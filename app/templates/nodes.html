@@ -1,0 +1,72 @@
+{% extends "layout.html" %}
+
+{% block content %}
+  <div class="mesh-card bg-white rounded-2xl p-6">
+    <h2 class="text-lg font-semibold">Nodes</h2>
+    <div class="overflow-x-auto mt-4">
+      <table class="table w-full">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Name</th>
+            <th>Roles</th>
+            <th>Mesh IP</th>
+            <th>Endpoint</th>
+            <th>Lease</th>
+            <th>Identity</th>
+            <th>Status</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for node in nodes %}
+            <tr>
+              <td class="mono">{{ node.id }}</td>
+              <td>{{ node.name }}</td>
+              <td>{{ node.roles | join(", ") }}</td>
+              <td class="mono">{{ node.mesh_ip or "-" }}</td>
+              <td class="mono text-xs">{{ node.api_endpoint or "-" }}</td>
+              <td class="mono text-xs">
+                {% if node.lease_expires_at %}
+                  exp={{ node.lease_expires_at }}<br />
+                  hb={{ node.heartbeat_at or "-" }}
+                {% else %}
+                  -
+                {% endif %}
+              </td>
+              <td class="mono text-xs">
+                {% if node.identity_fingerprint %}
+                  fp={{ node.identity_fingerprint[:16] }}...<br />
+                  cert_exp={{ node.identity_expires_at or "-" }}
+                {% else %}
+                  -
+                {% endif %}
+              </td>
+              <td class="mono text-xs">{{ node.status }}</td>
+              <td>
+                <div class="flex gap-2">
+                  <button class="btn btn-xs btn-outline" onclick="nodeAction('{{ node.id }}', 'cordon')">Cordon</button>
+                  <button class="btn btn-xs btn-outline" onclick="nodeAction('{{ node.id }}', 'drain')">Drain</button>
+                  <button class="btn btn-xs btn-outline" onclick="nodeAction('{{ node.id }}', 'rotate-wg-keys')">Rotate Keys</button>
+                </div>
+              </td>
+            </tr>
+          {% else %}
+            <tr>
+              <td colspan="9" class="text-center text-slate-400">No nodes registered yet.</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    async function nodeAction(nodeId, action) {
+      const response = await fetch(`/nodes/${nodeId}/${action}`, { method: "POST" });
+      if (response.ok) {
+        window.location.reload();
+      }
+    }
+  </script>
+{% endblock %}

@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "version": "2026.02.17.1",
+  "channels": {
+    "stable": {
+      "version": "2026.02.17.1",
+      "bootstrap": {
+        "version": "1.0.0",
+        "path": "ops/bootstrap.sh",
+        "sha256": "680627cb44b794c308eedfaa439804a52e6ff0b914130826b4d82e648b4a7ed9"
+      },
+      "updater": {
+        "version": "1.0.0",
+        "path": "ops/node-update.sh",
+        "sha256": "70e67d430430652431a29898759c804427700e8519ab69f3f9e1ade2a1462c3a"
+      },
+      "agent": {
+        "name": "uptimemesh-agent",
+        "version": "0.1.0",
+        "artifacts": {
+          "linux-amd64": {
+            "url": "",
+            "sha256": ""
+          },
+          "linux-arm64": {
+            "url": "",
+            "sha256": ""
+          }
+        }
+      }
+    }
+  }
+}

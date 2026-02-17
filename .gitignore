@@ -1,0 +1,75 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+.envrc
+.python-version
+test_servers.txt
+AGENTS.md
+ARCHITECTURE.md
+ROADMAP.MD
+
+# Keep template env files tracked
+!.env.example
+
+# Python caches / tooling
+__pycache__/
+*.py[cod]
+*.pyc.*
+*.pyd
+*.pyo
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+.tox/
+.nox/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging / build artifacts
+build/
+dist/
+site/
+*.egg
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+wheelhouse/
+
+# Test / coverage output
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Logs / runtime dumps
+*.log
+*.pid
+*.pid.lock
+*.out
+*.err
+
+# Local databases / runtime state
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+
+# Data directory (runtime artifacts only)
+/data/*
+!/data/.gitkeep

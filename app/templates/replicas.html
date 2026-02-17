@@ -1,0 +1,56 @@
+{% extends "layout.html" %}
+
+{% block content %}
+  <div class="mesh-card bg-white rounded-2xl p-6">
+    <h2 class="text-lg font-semibold">Replicas</h2>
+    <div class="overflow-x-auto mt-4">
+      <table class="table w-full">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Service</th>
+            <th>Node</th>
+            <th>Desired</th>
+            <th>Status</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for replica in replicas %}
+            <tr>
+              <td class="mono">{{ replica.id }}</td>
+              <td class="mono">{{ replica.service_id }}</td>
+              <td class="mono">{{ replica.node_id }}</td>
+              <td>{{ replica.desired_state }}</td>
+              <td class="mono text-xs">{{ replica.status }}</td>
+              <td>
+                <div class="flex gap-2">
+                  <button class="btn btn-xs btn-outline" onclick="replicaAction('{{ replica.id }}', 'restart')">Restart</button>
+                  <button class="btn btn-xs btn-outline" onclick="replicaAction('{{ replica.id }}', 'snapshot')">Snapshot</button>
+                  <button class="btn btn-xs btn-outline" onclick="replicaAction('{{ replica.id }}', 'restore')">Restore</button>
+                </div>
+              </td>
+            </tr>
+          {% else %}
+            <tr>
+              <td colspan="6" class="text-center text-slate-400">No replicas defined yet.</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    async function replicaAction(replicaId, action) {
+      const response = await fetch(`/replicas/${replicaId}/${action}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}"
+      });
+      if (response.ok) {
+        window.location.reload();
+      }
+    }
+  </script>
+{% endblock %}

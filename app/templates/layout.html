@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en" data-theme="winter">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ title }}</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=IBM+Plex+Mono:wght@400;600&display=swap"
+      rel="stylesheet"
+    />
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/daisyui@4.7.3/dist/full.min.js"></script>
+    <style>
+      :root {
+        --mesh-ink: #0f172a;
+        --mesh-slate: #475569;
+        --mesh-accent: #0ea5e9;
+        --mesh-sun: #fde68a;
+        --mesh-mint: #a7f3d0;
+      }
+      body {
+        font-family: "Space Grotesk", sans-serif;
+        color: var(--mesh-ink);
+        background: radial-gradient(circle at top left, var(--mesh-sun), transparent 45%),
+          radial-gradient(circle at 20% 60%, var(--mesh-mint), transparent 40%),
+          #f8fafc;
+        min-height: 100vh;
+      }
+      .mono {
+        font-family: "IBM Plex Mono", monospace;
+      }
+      .mesh-card {
+        border: 1px solid rgba(15, 23, 42, 0.08);
+        box-shadow: 0 12px 30px rgba(15, 23, 42, 0.08);
+      }
+      .mesh-pill {
+        border: 1px solid rgba(15, 23, 42, 0.15);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="max-w-6xl mx-auto px-6 py-10">
+      <header class="flex flex-col gap-6 md:flex-row md:items-center md:justify-between">
+        <div>
+          <p class="mono text-xs uppercase tracking-[0.3em] text-slate-500">UptimeMesh</p>
+          <h1 class="text-3xl md:text-4xl font-semibold">{{ title }}</h1>
+          <p class="text-sm text-slate-500">{{ subtitle }}</p>
+        </div>
+        <nav class="flex flex-wrap gap-2 text-sm">
+          <a class="btn btn-sm mesh-pill" href="{{ ui_prefix }}">Overview</a>
+          <a class="btn btn-sm mesh-pill" href="{{ ui_prefix }}/nodes">Nodes</a>
+          <a class="btn btn-sm mesh-pill" href="{{ ui_prefix }}/services">Services</a>
+          <a class="btn btn-sm mesh-pill" href="{{ ui_prefix }}/replicas">Replicas</a>
+          <a class="btn btn-sm mesh-pill" href="{{ ui_prefix }}/scheduler">Scheduler</a>
+          <a class="btn btn-sm mesh-pill" href="{{ ui_prefix }}/wireguard">WireGuard</a>
+          <a class="btn btn-sm mesh-pill" href="{{ ui_prefix }}/events">Events</a>
+          <a class="btn btn-sm mesh-pill" href="{{ ui_prefix }}/support">Support</a>
+          <a class="btn btn-sm mesh-pill" href="{{ ui_prefix }}/settings">Settings</a>
+          {% if auth_user %}
+            <span class="badge badge-outline mono py-3">{{ auth_user }}</span>
+          {% endif %}
+          <a class="btn btn-sm btn-outline" href="/auth/logout">Sign Out</a>
+        </nav>
+      </header>
+
+      {% if etcd_status and etcd_status != "ok" %}
+        <div class="mt-6 alert alert-warning mesh-card">
+          <div>
+            <h3 class="font-semibold">etcd unavailable or stale view</h3>
+            <p class="text-sm">
+              Status: {{ etcd_status }}{% if etcd_last_sync_at %} (last sync {{ etcd_last_sync_at }}){% endif %}
+            </p>
+          </div>
+        </div>
+      {% endif %}
+
+      <main class="mt-8">
+        {% block content %}{% endblock %}
+      </main>
+    </div>
+  </body>
+</html>

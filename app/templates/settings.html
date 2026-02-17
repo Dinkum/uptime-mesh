@@ -1,0 +1,73 @@
+{% extends "layout.html" %}
+
+{% block content %}
+  <section class="grid gap-6 lg:grid-cols-2">
+    <article class="card bg-white mesh-card">
+      <div class="card-body">
+        <h2 class="card-title">Authentication</h2>
+        <p class="text-sm text-slate-500">Rotate the admin password used for UI and API access.</p>
+        <div class="mt-3">
+          <span class="text-xs uppercase tracking-widest text-slate-500">Current Username</span>
+          <p class="mono text-sm mt-1">{{ username }}</p>
+        </div>
+      </div>
+    </article>
+
+    <article class="card bg-white mesh-card">
+      <div class="card-body">
+        <h2 class="card-title">Change Password</h2>
+
+        {% if success %}
+          <div class="alert alert-success text-sm mt-2">
+            <span>{{ success }}</span>
+          </div>
+        {% endif %}
+
+        {% if error %}
+          <div class="alert alert-error text-sm mt-2">
+            <span>{{ error }}</span>
+          </div>
+        {% endif %}
+
+        <form method="post" action="{{ ui_prefix }}/settings/password" class="space-y-3 mt-3">
+          <label class="form-control">
+            <span class="label-text text-sm">Current Password</span>
+            <input
+              class="input input-bordered"
+              type="password"
+              name="current_password"
+              required
+              autocomplete="current-password"
+            />
+          </label>
+
+          <label class="form-control">
+            <span class="label-text text-sm">New Password</span>
+            <input
+              class="input input-bordered"
+              type="password"
+              name="new_password"
+              minlength="8"
+              required
+              autocomplete="new-password"
+            />
+          </label>
+
+          <label class="form-control">
+            <span class="label-text text-sm">Confirm New Password</span>
+            <input
+              class="input input-bordered"
+              type="password"
+              name="confirm_password"
+              minlength="8"
+              required
+              autocomplete="new-password"
+            />
+          </label>
+
+          <button class="btn btn-primary w-full mt-2" type="submit">Update Password</button>
+        </form>
+      </div>
+    </article>
+  </section>
+{% endblock %}

@@ -1,0 +1,35 @@
+{% extends "layout.html" %}
+
+{% block content %}
+  <div class="mesh-card bg-white rounded-2xl p-6">
+    <h2 class="text-lg font-semibold">WireGuard Status</h2>
+    <div class="overflow-x-auto mt-4">
+      <table class="table w-full">
+        <thead>
+          <tr>
+            <th>Node</th>
+            <th>Primary Tunnel</th>
+            <th>Secondary Tunnel</th>
+            <th>Active Route</th>
+            <th>Failover State</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in wireguard_rows %}
+            <tr>
+              <td class="mono">{{ row.node_id }}</td>
+              <td class="mono">{{ row.primary_tunnel or "-" }}</td>
+              <td class="mono">{{ row.secondary_tunnel or "-" }}</td>
+              <td class="mono">{{ row.active_route or "-" }}</td>
+              <td>{{ row.failover_state or "-" }}</td>
+            </tr>
+          {% else %}
+            <tr>
+              <td colspan="5" class="text-center text-slate-400">No WireGuard status reported yet.</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+{% endblock %}

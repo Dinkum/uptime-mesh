@@ -1,0 +1,78 @@
+{% extends "layout.html" %}
+
+{% block content %}
+  <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+    <div class="mesh-card bg-white rounded-2xl p-6">
+      <h2 class="text-lg font-semibold">etcd Snapshots</h2>
+      <p class="text-sm text-slate-500">Request snapshots and track recent runs.</p>
+      <p class="text-xs text-slate-400 mt-1">Requests are recorded here and executed by agents.</p>
+      <button class="btn btn-sm btn-outline mt-4" id="snapshot-btn">Request snapshot</button>
+      <div class="mt-4 space-y-2 text-sm" id="snapshot-list">
+        {% for snapshot in snapshots %}
+          <div class="flex justify-between">
+            <span class="mono">{{ snapshot.id }}</span>
+            <span>{{ snapshot.status }}</span>
+          </div>
+        {% else %}
+          <p class="text-slate-400">No snapshots yet.</p>
+        {% endfor %}
+      </div>
+    </div>
+
+    <div class="mesh-card bg-white rounded-2xl p-6">
+      <h2 class="text-lg font-semibold">Support Bundles</h2>
+      <p class="text-sm text-slate-500">Collect logs and configs for diagnostics.</p>
+      <p class="text-xs text-slate-400 mt-1">Requests are recorded here and executed by agents.</p>
+      <button class="btn btn-sm btn-outline mt-4" id="bundle-btn">Request bundle</button>
+      <div class="mt-4 space-y-2 text-sm" id="bundle-list">
+        {% for bundle in bundles %}
+          <div class="flex justify-between">
+            <span class="mono">{{ bundle.id }}</span>
+            <span>{{ bundle.status }}</span>
+          </div>
+        {% else %}
+          <p class="text-slate-400">No bundles yet.</p>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const snapshotBtn = document.getElementById("snapshot-btn");
+    const bundleBtn = document.getElementById("bundle-btn");
+
+    function addRow(containerId, id, status) {
+      const container = document.getElementById(containerId);
+      const row = document.createElement("div");
+      row.className = "flex justify-between";
+      row.innerHTML = `<span class="mono">${id}</span><span>${status}</span>`;
+      container.prepend(row);
+    }
+
+    snapshotBtn.addEventListener("click", async () => {
+      const id = crypto.randomUUID();
+      const response = await fetch("/etcd/snapshots", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id })
+      });
+      if (response.ok) {
+        const data = await response.json();
+        addRow("snapshot-list", data.id, data.status);
+      }
+    });
+
+    bundleBtn.addEventListener("click", async () => {
+      const id = crypto.randomUUID();
+      const response = await fetch("/support-bundles", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id })
+      });
+      if (response.ok) {
+        const data = await response.json();
+        addRow("bundle-list", data.id, data.status);
+      }
+    });
+  </script>
+{% endblock %}

@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en" data-theme="winter">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ title }}</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=IBM+Plex+Mono:wght@400;600&display=swap"
+      rel="stylesheet"
+    />
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/daisyui@4.7.3/dist/full.min.js"></script>
+    <style>
+      body {
+        font-family: "Space Grotesk", sans-serif;
+        min-height: 100vh;
+        background: radial-gradient(circle at top left, #fde68a, transparent 45%),
+          radial-gradient(circle at 20% 60%, #a7f3d0, transparent 40%),
+          #f8fafc;
+      }
+      .mono {
+        font-family: "IBM Plex Mono", monospace;
+      }
+      .mesh-card {
+        border: 1px solid rgba(15, 23, 42, 0.08);
+        box-shadow: 0 12px 30px rgba(15, 23, 42, 0.08);
+      }
+    </style>
+  </head>
+  <body class="flex items-center justify-center p-6">
+    <div class="w-full max-w-md bg-white rounded-2xl p-8 mesh-card">
+      <p class="mono text-xs uppercase tracking-[0.3em] text-slate-500">UptimeMesh</p>
+      <h1 class="text-3xl font-semibold mt-2">Sign In</h1>
+      <p class="text-sm text-slate-500 mt-2">Cluster administration requires authentication.</p>
+
+      {% if error %}
+        <div class="alert alert-error mt-5 text-sm">
+          <span>{{ error }}</span>
+        </div>
+      {% endif %}
+
+      <form method="post" action="/auth/login" class="mt-6 space-y-4">
+        <input type="hidden" name="next" value="{{ next_path }}" />
+        <label class="form-control">
+          <span class="label-text text-sm">Username</span>
+          <input
+            class="input input-bordered"
+            type="text"
+            name="username"
+            value=""
+            required
+            autocomplete="username"
+            autofocus
+          />
+        </label>
+        <label class="form-control">
+          <span class="label-text text-sm">Password</span>
+          <input
+            class="input input-bordered"
+            type="password"
+            name="password"
+            required
+            autocomplete="current-password"
+          />
+        </label>
+        <button class="btn btn-primary w-full" type="submit">Sign In</button>
+      </form>
+    </div>
+  </body>
+</html>
