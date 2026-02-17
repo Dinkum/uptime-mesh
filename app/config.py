@@ -5,6 +5,8 @@ from functools import lru_cache
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.versioning import get_version_info
+
 DEFAULT_AUTH_SECRET_KEY = "change-me-uptimemesh-auth-secret"
 DEFAULT_CLUSTER_SIGNING_KEY = "change-me-uptimemesh-cluster-signing-key"
 _PROD_ENV_NAMES = {"prod", "production"}
@@ -13,7 +15,6 @@ _PROD_ENV_NAMES = {"prod", "production"}
 class Settings(BaseSettings):
     app_name: str = Field(default="UptimeMesh")
     app_env: str = Field(default="dev")
-    app_version: str = Field(default="0.1.0")
 
     database_url: str = Field(default="")
 
@@ -34,16 +35,59 @@ class Settings(BaseSettings):
     cluster_lease_token_ttl_seconds: int = Field(default=86400)
     heartbeat_signature_max_skew_seconds: int = Field(default=30)
 
+    runtime_enable: bool = Field(default=False)
+    runtime_node_id: str = Field(default="")
+    runtime_node_name: str = Field(default="")
+    runtime_node_role: str = Field(default="worker")
+    runtime_api_base_url: str = Field(default="http://127.0.0.1:8000")
+    runtime_identity_dir: str = Field(default="data/identities")
+    runtime_heartbeat_interval_seconds: int = Field(default=15, ge=5, le=300)
+    runtime_heartbeat_ttl_seconds: int = Field(default=45, ge=10, le=300)
+    runtime_mesh_cidr: str = Field(default="10.42.0.0/16")
+    runtime_wg_primary_iface: str = Field(default="wg-mesh0")
+    runtime_wg_secondary_iface: str = Field(default="wg-mesh1")
+    runtime_wg_primary_router_ip: str = Field(default="")
+    runtime_wg_secondary_router_ip: str = Field(default="")
+    runtime_failover_threshold: int = Field(default=3, ge=1, le=20)
+    runtime_failback_stable_count: int = Field(default=6, ge=1, le=50)
+    runtime_failback_enabled: bool = Field(default=False)
+    runtime_route_primary_metric: int = Field(default=100, ge=1, le=10000)
+    runtime_route_secondary_metric: int = Field(default=200, ge=1, le=10000)
+    runtime_etcd_endpoints: str = Field(default="")
+    runtime_etcd_probe_interval_seconds: int = Field(default=10, ge=3, le=300)
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
+        extra="ignore",
     )
+
+    @property
+    def app_version(self) -> str:
+        return get_version_info().app_version
+
+    @property
+    def app_manifest_version(self) -> str:
+        return get_version_info().manifest_version
+
+    @property
+    def app_release_channel(self) -> str:
+        return get_version_info().channel
+
+    @property
+    def app_agent_version(self) -> str:
+        return get_version_info().agent_version
+
+    @property
+    def app_version_source_path(self) -> str:
+        return get_version_info().source_path
 
     @model_validator(mode="after")
     def validate_database_url(self) -> "Settings":
         if not self.database_url:
             raise ValueError("DATABASE_URL must be set in .env or environment variables.")
+        _ = get_version_info()
         if self.app_env.strip().lower() in _PROD_ENV_NAMES:
             issues: list[str] = []
             if self.auth_secret_key == DEFAULT_AUTH_SECRET_KEY:
@@ -58,6 +102,8 @@ class Settings(BaseSettings):
                 issues.append("AUTH_COOKIE_SECURE must be true in production.")
             if issues:
                 raise ValueError(" ".join(issues))
+        if self.runtime_enable and not self.runtime_node_id:
+            raise ValueError("RUNTIME_NODE_ID is required when RUNTIME_ENABLE=true.")
         return self
 
 

@@ -70,7 +70,7 @@ async def join_node(
 @router.post("/heartbeat", response_model=HeartbeatOut)
 async def heartbeat(
     payload: HeartbeatRequest,
-    session: AsyncSession = Depends(get_writable_db_session),
+    session: AsyncSession = Depends(get_db_session),
 ) -> HeartbeatOut:
     lease = await cluster_service.apply_heartbeat(
         session,

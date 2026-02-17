@@ -278,7 +278,7 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
             node.identity_cert_pem = node_cert_pem
             node.identity_expires_at = identity_expires_at
             event_name = "node.rejoin"
-        op.step("node.upsert", "Applied node state", event=event_name)
+        op.step("node.upsert", "Applied node state", cluster_event=event_name)
 
         await record_event(
             session,
@@ -293,7 +293,7 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
                 "token_id": join_token.id,
             },
         )
-        op.step("event.record", "Recorded node join event", event=event_name)
+        op.step("event.record", "Recorded node join event", cluster_event=event_name)
         await session.commit()
         op.step("db.commit", "Committed node join transaction")
         return NodeJoinOut(

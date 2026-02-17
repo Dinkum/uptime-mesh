@@ -32,6 +32,7 @@ from app.routes import (
     ui,
     wireguard,
 )
+from app.runtime import RuntimeController
 from app.security import SESSION_COOKIE_NAME, decode_session_token
 
 settings = get_settings()
@@ -41,7 +42,13 @@ logger = get_logger("api")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    logger.info("app.startup", "Starting app", env=settings.app_env, version=settings.app_version)
+    logger.info(
+        "app.startup",
+        "Starting app",
+        env=settings.app_env,
+        version=settings.app_version,
+        version_source=settings.app_version_source_path,
+    )
     if settings.app_env.strip().lower() not in {"prod", "production"}:
         if settings.auth_secret_key == DEFAULT_AUTH_SECRET_KEY:
             logger.warning(
@@ -58,7 +65,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "security.cookies",
                 "AUTH_COOKIE_SECURE is disabled; enable it when serving over HTTPS",
             )
+    runtime = RuntimeController(settings)
+    app.state.runtime_controller = runtime
+    await runtime.start()
     yield
+    await runtime.stop()
     logger.info("app.shutdown", "Shutting down app")
 
 

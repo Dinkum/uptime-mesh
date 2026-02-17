@@ -89,6 +89,35 @@ VERSION_URL=https://raw.githubusercontent.com/<org>/<repo>/main/version.json sh 
 
 See `ops/README.md` for release/checksum workflow.
 
+## Runtime Controller (Phase 2)
+
+The API process can run a lightweight node runtime loop (source-first, no binaries required):
+
+- signed heartbeat publishing to `/cluster/heartbeat`
+- WireGuard primary/secondary reachability checks
+- route-metric failover (`ip route replace`) between `wg-mesh0` and `wg-mesh1`
+- etcd endpoint health probing and `cluster_settings.etcd_status` reconciliation
+
+Enable with environment variables:
+
+- `RUNTIME_ENABLE=true`
+- `RUNTIME_NODE_ID=<node-id>`
+- optional:
+  - `RUNTIME_ETCD_ENDPOINTS=http://127.0.0.1:2379,http://10.0.0.2:2379`
+  - `RUNTIME_WG_PRIMARY_ROUTER_IP=<mesh-ip>`
+  - `RUNTIME_WG_SECONDARY_ROUTER_IP=<mesh-ip>`
+
+## Version Source of Truth
+
+- All runtime version reporting is sourced from `version.json`.
+- `/version` returns:
+  - `version` (active app version),
+  - `manifest_version`,
+  - `channel`,
+  - `agent_version`,
+  - `version_source`.
+- `APP_VERSION` is intentionally not used.
+
 ## API Endpoints (Initial)
 
 - `GET /health`

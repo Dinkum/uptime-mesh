@@ -31,5 +31,9 @@ async def version() -> Dict[str, str]:
     return {
         "app": settings.app_name,
         "version": settings.app_version,
+        "manifest_version": settings.app_manifest_version,
+        "channel": settings.app_release_channel,
+        "agent_version": settings.app_agent_version,
+        "version_source": settings.app_version_source_path,
         "env": settings.app_env,
     }
