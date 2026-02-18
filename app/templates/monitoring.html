@@ -1,0 +1,84 @@
+{% extends "layout.html" %}
+
+{% block content %}
+  <section class="grid grid-cols-1 md:grid-cols-4 gap-6">
+    <div class="mesh-card bg-white rounded-2xl p-6">
+      <p class="text-sm text-slate-500">Prometheus Targets</p>
+      <p class="text-3xl font-semibold">{{ api_target_count }}</p>
+      <p class="text-xs text-slate-400">UptimeMesh API metrics</p>
+    </div>
+    <div class="mesh-card bg-white rounded-2xl p-6">
+      <p class="text-sm text-slate-500">Node Exporters</p>
+      <p class="text-3xl font-semibold">{{ node_exporter_target_count }}</p>
+      <p class="text-xs text-slate-400">Host telemetry targets</p>
+    </div>
+    <div class="mesh-card bg-white rounded-2xl p-6">
+      <p class="text-sm text-slate-500">Alertmanager Targets</p>
+      <p class="text-3xl font-semibold">{{ alertmanager_target_count }}</p>
+      <p class="text-xs text-slate-400">Alert routing endpoints</p>
+    </div>
+    <div class="mesh-card bg-white rounded-2xl p-6">
+      <p class="text-sm text-slate-500">Apply Status</p>
+      <p class="text-3xl font-semibold">{{ last_apply_status }}</p>
+      <p class="text-xs text-slate-400">Last sync {{ last_sync_at or "never" }}</p>
+    </div>
+  </section>
+
+  {% if last_apply_error %}
+    <div class="alert alert-error mesh-card mt-6 text-sm">
+      <span>{{ last_apply_error }}</span>
+    </div>
+  {% endif %}
+
+  <section class="mesh-card bg-white rounded-2xl p-6 mt-8">
+    <div class="flex flex-wrap items-center justify-between gap-2">
+      <h2 class="text-lg font-semibold">Monitoring Config</h2>
+      <a class="btn btn-sm btn-outline" href="{{ config_endpoint }}">View Prometheus Config</a>
+    </div>
+    <div class="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
+      <div>
+        <p class="text-slate-500">Config path</p>
+        <p class="mono">{{ config_path }}</p>
+      </div>
+      <div>
+        <p class="text-slate-500">SHA-256</p>
+        <p class="mono break-all">{{ config_sha256 or "-" }}</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="grid grid-cols-1 md:grid-cols-3 gap-6 mt-8">
+    <div class="mesh-card bg-white rounded-2xl p-6">
+      <h3 class="text-lg font-semibold">API Targets</h3>
+      <div class="mt-3 space-y-2 text-sm mono">
+        {% for target in api_targets %}
+          <p>{{ target }}</p>
+        {% else %}
+          <p class="text-slate-400">No targets available.</p>
+        {% endfor %}
+      </div>
+    </div>
+
+    <div class="mesh-card bg-white rounded-2xl p-6">
+      <h3 class="text-lg font-semibold">Node Exporter Targets</h3>
+      <div class="mt-3 space-y-2 text-sm mono">
+        {% for target in node_exporter_targets %}
+          <p>{{ target }}</p>
+        {% else %}
+          <p class="text-slate-400">No targets available.</p>
+        {% endfor %}
+      </div>
+    </div>
+
+    <div class="mesh-card bg-white rounded-2xl p-6">
+      <h3 class="text-lg font-semibold">Alertmanager Targets</h3>
+      <div class="mt-3 space-y-2 text-sm mono">
+        {% for target in alertmanager_targets %}
+          <p>{{ target }}</p>
+        {% else %}
+          <p class="text-slate-400">No targets available.</p>
+        {% endfor %}
+      </div>
+    </div>
+  </section>
+{% endblock %}

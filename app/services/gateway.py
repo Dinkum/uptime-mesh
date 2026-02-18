@@ -186,7 +186,7 @@ def render_nginx_config(
         "    worker_connections 1024;",
         "}",
         "http {",
-        "    include       mime.types;",
+        "    include       /etc/nginx/mime.types;",
         "    default_type  application/octet-stream;",
         "    sendfile on;",
         "    keepalive_timeout 65;",

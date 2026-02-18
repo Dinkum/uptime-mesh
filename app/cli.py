@@ -55,6 +55,49 @@ def _api_request(
         raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
 
 
+def _api_text_request(
+    *,
+    base_url: str,
+    path: str,
+    session_token: Optional[str] = None,
+) -> str:
+    url = base_url.rstrip("/") + path
+    headers: Dict[str, str] = {"Accept": "text/plain"}
+    if session_token:
+        headers["Cookie"] = f"{SESSION_COOKIE_NAME}={session_token}"
+    req = request.Request(url=url, method="GET", headers=headers)
+    try:
+        with request.urlopen(req, timeout=15) as response:
+            return response.read().decode("utf-8")
+    except error.HTTPError as exc:
+        payload = exc.read().decode("utf-8")
+        raise RuntimeError(f"HTTP {exc.code}: {payload}") from exc
+
+
+def _download_file(
+    *,
+    base_url: str,
+    path: str,
+    output_path: str,
+    session_token: Optional[str] = None,
+) -> str:
+    url = base_url.rstrip("/") + path
+    headers: Dict[str, str] = {}
+    if session_token:
+        headers["Cookie"] = f"{SESSION_COOKIE_NAME}={session_token}"
+    req = request.Request(url=url, method="GET", headers=headers)
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with request.urlopen(req, timeout=60) as response:
+            data = response.read()
+    except error.HTTPError as exc:
+        payload = exc.read().decode("utf-8")
+        raise RuntimeError(f"HTTP {exc.code}: {payload}") from exc
+    out.write_bytes(data)
+    return str(out)
+
+
 def _login(base_url: str, username: str, password: str) -> str:
     result = _api_request(
         base_url=base_url,
@@ -316,6 +359,31 @@ def cmd_service_apply_pinned(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_monitoring_status(args: argparse.Namespace) -> int:
+    session_token = _login(args.api_url, args.username, args.password)
+    result = _api_request(
+        base_url=args.api_url,
+        path="/monitoring/status",
+        method="GET",
+        session_token=session_token,
+    )
+    if not isinstance(result, dict):
+        raise RuntimeError("Unexpected response for /monitoring/status")
+    _print_json(result)
+    return 0
+
+
+def cmd_monitoring_config(args: argparse.Namespace) -> int:
+    session_token = _login(args.api_url, args.username, args.password)
+    result = _api_text_request(
+        base_url=args.api_url,
+        path="/monitoring/prometheus/config",
+        session_token=session_token,
+    )
+    print(result)
+    return 0
+
+
 def cmd_etcd_status(args: argparse.Namespace) -> int:
     session_token = _login(args.api_url, args.username, args.password)
     result = _api_request(
@@ -425,6 +493,18 @@ def cmd_snapshot_restore(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_snapshot_download(args: argparse.Namespace) -> int:
+    session_token = _login(args.api_url, args.username, args.password)
+    output = _download_file(
+        base_url=args.api_url,
+        path=f"/etcd/snapshots/{args.snapshot_id}/download",
+        output_path=args.output,
+        session_token=session_token,
+    )
+    print(json.dumps({"snapshot_id": args.snapshot_id, "output": output}, indent=2, sort_keys=True))
+    return 0
+
+
 def cmd_support_bundle_run(args: argparse.Namespace) -> int:
     session_token = _login(args.api_url, args.username, args.password)
     body: Dict[str, Any] = {}
@@ -456,6 +536,18 @@ def cmd_support_bundle_list(args: argparse.Namespace) -> int:
     if not isinstance(result, list):
         raise RuntimeError("Unexpected response for /support-bundles")
     print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_support_bundle_download(args: argparse.Namespace) -> int:
+    session_token = _login(args.api_url, args.username, args.password)
+    output = _download_file(
+        base_url=args.api_url,
+        path=f"/support-bundles/{args.bundle_id}/download",
+        output_path=args.output,
+        session_token=session_token,
+    )
+    print(json.dumps({"bundle_id": args.bundle_id, "output": output}, indent=2, sort_keys=True))
     return 0
 
 
@@ -515,6 +607,20 @@ def build_parser() -> argparse.ArgumentParser:
     service_apply_pinned.add_argument("--service-id", required=True)
     service_apply_pinned.set_defaults(func=cmd_service_apply_pinned)
 
+    monitoring_status = sub.add_parser(
+        "monitoring-status",
+        help="Show monitoring reconciliation state",
+    )
+    _add_auth_args(monitoring_status)
+    monitoring_status.set_defaults(func=cmd_monitoring_status)
+
+    monitoring_config = sub.add_parser(
+        "monitoring-config",
+        help="Render current Prometheus config",
+    )
+    _add_auth_args(monitoring_config)
+    monitoring_config.set_defaults(func=cmd_monitoring_config)
+
     etcd_status = sub.add_parser("etcd-status", help="Show etcd endpoint health")
     _add_auth_args(etcd_status)
     etcd_status.set_defaults(func=cmd_etcd_status)
@@ -550,6 +656,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_auth_args(snapshot_restore)
     snapshot_restore.set_defaults(func=cmd_snapshot_restore)
 
+    snapshot_download = sub.add_parser("snapshot-download", help="Download etcd snapshot artifact")
+    snapshot_download.add_argument("snapshot_id")
+    snapshot_download.add_argument("--output", required=True)
+    _add_auth_args(snapshot_download)
+    snapshot_download.set_defaults(func=cmd_snapshot_download)
+
     support_bundle_run = sub.add_parser("support-bundle-run", help="Generate support bundle")
     _add_auth_args(support_bundle_run)
     support_bundle_run.add_argument("--id")
@@ -559,6 +671,14 @@ def build_parser() -> argparse.ArgumentParser:
     support_bundle_list = sub.add_parser("support-bundle-list", help="List support bundles")
     _add_auth_args(support_bundle_list)
     support_bundle_list.set_defaults(func=cmd_support_bundle_list)
+
+    support_bundle_download = sub.add_parser(
+        "support-bundle-download", help="Download support bundle artifact"
+    )
+    support_bundle_download.add_argument("bundle_id")
+    support_bundle_download.add_argument("--output", required=True)
+    _add_auth_args(support_bundle_download)
+    support_bundle_download.set_defaults(func=cmd_support_bundle_download)
 
     return parser
 

@@ -31,6 +31,9 @@ from app.security import SESSION_COOKIE_NAME
 from app.services import cluster_settings as cluster_settings_service
 from app.services import discovery as discovery_service
 from app.services import gateway as gateway_service
+from app.services import monitoring as monitoring_service
+from app.services import snapshots as snapshot_service
+from app.schemas.snapshots import SnapshotRunCreate
 
 _logger = get_logger("runtime")
 
@@ -93,8 +96,11 @@ def _http_json(
 
 def _http_status(url: str, *, timeout_seconds: int = 5) -> int:
     req = request.Request(url=url, method="GET")
-    with request.urlopen(req, timeout=timeout_seconds) as response:
-        return int(getattr(response, "status", 0))
+    try:
+        with request.urlopen(req, timeout=timeout_seconds) as response:
+            return int(getattr(response, "status", 0))
+    except error.HTTPError as exc:
+        return int(exc.code)
 
 
 def _sign_heartbeat(private_key_pem: bytes, message: bytes) -> str:
@@ -145,6 +151,7 @@ class RuntimeController:
         self._discovery_zone_sha = ""
         self._discovery_corefile_sha = ""
         self._gateway_config_sha = ""
+        self._monitoring_config_sha = ""
 
     @property
     def enabled(self) -> bool:
@@ -153,6 +160,12 @@ class RuntimeController:
             or self._settings.runtime_etcd_endpoints.strip()
             or self._settings.runtime_discovery_enable
             or self._settings.runtime_gateway_enable
+            or self._settings.runtime_monitoring_enable
+            or (
+                self._settings.etcd_snapshot_schedule_enabled
+                and self._settings.etcd_enabled
+                and self._settings.etcd_endpoints.strip()
+            )
         )
 
     async def start(self) -> None:
@@ -190,6 +203,28 @@ class RuntimeController:
                 config_path=self._settings.runtime_gateway_config_path,
                 listen=self._settings.runtime_gateway_listen,
                 interval_seconds=self._settings.runtime_gateway_interval_seconds,
+            )
+
+        if self._settings.runtime_monitoring_enable:
+            self._tasks.append(asyncio.create_task(self._monitoring_config_loop()))
+            _logger.info(
+                "runtime.monitoring.start",
+                "Started monitoring config loop",
+                config_path=self._settings.runtime_monitoring_prometheus_config_path,
+                interval_seconds=self._settings.runtime_monitoring_interval_seconds,
+            )
+
+        if (
+            self._settings.etcd_snapshot_schedule_enabled
+            and self._settings.etcd_enabled
+            and self._settings.etcd_endpoints.strip()
+        ):
+            self._tasks.append(asyncio.create_task(self._snapshot_schedule_loop()))
+            _logger.info(
+                "runtime.snapshot.start",
+                "Started scheduled snapshot loop",
+                interval_seconds=self._settings.etcd_snapshot_interval_seconds,
+                requested_by=self._settings.etcd_snapshot_schedule_requested_by,
             )
 
         if self._settings.runtime_enable:
@@ -426,6 +461,32 @@ class RuntimeController:
             }
         )
 
+    async def _mark_monitoring_status(
+        self,
+        *,
+        status: str,
+        error_text: str,
+        digest: str,
+        api_targets: list[str],
+        node_exporter_targets: list[str],
+        alertmanager_targets: list[str],
+    ) -> None:
+        await self._upsert_cluster_settings(
+            {
+                "monitoring_last_apply_status": status,
+                "monitoring_last_apply_error": error_text,
+                "monitoring_last_sync_at": _utcnow_iso(),
+                "monitoring_config_sha256": digest,
+                "monitoring_config_path": self._settings.runtime_monitoring_prometheus_config_path,
+                "monitoring_api_target_count": str(len(api_targets)),
+                "monitoring_node_exporter_target_count": str(len(node_exporter_targets)),
+                "monitoring_alertmanager_target_count": str(len(alertmanager_targets)),
+                "monitoring_api_targets": ",".join(api_targets),
+                "monitoring_node_exporter_targets": ",".join(node_exporter_targets),
+                "monitoring_alertmanager_targets": ",".join(alertmanager_targets),
+            }
+        )
+
     async def _gateway_config_loop(self) -> None:
         interval = self._settings.runtime_gateway_interval_seconds
         while not self._stop.is_set():
@@ -503,7 +564,7 @@ class RuntimeController:
                     error_text=error_text,
                     route_count=route_count,
                     upstream_count=upstream_count,
-                    digest=digest,
+                    digest=self._gateway_config_sha,
                 )
                 raise RuntimeError(f"gateway validation failed: {error_text}")
 
@@ -533,7 +594,7 @@ class RuntimeController:
                     error_text=error_text,
                     route_count=route_count,
                     upstream_count=upstream_count,
-                    digest=digest,
+                    digest=self._gateway_config_sha,
                 )
                 raise RuntimeError(f"gateway reload failed: {error_text}")
 
@@ -541,11 +602,27 @@ class RuntimeController:
         expected_status = self._settings.runtime_gateway_healthcheck_expected_status
         timeout_seconds = self._settings.runtime_gateway_healthcheck_timeout_seconds
         for url in healthcheck_urls:
-            status_code = await asyncio.to_thread(
-                _http_status,
-                url,
-                timeout_seconds=timeout_seconds,
-            )
+            try:
+                status_code = await asyncio.to_thread(
+                    _http_status,
+                    url,
+                    timeout_seconds=timeout_seconds,
+                )
+            except Exception as exc:  # noqa: BLE001
+                error_text = f"healthcheck exception for {url}: {type(exc).__name__}: {exc}"
+                if previous_config is not None:
+                    self._write_bytes_atomic(path=config_path, data=previous_config)
+                    if reload_command:
+                        _run_command(("sh", "-c", reload_command))
+                await self._mark_gateway_status(
+                    status="healthcheck_failed",
+                    error_text=error_text,
+                    route_count=route_count,
+                    upstream_count=upstream_count,
+                    digest=self._gateway_config_sha,
+                )
+                raise RuntimeError(f"gateway post-reload healthcheck failed: {error_text}") from exc
+
             if status_code != expected_status:
                 error_text = f"healthcheck status {status_code} for {url} (expected {expected_status})"
                 if previous_config is not None:
@@ -557,7 +634,7 @@ class RuntimeController:
                     error_text=error_text,
                     route_count=route_count,
                     upstream_count=upstream_count,
-                    digest=digest,
+                    digest=self._gateway_config_sha,
                 )
                 raise RuntimeError(f"gateway post-reload healthcheck failed: {error_text}")
 
@@ -570,6 +647,209 @@ class RuntimeController:
             digest=digest,
         )
         return True, route_count, upstream_count
+
+    async def _monitoring_config_loop(self) -> None:
+        interval = self._settings.runtime_monitoring_interval_seconds
+        while not self._stop.is_set():
+            try:
+                changed, api_targets, node_exporter_targets, alertmanager_targets = (
+                    await self._sync_monitoring_config()
+                )
+                record_runtime_loop(loop="monitoring_config", ok=True)
+                if changed:
+                    _logger.info(
+                        "runtime.monitoring.sync",
+                        "Applied Prometheus monitoring config",
+                        config_path=self._settings.runtime_monitoring_prometheus_config_path,
+                        api_targets=api_targets,
+                        node_exporter_targets=node_exporter_targets,
+                        alertmanager_targets=alertmanager_targets,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                record_runtime_loop(loop="monitoring_config", ok=False)
+                _logger.exception(
+                    "runtime.monitoring.error",
+                    "Monitoring config sync failed",
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=interval)
+            except TimeoutError:
+                continue
+
+    async def _sync_monitoring_config(self) -> tuple[bool, int, int, int]:
+        async with self._sessionmaker() as session:
+            rendered = await monitoring_service.render_prometheus_config(
+                session,
+                app_metrics_path="/metrics",
+                default_api_port=self._settings.server_port,
+                node_exporter_port=self._settings.runtime_monitoring_node_exporter_port,
+                scrape_interval_seconds=self._settings.runtime_monitoring_scrape_interval_seconds,
+                evaluation_interval_seconds=self._settings.runtime_monitoring_evaluation_interval_seconds,
+                rules_path=self._settings.runtime_monitoring_rules_path,
+                alertmanager_targets_raw=self._settings.runtime_monitoring_alertmanager_targets,
+                include_localhost_targets=self._settings.runtime_monitoring_include_localhost_targets,
+            )
+
+        config_data = rendered.config.encode("utf-8")
+        digest = hashlib.sha256(config_data).hexdigest()
+        paths = monitoring_service.resolve_monitoring_paths(
+            config_path=self._settings.runtime_monitoring_prometheus_config_path,
+            candidate_path=self._settings.runtime_monitoring_prometheus_candidate_path,
+            backup_path=self._settings.runtime_monitoring_prometheus_backup_path,
+        )
+
+        if digest == self._monitoring_config_sha and paths.config_path.exists():
+            return (
+                False,
+                len(rendered.api_targets),
+                len(rendered.node_exporter_targets),
+                len(rendered.alertmanager_targets),
+            )
+
+        self._write_bytes_atomic(path=paths.candidate_path, data=config_data)
+        _logger.info(
+            "runtime.monitoring.candidate",
+            "Wrote candidate Prometheus config",
+            candidate_path=str(paths.candidate_path),
+            api_targets=len(rendered.api_targets),
+            node_exporter_targets=len(rendered.node_exporter_targets),
+            alertmanager_targets=len(rendered.alertmanager_targets),
+        )
+
+        validate_command = self._format_gateway_command(
+            self._settings.runtime_monitoring_validate_command,
+            config_path=paths.config_path,
+            candidate_path=paths.candidate_path,
+            backup_path=paths.backup_path,
+        )
+        if validate_command:
+            code, out, err = _run_command(("sh", "-c", validate_command))
+            if code != 0:
+                error_text = err or out or f"exit_{code}"
+                await self._mark_monitoring_status(
+                    status="validate_failed",
+                    error_text=error_text,
+                    digest=self._monitoring_config_sha,
+                    api_targets=rendered.api_targets,
+                    node_exporter_targets=rendered.node_exporter_targets,
+                    alertmanager_targets=rendered.alertmanager_targets,
+                )
+                raise RuntimeError(f"monitoring validation failed: {error_text}")
+
+        previous_config: bytes | None = None
+        if paths.config_path.exists():
+            previous_config = paths.config_path.read_bytes()
+            self._write_bytes_atomic(path=paths.backup_path, data=previous_config)
+        self._write_bytes_atomic(path=paths.config_path, data=config_data)
+
+        reload_command = self._format_gateway_command(
+            self._settings.runtime_monitoring_reload_command,
+            config_path=paths.config_path,
+            candidate_path=paths.candidate_path,
+            backup_path=paths.backup_path,
+        )
+        if reload_command:
+            code, out, err = _run_command(("sh", "-c", reload_command))
+            if code != 0:
+                error_text = err or out or f"exit_{code}"
+                if previous_config is not None:
+                    self._write_bytes_atomic(path=paths.config_path, data=previous_config)
+                    _run_command(("sh", "-c", reload_command))
+                await self._mark_monitoring_status(
+                    status="reload_failed",
+                    error_text=error_text,
+                    digest=self._monitoring_config_sha,
+                    api_targets=rendered.api_targets,
+                    node_exporter_targets=rendered.node_exporter_targets,
+                    alertmanager_targets=rendered.alertmanager_targets,
+                )
+                raise RuntimeError(f"monitoring reload failed: {error_text}")
+
+        self._monitoring_config_sha = digest
+        await self._mark_monitoring_status(
+            status="ok",
+            error_text="",
+            digest=digest,
+            api_targets=rendered.api_targets,
+            node_exporter_targets=rendered.node_exporter_targets,
+            alertmanager_targets=rendered.alertmanager_targets,
+        )
+
+        return (
+            True,
+            len(rendered.api_targets),
+            len(rendered.node_exporter_targets),
+            len(rendered.alertmanager_targets),
+        )
+
+    async def _snapshot_schedule_loop(self) -> None:
+        interval = self._settings.etcd_snapshot_interval_seconds
+        requested_by = self._settings.etcd_snapshot_schedule_requested_by
+        while not self._stop.is_set():
+            try:
+                now = datetime.now(timezone.utc)
+                should_run = True
+                age_seconds = -1.0
+                latest_id = ""
+
+                async with self._sessionmaker() as session:
+                    latest = await snapshot_service.list_snapshots(session, limit=1)
+                    if latest:
+                        item = latest[0]
+                        latest_id = item.id
+                        created_at = item.created_at
+                        if created_at.tzinfo is None:
+                            created_at = created_at.replace(tzinfo=timezone.utc)
+                        age_seconds = max(
+                            0.0,
+                            (now - created_at.astimezone(timezone.utc)).total_seconds(),
+                        )
+                        if item.status == "running":
+                            should_run = False
+                        elif age_seconds < interval:
+                            should_run = False
+
+                    if should_run:
+                        snapshot_id = f"auto-{now.strftime('%Y%m%d%H%M%S')}"
+                        result = await snapshot_service.create_snapshot(
+                            session,
+                            SnapshotRunCreate(id=snapshot_id, requested_by=requested_by),
+                        )
+                        _logger.info(
+                            "runtime.snapshot.run",
+                            "Executed scheduled etcd snapshot",
+                            snapshot_id=result.id,
+                            status=result.status,
+                            requested_by=requested_by,
+                            location=result.location or "",
+                        )
+                    else:
+                        _logger.debug(
+                            "runtime.snapshot.skip",
+                            "Skipped scheduled snapshot (interval not reached)",
+                            interval_seconds=interval,
+                            latest_snapshot_id=latest_id,
+                            latest_age_seconds=round(age_seconds, 1),
+                        )
+                record_runtime_loop(loop="snapshot_schedule", ok=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                record_runtime_loop(loop="snapshot_schedule", ok=False)
+                _logger.exception(
+                    "runtime.snapshot.error",
+                    "Scheduled snapshot loop failed",
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=interval)
+            except TimeoutError:
+                continue
 
     async def _node_agent_loop(self) -> None:
         interval = self._settings.runtime_heartbeat_interval_seconds

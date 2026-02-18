@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     etcd_command_timeout_seconds: int = Field(default=10, ge=1, le=120)
     etcd_snapshot_dir: str = Field(default="data/etcd-snapshots")
     etcd_snapshot_retention: int = Field(default=30, ge=1, le=365)
+    etcd_snapshot_schedule_enabled: bool = Field(default=True)
+    etcd_snapshot_interval_seconds: int = Field(default=86400, ge=60, le=604800)
+    etcd_snapshot_schedule_requested_by: str = Field(default="runtime.snapshot_scheduler")
     support_bundle_dir: str = Field(default="data/support-bundles")
     lxd_enabled: bool = Field(default=True)
     lxd_command: str = Field(default="lxc")
@@ -106,6 +109,25 @@ class Settings(BaseSettings):
     runtime_gateway_healthcheck_urls: str = Field(default="")
     runtime_gateway_healthcheck_timeout_seconds: int = Field(default=3, ge=1, le=60)
     runtime_gateway_healthcheck_expected_status: int = Field(default=200, ge=100, le=599)
+    runtime_monitoring_enable: bool = Field(default=False)
+    runtime_monitoring_interval_seconds: int = Field(default=15, ge=3, le=300)
+    runtime_monitoring_prometheus_config_path: str = Field(default="data/monitoring/prometheus.yml")
+    runtime_monitoring_prometheus_candidate_path: str = Field(
+        default="data/monitoring/prometheus.candidate.yml"
+    )
+    runtime_monitoring_prometheus_backup_path: str = Field(default="data/monitoring/prometheus.prev.yml")
+    runtime_monitoring_rules_path: str = Field(default="/etc/uptime-mesh/monitoring/alert_rules.yml")
+    runtime_monitoring_alertmanager_targets: str = Field(default="127.0.0.1:9093")
+    runtime_monitoring_scrape_interval_seconds: int = Field(default=15, ge=5, le=300)
+    runtime_monitoring_evaluation_interval_seconds: int = Field(default=15, ge=5, le=300)
+    runtime_monitoring_node_exporter_port: int = Field(default=9100, ge=1, le=65535)
+    runtime_monitoring_include_localhost_targets: bool = Field(default=True)
+    runtime_monitoring_validate_command: str = Field(
+        default="promtool check config {candidate_path}"
+    )
+    runtime_monitoring_reload_command: str = Field(
+        default="systemctl reload prometheus || systemctl restart prometheus"
+    )
 
     model_config = SettingsConfigDict(
         env_file=".env",

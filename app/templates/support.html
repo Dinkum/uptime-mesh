@@ -19,9 +19,15 @@
               <span>{{ snapshot.status }}</span>
               {% if snapshot.status == "completed" %}
                 <button class="btn btn-xs btn-outline snapshot-restore-btn" data-snapshot-id="{{ snapshot.id }}">Restore</button>
+                {% if snapshot.location %}
+                  <a class="btn btn-xs btn-outline" href="/etcd/snapshots/{{ snapshot.id }}/download">Download</a>
+                {% endif %}
               {% endif %}
             </div>
           </div>
+          {% if snapshot.error %}
+            <p class="text-xs text-red-600 break-all">{{ snapshot.error }}</p>
+          {% endif %}
         {% else %}
           <p class="text-slate-400">No snapshots yet.</p>
         {% endfor %}
@@ -43,6 +49,9 @@
               {% endif %}
             </div>
           </div>
+          {% if bundle.error %}
+            <p class="text-xs text-red-600 break-all">{{ bundle.error }}</p>
+          {% endif %}
         {% else %}
           <p class="text-slate-400">No bundles yet.</p>
         {% endfor %}
@@ -62,12 +71,21 @@
         const restoreButton = status === "completed"
           ? `<button class="btn btn-xs btn-outline snapshot-restore-btn" data-snapshot-id="${id}">Restore</button>`
           : "";
-        row.innerHTML = `<div class="flex flex-col"><span class="mono">${id}</span></div><div class="flex items-center gap-2"><span>${status}</span>${restoreButton}</div>`;
+        const download = extras && extras.download
+          ? `<a class="btn btn-xs btn-outline" href="${extras.download}">Download</a>`
+          : "";
+        const error = extras && extras.error
+          ? `<p class="text-xs text-red-600 break-all">${extras.error}</p>`
+          : "";
+        row.innerHTML = `<div class="flex flex-col"><span class="mono">${id}</span>${error}</div><div class="flex items-center gap-2"><span>${status}</span>${restoreButton}${download}</div>`;
       } else {
         const download = extras && extras.download
           ? `<a class="btn btn-xs btn-outline" href="${extras.download}">Download</a>`
           : "";
-        row.innerHTML = `<span class="mono">${id}</span><div class="flex items-center gap-2"><span>${status}</span>${download}</div>`;
+        const error = extras && extras.error
+          ? `<p class="text-xs text-red-600 break-all">${extras.error}</p>`
+          : "";
+        row.innerHTML = `<div class="flex flex-col"><span class="mono">${id}</span>${error}</div><div class="flex items-center gap-2"><span>${status}</span>${download}</div>`;
       }
       container.prepend(row);
     }
@@ -80,7 +98,8 @@
       });
       if (response.ok) {
         const data = await response.json();
-        addRow("snapshot-list", data.id, data.status, {});
+        const download = data.location ? `/etcd/snapshots/${data.id}/download` : "";
+        addRow("snapshot-list", data.id, data.status, { download, error: data.error || "" });
       }
     }
 
@@ -93,7 +112,8 @@
       });
       if (response.ok) {
         const data = await response.json();
-        addRow("snapshot-list", data.id, data.status, {});
+        const download = data.location ? `/etcd/snapshots/${data.id}/download` : "";
+        addRow("snapshot-list", data.id, data.status, { download, error: data.error || "" });
       }
     });
 
@@ -107,7 +127,7 @@
       if (response.ok) {
         const data = await response.json();
         const download = data.path ? `/support-bundles/${data.id}/download` : "";
-        addRow("bundle-list", data.id, data.status, { download });
+        addRow("bundle-list", data.id, data.status, { download, error: data.error || "" });
       }
     });
 

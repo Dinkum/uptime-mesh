@@ -26,6 +26,7 @@ from app.routes import (
     endpoints,
     events,
     gateway,
+    monitoring,
     nodes,
     replicas,
     router_assignments,
@@ -209,6 +210,7 @@ app.include_router(replicas.router)
 app.include_router(endpoints.router)
 app.include_router(discovery.router)
 app.include_router(gateway.router)
+app.include_router(monitoring.router)
 app.include_router(router_assignments.router)
 app.include_router(scheduler.router)
 app.include_router(events.router)

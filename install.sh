@@ -559,7 +559,7 @@ if [[ "$INSTALL_DEPS" -eq 1 ]]; then
   if [[ "$NODE_ROLE" == "gateway" ]]; then
     apt-get install -y nginx || true
   fi
-  apt-get install -y prometheus prometheus-node-exporter prometheus-alertmanager || true
+  apt-get install -y prometheus prometheus-node-exporter prometheus-alertmanager grafana || true
 fi
 
 require_cmd python3
@@ -621,6 +621,12 @@ setv("ETCD_DIAL_TIMEOUT_SECONDS", kv.get("ETCD_DIAL_TIMEOUT_SECONDS", "5") or "5
 setv("ETCD_COMMAND_TIMEOUT_SECONDS", kv.get("ETCD_COMMAND_TIMEOUT_SECONDS", "10") or "10")
 setv("ETCD_SNAPSHOT_DIR", kv.get("ETCD_SNAPSHOT_DIR", "data/etcd-snapshots") or "data/etcd-snapshots")
 setv("ETCD_SNAPSHOT_RETENTION", kv.get("ETCD_SNAPSHOT_RETENTION", "30") or "30")
+setv("ETCD_SNAPSHOT_SCHEDULE_ENABLED", kv.get("ETCD_SNAPSHOT_SCHEDULE_ENABLED", "true") or "true")
+setv("ETCD_SNAPSHOT_INTERVAL_SECONDS", kv.get("ETCD_SNAPSHOT_INTERVAL_SECONDS", "86400") or "86400")
+setv(
+    "ETCD_SNAPSHOT_SCHEDULE_REQUESTED_BY",
+    kv.get("ETCD_SNAPSHOT_SCHEDULE_REQUESTED_BY", "runtime.snapshot_scheduler") or "runtime.snapshot_scheduler",
+)
 setv("SUPPORT_BUNDLE_DIR", kv.get("SUPPORT_BUNDLE_DIR", "data/support-bundles") or "data/support-bundles")
 setv("LXD_ENABLED", kv.get("LXD_ENABLED", "true") or "true")
 setv("LXD_COMMAND", kv.get("LXD_COMMAND", "lxc") or "lxc")
@@ -714,6 +720,54 @@ setv(
     "RUNTIME_GATEWAY_HEALTHCHECK_EXPECTED_STATUS",
     kv.get("RUNTIME_GATEWAY_HEALTHCHECK_EXPECTED_STATUS", "200") or "200",
 )
+default_monitoring = "true" if "${NODE_ROLE}" == "worker" else "false"
+setv("RUNTIME_MONITORING_ENABLE", kv.get("RUNTIME_MONITORING_ENABLE", default_monitoring) or default_monitoring)
+setv("RUNTIME_MONITORING_INTERVAL_SECONDS", kv.get("RUNTIME_MONITORING_INTERVAL_SECONDS", "15") or "15")
+setv(
+    "RUNTIME_MONITORING_PROMETHEUS_CONFIG_PATH",
+    kv.get("RUNTIME_MONITORING_PROMETHEUS_CONFIG_PATH", "/etc/prometheus/prometheus.yml") or "/etc/prometheus/prometheus.yml",
+)
+setv(
+    "RUNTIME_MONITORING_PROMETHEUS_CANDIDATE_PATH",
+    kv.get("RUNTIME_MONITORING_PROMETHEUS_CANDIDATE_PATH", "/etc/prometheus/prometheus.candidate.yml") or "/etc/prometheus/prometheus.candidate.yml",
+)
+setv(
+    "RUNTIME_MONITORING_PROMETHEUS_BACKUP_PATH",
+    kv.get("RUNTIME_MONITORING_PROMETHEUS_BACKUP_PATH", "/etc/prometheus/prometheus.prev.yml") or "/etc/prometheus/prometheus.prev.yml",
+)
+setv(
+    "RUNTIME_MONITORING_RULES_PATH",
+    kv.get("RUNTIME_MONITORING_RULES_PATH", "/etc/uptime-mesh/monitoring/alert_rules.yml") or "/etc/uptime-mesh/monitoring/alert_rules.yml",
+)
+setv(
+    "RUNTIME_MONITORING_ALERTMANAGER_TARGETS",
+    kv.get("RUNTIME_MONITORING_ALERTMANAGER_TARGETS", "127.0.0.1:9093") or "127.0.0.1:9093",
+)
+setv(
+    "RUNTIME_MONITORING_SCRAPE_INTERVAL_SECONDS",
+    kv.get("RUNTIME_MONITORING_SCRAPE_INTERVAL_SECONDS", "15") or "15",
+)
+setv(
+    "RUNTIME_MONITORING_EVALUATION_INTERVAL_SECONDS",
+    kv.get("RUNTIME_MONITORING_EVALUATION_INTERVAL_SECONDS", "15") or "15",
+)
+setv(
+    "RUNTIME_MONITORING_NODE_EXPORTER_PORT",
+    kv.get("RUNTIME_MONITORING_NODE_EXPORTER_PORT", "9100") or "9100",
+)
+setv(
+    "RUNTIME_MONITORING_INCLUDE_LOCALHOST_TARGETS",
+    kv.get("RUNTIME_MONITORING_INCLUDE_LOCALHOST_TARGETS", "true") or "true",
+)
+setv(
+    "RUNTIME_MONITORING_VALIDATE_COMMAND",
+    kv.get("RUNTIME_MONITORING_VALIDATE_COMMAND", "promtool check config {candidate_path}") or "promtool check config {candidate_path}",
+)
+setv(
+    "RUNTIME_MONITORING_RELOAD_COMMAND",
+    kv.get("RUNTIME_MONITORING_RELOAD_COMMAND", "systemctl reload prometheus || systemctl restart prometheus")
+    or "systemctl reload prometheus || systemctl restart prometheus",
+)
 
 if (not kv.get("AUTH_SECRET_KEY")) or kv["AUTH_SECRET_KEY"].startswith("change-me"):
     setv("AUTH_SECRET_KEY", secrets.token_hex(32))
@@ -729,12 +783,24 @@ PY
 install -d /etc/uptime-mesh/monitoring/grafana/provisioning/dashboards
 install -d /etc/uptime-mesh/monitoring/grafana/provisioning/datasources
 install -d /etc/uptime-mesh/monitoring/grafana/dashboards
+install -d /etc/prometheus
+install -d /etc/alertmanager
 cp "${APP_DIR}/ops/monitoring/prometheus.yml" /etc/uptime-mesh/monitoring/prometheus.yml
 cp "${APP_DIR}/ops/monitoring/alert_rules.yml" /etc/uptime-mesh/monitoring/alert_rules.yml
 cp "${APP_DIR}/ops/monitoring/alertmanager.yml" /etc/uptime-mesh/monitoring/alertmanager.yml
 cp "${APP_DIR}/ops/monitoring/grafana/provisioning/dashboards/uptimemesh.yml" /etc/uptime-mesh/monitoring/grafana/provisioning/dashboards/uptimemesh.yml
 cp "${APP_DIR}/ops/monitoring/grafana/provisioning/datasources/uptimemesh.yml" /etc/uptime-mesh/monitoring/grafana/provisioning/datasources/uptimemesh.yml
 cp "${APP_DIR}/ops/monitoring/grafana/dashboards/uptimemesh-overview.json" /etc/uptime-mesh/monitoring/grafana/dashboards/uptimemesh-overview.json
+cp "${APP_DIR}/ops/monitoring/prometheus.yml" /etc/prometheus/prometheus.yml || true
+cp "${APP_DIR}/ops/monitoring/alertmanager.yml" /etc/alertmanager/alertmanager.yml || true
+if [[ -d /etc/grafana/provisioning ]]; then
+  install -d /etc/grafana/provisioning/dashboards
+  install -d /etc/grafana/provisioning/datasources
+  install -d /var/lib/grafana/dashboards
+  cp "${APP_DIR}/ops/monitoring/grafana/provisioning/dashboards/uptimemesh.yml" /etc/grafana/provisioning/dashboards/uptimemesh.yml || true
+  cp "${APP_DIR}/ops/monitoring/grafana/provisioning/datasources/uptimemesh.yml" /etc/grafana/provisioning/datasources/uptimemesh.yml || true
+  cp "${APP_DIR}/ops/monitoring/grafana/dashboards/uptimemesh-overview.json" /var/lib/grafana/dashboards/uptimemesh-overview.json || true
+fi
 
 cat > /etc/systemd/system/uptime-mesh.service <<SYSTEMD
 [Unit]
@@ -779,6 +845,8 @@ SYSTEMD
 
 systemctl daemon-reload
 systemctl enable --now uptime-mesh.service
+systemctl enable --now prometheus prometheus-node-exporter prometheus-alertmanager || true
+systemctl enable --now grafana-server || true
 
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   if curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then

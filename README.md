@@ -16,7 +16,7 @@ This repo contains the V1 control plane, UI, Go agent, and operational tooling.
 - 🔌 **Local agent control**: unix socket admin API (`data/agent.sock`) with `/healthz`, `/version`, `/status`.
 - 🧱 **Workload sandboxes**: LXD containers with snapshot/restore and rollout/rollback primitives.
 - 🖥️ **UI + CLI**: built-in Web UI and ASCII-first `uptimemesh` CLI.
-- 📊 **Observability-ready**: Prometheus/Grafana scaffolding and structured logs (`app.log`, `agent.log`).
+- 📊 **Observability-ready**: Prometheus config reconciliation, Grafana dashboard provisioning, Alertmanager rules, and structured logs (`app.log`, `agent.log`).
 - 🔁 **Failover foundations**: dual WireGuard interfaces and route metric switching for runtime failover.
 - 🧭 **Router assignment automation**: worker joins auto-reconcile primary/secondary router assignments.
 - 🔎 **Discovery**: CoreDNS zone generation (`mesh.local`) from the health registry.
@@ -144,7 +144,8 @@ sudo ./install.sh --wizard
 
 * **Gateway node**
 
-  * Reserved for ingress-heavy behavior (V1/V2 roadmap).
+  * Runs optional NGINX ingress config reconciliation.
+  * Applies safe config updates with validation and rollback.
 
 ### Control Behavior
 
@@ -313,10 +314,17 @@ gateway:
 uptimemesh snapshot-run --api-url http://127.0.0.1:8010 --username <login-id> --password <admin-pass>
 uptimemesh snapshot-list --api-url http://127.0.0.1:8010 --username <login-id> --password <admin-pass>
 uptimemesh snapshot-restore --api-url http://127.0.0.1:8010 <snapshot-id> --username <login-id> --password <admin-pass>
+uptimemesh snapshot-download --api-url http://127.0.0.1:8010 <snapshot-id> --output ./snapshot.db --username <login-id> --password <admin-pass>
 
 uptimemesh support-bundle-run --api-url http://127.0.0.1:8010 --username <login-id> --password <admin-pass>
 uptimemesh support-bundle-list --api-url http://127.0.0.1:8010 --username <login-id> --password <admin-pass>
+uptimemesh support-bundle-download --api-url http://127.0.0.1:8010 <bundle-id> --output ./bundle.tar.gz --username <login-id> --password <admin-pass>
 ```
+
+Scheduled etcd snapshots are enabled by default and controlled via:
+- `ETCD_SNAPSHOT_SCHEDULE_ENABLED`
+- `ETCD_SNAPSHOT_INTERVAL_SECONDS`
+- `ETCD_SNAPSHOT_SCHEDULE_REQUESTED_BY`
 
 Node identity artifacts live under:
 

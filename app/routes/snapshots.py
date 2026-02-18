@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import get_db_session, get_writable_db_session
@@ -29,3 +31,19 @@ async def request_snapshot(
         raise HTTPException(status_code=409, detail="Snapshot id already exists")
     snapshot = await snapshot_service.create_snapshot(session, payload)
     return SnapshotRunOut.model_validate(snapshot)
+
+
+@router.get("/{snapshot_id}/download")
+async def download_snapshot(
+    snapshot_id: str,
+    session: AsyncSession = Depends(get_db_session),
+) -> FileResponse:
+    snapshot = await snapshot_service.get_snapshot(session, snapshot_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+    if not snapshot.location:
+        raise HTTPException(status_code=409, detail="Snapshot artifact is not available")
+    path = Path(snapshot.location)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Snapshot artifact file is missing")
+    return FileResponse(path=str(path), filename=f"{snapshot_id}.db", media_type="application/octet-stream")

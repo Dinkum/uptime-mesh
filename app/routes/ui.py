@@ -16,6 +16,7 @@ from app.services import (
     discovery as discovery_service,
     events as event_service,
     gateway as gateway_service,
+    monitoring as monitoring_service,
     nodes as node_service,
     replicas as replica_service,
     router_assignments as router_assignment_service,
@@ -222,6 +223,52 @@ async def gateway_page(request: Request, session: AsyncSession = Depends(get_db_
     }
     context.update(await _base_context(request, session))
     return templates.TemplateResponse("gateway.html", context)
+
+
+@router.get("/monitoring")
+async def monitoring_page(request: Request, session: AsyncSession = Depends(get_db_session)) -> Any:
+    settings_map = await cluster_settings.get_settings_map(session)
+    paths = monitoring_service.resolve_monitoring_paths(
+        config_path=settings.runtime_monitoring_prometheus_config_path,
+        candidate_path=settings.runtime_monitoring_prometheus_candidate_path,
+        backup_path=settings.runtime_monitoring_prometheus_backup_path,
+    )
+
+    def split_csv(raw: str) -> list[str]:
+        return [item.strip() for item in raw.split(",") if item.strip()]
+
+    api_targets = split_csv(settings_map.get("monitoring_api_targets", ""))
+    node_exporter_targets = split_csv(settings_map.get("monitoring_node_exporter_targets", ""))
+    alertmanager_targets = split_csv(settings_map.get("monitoring_alertmanager_targets", ""))
+    context = {
+        "request": request,
+        "title": "Monitoring",
+        "subtitle": "Prometheus targets, alerting paths, and sync status",
+        "enabled": settings.runtime_monitoring_enable,
+        "config_endpoint": "/monitoring/prometheus/config",
+        "config_path": str(paths.config_path),
+        "config_sha256": settings_map.get("monitoring_config_sha256", ""),
+        "api_targets": api_targets,
+        "node_exporter_targets": node_exporter_targets,
+        "alertmanager_targets": alertmanager_targets,
+        "api_target_count": _safe_int(
+            settings_map.get("monitoring_api_target_count", "0"),
+            default=len(api_targets),
+        ),
+        "node_exporter_target_count": _safe_int(
+            settings_map.get("monitoring_node_exporter_target_count", "0"),
+            default=len(node_exporter_targets),
+        ),
+        "alertmanager_target_count": _safe_int(
+            settings_map.get("monitoring_alertmanager_target_count", "0"),
+            default=len(alertmanager_targets),
+        ),
+        "last_sync_at": settings_map.get("monitoring_last_sync_at", ""),
+        "last_apply_status": settings_map.get("monitoring_last_apply_status", "unknown"),
+        "last_apply_error": settings_map.get("monitoring_last_apply_error", ""),
+    }
+    context.update(await _base_context(request, session))
+    return templates.TemplateResponse("monitoring.html", context)
 
 
 @router.get("/support")
