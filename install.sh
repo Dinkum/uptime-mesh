@@ -554,12 +554,17 @@ if [[ "$INSTALL_DEPS" -eq 1 ]]; then
     apt-get install -y lxd || true
   fi
   if [[ "$NODE_ROLE" == "worker" ]]; then
-    apt-get install -y etcd || true
+    apt-get install -y etcd || apt-get install -y etcd-server etcd-client || true
   fi
   if [[ "$NODE_ROLE" == "gateway" ]]; then
     apt-get install -y nginx || true
   fi
   apt-get install -y prometheus prometheus-node-exporter prometheus-alertmanager grafana || true
+fi
+
+ETCD_AVAILABLE=0
+if command -v etcdctl >/dev/null 2>&1 || command -v etcd >/dev/null 2>&1; then
+  ETCD_AVAILABLE=1
 fi
 
 require_cmd python3
@@ -611,9 +616,9 @@ setv("AGENT_ENABLE_UNIX_SOCKET", kv.get("AGENT_ENABLE_UNIX_SOCKET", "true") or "
 setv("AGENT_UNIX_SOCKET", kv.get("AGENT_UNIX_SOCKET", "./data/agent.sock") or "./data/agent.sock")
 setv("MANAGED_CONFIG_PATH", kv.get("MANAGED_CONFIG_PATH", "config.yaml") or "config.yaml")
 setv("METRICS_ENABLED", kv.get("METRICS_ENABLED", "true") or "true")
-default_etcd_enabled = "true" if "${NODE_ROLE}" == "worker" else "false"
+default_etcd_enabled = "true" if "${NODE_ROLE}" == "worker" and "${ETCD_AVAILABLE}" == "1" else "false"
 setv("ETCD_ENABLED", kv.get("ETCD_ENABLED", default_etcd_enabled) or default_etcd_enabled)
-default_etcd_endpoints = "http://127.0.0.1:2379" if "${NODE_ROLE}" == "worker" else ""
+default_etcd_endpoints = "http://127.0.0.1:2379" if "${NODE_ROLE}" == "worker" and "${ETCD_AVAILABLE}" == "1" else ""
 setv("ETCD_ENDPOINTS", kv.get("ETCD_ENDPOINTS", default_etcd_endpoints) or default_etcd_endpoints)
 setv("ETCDCTL_COMMAND", kv.get("ETCDCTL_COMMAND", "etcdctl") or "etcdctl")
 setv("ETCD_PREFIX", kv.get("ETCD_PREFIX", "/uptimemesh") or "/uptimemesh")
@@ -844,6 +849,16 @@ WantedBy=multi-user.target
 SYSTEMD
 
 systemctl daemon-reload
+
+if [[ "$NODE_ROLE" == "worker" ]]; then
+  if systemctl list-unit-files | awk '{print $1}' | grep -qx 'etcd.service'; then
+    systemctl enable --now etcd || true
+  fi
+  if systemctl list-unit-files | awk '{print $1}' | grep -qx 'etcd-server.service'; then
+    systemctl enable --now etcd-server || true
+  fi
+fi
+
 systemctl enable --now uptime-mesh.service
 systemctl enable --now prometheus prometheus-node-exporter prometheus-alertmanager || true
 systemctl enable --now grafana-server || true
