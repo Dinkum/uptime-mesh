@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" data-theme="winter">
+<html lang="en" data-theme="dark">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -16,24 +16,26 @@
       body {
         font-family: "Space Grotesk", sans-serif;
         min-height: 100vh;
-        background: radial-gradient(circle at top left, #fde68a, transparent 45%),
-          radial-gradient(circle at 20% 60%, #a7f3d0, transparent 40%),
-          #f8fafc;
+        color: #e2e8f0;
+        background: radial-gradient(circle at 12% 12%, rgba(14, 165, 233, 0.18), transparent 32%),
+          radial-gradient(circle at 82% 18%, rgba(56, 189, 248, 0.14), transparent 28%),
+          linear-gradient(160deg, #030712 0%, #0b1220 55%, #0f172a 100%);
       }
       .mono {
         font-family: "IBM Plex Mono", monospace;
       }
       .mesh-card {
-        border: 1px solid rgba(15, 23, 42, 0.08);
-        box-shadow: 0 12px 30px rgba(15, 23, 42, 0.08);
+        border: 1px solid rgba(148, 163, 184, 0.22);
+        box-shadow: 0 28px 60px rgba(2, 6, 23, 0.6);
+        background: linear-gradient(180deg, rgba(15, 23, 42, 0.9), rgba(15, 23, 42, 0.82));
+        backdrop-filter: blur(8px);
       }
     </style>
   </head>
   <body class="flex items-center justify-center p-6">
-    <div class="w-full max-w-md bg-white rounded-2xl p-8 mesh-card">
-      <p class="mono text-xs uppercase tracking-[0.3em] text-slate-500">UptimeMesh</p>
+    <div class="w-full max-w-md rounded-2xl p-8 mesh-card">
       <h1 class="text-3xl font-semibold mt-2">Sign In</h1>
-      <p class="text-sm text-slate-500 mt-2">Cluster administration requires authentication.</p>
+      <p class="text-sm text-slate-400 mt-2">Cluster administration requires authentication.</p>
 
       {% if error %}
         <div class="alert alert-error mt-5 text-sm">
@@ -44,7 +46,7 @@
       <form method="post" action="/auth/login" class="mt-6 space-y-4">
         <input type="hidden" name="next" value="{{ next_path }}" />
         <label class="form-control">
-          <span class="label-text text-sm">Login ID</span>
+          <span class="label-text text-sm text-slate-300">Username</span>
           <input
             class="input input-bordered"
             type="text"
@@ -52,12 +54,12 @@
             value=""
             required
             autocomplete="username"
-            placeholder="UM-XXXX-XXXX-XXXX-XXXX"
+            placeholder="admin"
             autofocus
           />
         </label>
         <label class="form-control">
-          <span class="label-text text-sm">Password</span>
+          <span class="label-text text-sm text-slate-300">Password</span>
           <input
             class="input input-bordered"
             type="password"

@@ -77,9 +77,9 @@ _FIELDS: tuple[_ConfigField, ...] = (
     _ConfigField(
         section="AUTH",
         key="auth_username",
-        default="",
-        description="Administrative login ID for UI and CLI auth (auto-generated on first bootstrap).",
-        possible_values="UM-XXXX-XXXX-XXXX-XXXX style ID or empty before first bootstrap.",
+        default="admin",
+        description="Administrative username for UI and CLI authentication.",
+        possible_values="Any non-empty username string (default: admin).",
         import_from_yaml=True,
     ),
     _ConfigField(

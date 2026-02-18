@@ -73,6 +73,7 @@ Usage:
 
 Options:
   --name <name>              Node display name (default: generated 3-word name)
+  --username <username>      Initial admin username for first-node bootstrap (default: admin)
   --role <role>              Optional advanced override: worker | gateway (default: worker)
   --join <peer-ip|url>       Join an existing mesh via peer API
   --join-port <port>         Peer API port for --join when omitted in target (default: 8010)
@@ -99,6 +100,7 @@ USAGE
 
 NODE_ID=""
 NODE_NAME=""
+INSTALL_ADMIN_USERNAME="admin"
 NODE_ROLE=""
 API_URL="http://127.0.0.1:8010"
 API_ENDPOINT=""
@@ -111,7 +113,7 @@ PORT="8010"
 INSTALL_DEPS=0
 INSTALL_MONITORING=1
 WIZARD=0
-INITIAL_ADMIN_LOGIN_ID=""
+INITIAL_ADMIN_USERNAME=""
 INITIAL_ADMIN_PASSWORD=""
 INITIAL_ADMIN_GENERATED=0
 
@@ -350,6 +352,7 @@ run_wizard() {
   if [[ "$mode" == "first" ]]; then
     BOOTSTRAP=1
     INSTALL_MONITORING=1
+    INSTALL_ADMIN_USERNAME="$(prompt_default "Initial admin username" "${INSTALL_ADMIN_USERNAME}")"
   else
     BOOTSTRAP=0
     INSTALL_MONITORING=1
@@ -451,6 +454,8 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --name)
       NODE_NAME="$2"; shift 2 ;;
+    --username)
+      INSTALL_ADMIN_USERNAME="$2"; shift 2 ;;
     --role)
       NODE_ROLE="$2"; shift 2 ;;
     --api-url)
@@ -534,6 +539,10 @@ else
 fi
 if [[ "$BOOTSTRAP" -eq 1 && "$NODE_ROLE" != "worker" ]]; then
   echo "first-node install requires --role worker" >&2
+  exit 1
+fi
+if [[ "$BOOTSTRAP" -eq 1 && -z "${INSTALL_ADMIN_USERNAME// }" ]]; then
+  echo "--username cannot be empty for first-node install" >&2
   exit 1
 fi
 
@@ -905,14 +914,15 @@ done
 curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null
 
 if [[ "$BOOTSTRAP" -eq 1 ]]; then
-  bootstrap_prep_json="$(${APP_DIR}/.venv/bin/python - <<'PY'
+  bootstrap_prep_json="$(INSTALL_ADMIN_USERNAME="${INSTALL_ADMIN_USERNAME}" ${APP_DIR}/.venv/bin/python - <<'PY'
 import datetime as dt
 import json
+import os
 import secrets
 import sqlite3
 import string
 
-from app.security import generate_login_id, hash_password
+from app.security import hash_password
 
 conn = sqlite3.connect("data/app.db")
 cur = conn.cursor()
@@ -928,7 +938,7 @@ if bootstrapped:
     raise SystemExit(0)
 
 alphabet = string.ascii_letters + string.digits + "-_"
-username = generate_login_id(16)
+username = os.environ.get("INSTALL_ADMIN_USERNAME", "").strip() or "admin"
 password = "".join(secrets.choice(alphabet) for _ in range(28))
 password_hash = hash_password(password)
 updated_at = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -948,14 +958,14 @@ for key, value in (
     )
 
 conn.commit()
-print(json.dumps({"action": "generated", "login_id": username, "password": password}))
+print(json.dumps({"action": "generated", "username": username, "password": password}))
 PY
 )"
   bootstrap_action="$(printf '%s' "$bootstrap_prep_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("action",""))')"
   if [[ "$bootstrap_action" == "generated" ]]; then
-    INITIAL_ADMIN_LOGIN_ID="$(printf '%s' "$bootstrap_prep_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("login_id",""))')"
+    INITIAL_ADMIN_USERNAME="$(printf '%s' "$bootstrap_prep_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("username",""))')"
     INITIAL_ADMIN_PASSWORD="$(printf '%s' "$bootstrap_prep_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("password",""))')"
-    bootstrap_json="$(${APP_DIR}/.venv/bin/uptimemesh --api-url "${API_URL}" bootstrap --username "${INITIAL_ADMIN_LOGIN_ID}" --password "${INITIAL_ADMIN_PASSWORD}")"
+    bootstrap_json="$(${APP_DIR}/.venv/bin/uptimemesh --api-url "${API_URL}" bootstrap --username "${INITIAL_ADMIN_USERNAME}" --password "${INITIAL_ADMIN_PASSWORD}")"
     worker_token="$(printf '%s' "$bootstrap_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["worker_token"]["token"])')"
     join_cmd=(
       "${APP_DIR}/.venv/bin/uptimemesh" --api-url "${API_URL}" join
@@ -1009,7 +1019,7 @@ fi
 echo "Status:"
 if [[ "$INITIAL_ADMIN_GENERATED" -eq 1 ]]; then
   ${APP_DIR}/.venv/bin/uptimemesh --api-url "${API_URL}" nodes-status \
-    --username "${INITIAL_ADMIN_LOGIN_ID}" \
+    --username "${INITIAL_ADMIN_USERNAME}" \
     --password "${INITIAL_ADMIN_PASSWORD}" || true
 else
   echo "nodes-status requires admin credentials; run it manually once credentials are available."
@@ -1018,7 +1028,7 @@ print_install_summary
 if [[ "$INITIAL_ADMIN_GENERATED" -eq 1 ]]; then
   cat <<EOF
 Initial admin credentials (shown once):
-  login_id: ${INITIAL_ADMIN_LOGIN_ID}
+  username: ${INITIAL_ADMIN_USERNAME}
   password: ${INITIAL_ADMIN_PASSWORD}
 EOF
 fi

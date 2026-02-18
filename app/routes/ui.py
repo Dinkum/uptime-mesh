@@ -295,7 +295,7 @@ async def settings_page(request: Request, session: AsyncSession = Depends(get_db
         "request": request,
         "title": "Settings",
         "subtitle": "Authentication and cluster preferences",
-        "login_id": await auth_service.get_login_id(session),
+        "username": await auth_service.get_username(session),
         "password_success": "Password updated successfully." if password_updated else "",
         "password_error": "",
         "repo_success": "Repository URL updated successfully." if repo_updated else "",
@@ -321,7 +321,7 @@ async def change_password(
     new_password: str = Form(default=""),
     confirm_password: str = Form(default=""),
 ) -> Any:
-    login_id = await auth_service.get_login_id(session)
+    username = await auth_service.get_username(session)
     error = ""
     success = ""
     status_code = status.HTTP_200_OK
@@ -371,7 +371,7 @@ async def change_password(
         "request": request,
         "title": "Settings",
         "subtitle": "Authentication and cluster preferences",
-        "login_id": login_id,
+        "username": username,
         "password_success": success,
         "password_error": error,
         "repo_success": "",
@@ -411,7 +411,7 @@ async def update_repo_url(
         "request": request,
         "title": "Settings",
         "subtitle": "Authentication and cluster preferences",
-        "login_id": await auth_service.get_login_id(session),
+        "username": await auth_service.get_username(session),
         "password_success": "",
         "password_error": "",
         "repo_success": success,

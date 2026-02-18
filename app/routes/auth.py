@@ -129,7 +129,7 @@ async def login_submit(
             )
             return _login_context(
                 request,
-                error="Invalid login ID or password.",
+                error="Invalid username or password.",
                 next_path=next_path,
                 status_code=status.HTTP_401_UNAUTHORIZED,
             )
@@ -228,7 +228,7 @@ async def token_login(
                 client_ip=client_ip,
             )
             raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid login ID or password."
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid username or password."
             )
 
         limiter.record_success(ip_key)
