@@ -36,6 +36,7 @@ class NodeJoinRequest(BaseModel):
     role: str = Field(pattern="^(core|worker|gateway)$")
     mesh_ip: Optional[str] = None
     api_endpoint: Optional[str] = None
+    etcd_peer_url: Optional[str] = None
     labels: Dict[str, str] = Field(default_factory=dict)
     status: Dict[str, Any] = Field(default_factory=dict)
     lease_ttl_seconds: int = Field(default=45, ge=10, le=300)

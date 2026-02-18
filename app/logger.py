@@ -33,6 +33,7 @@ class _UptimeFormatter(logging.Formatter):
         event = getattr(record, "event", "")
         message = record.getMessage()
         fields: Mapping[str, Any] = getattr(record, "fields", {})
+        mutable_fields = dict(fields)
 
         parts = [
             f"{date_part} {time_part}",
@@ -41,15 +42,24 @@ class _UptimeFormatter(logging.Formatter):
         ]
 
         if event:
-            parts.append(f"{symbol} {event}")
+            if event == "operation.step":
+                step_name = str(mutable_fields.pop("step", "step"))
+                child_name = mutable_fields.pop("child", None)
+                mutable_fields.pop("step_depth", None)
+                if child_name:
+                    parts.append(f"{symbol} >> {step_name} >> {child_name}")
+                else:
+                    parts.append(f"{symbol} >> {step_name}")
+            else:
+                parts.append(f"{symbol} {event}")
         elif message:
             parts.append(f"{symbol} {message}")
 
         if event and message:
             parts.append(str(message))
 
-        if fields:
-            field_parts = [f"{key}: {value}" for key, value in fields.items()]
+        if mutable_fields:
+            field_parts = [f"{key}: {value}" for key, value in mutable_fields.items()]
             parts.extend(field_parts)
 
         formatted = " | ".join(parts)
@@ -99,12 +109,39 @@ class Operation:
                 error_type=exc_type.__name__,
             )
 
+    def _step(self, severity: int, name: str, message: str, **fields: Any) -> None:
+        payload = {
+            "operation": self.name,
+            "step": name,
+            **fields,
+        }
+        if severity == logging.WARNING:
+            self.logger.warning("operation.step", message, **payload)
+            return
+        if severity >= logging.ERROR:
+            self.logger.error("operation.step", message, **payload)
+            return
+        if severity == logging.DEBUG:
+            self.logger.debug("operation.step", message, **payload)
+            return
+        self.logger.info("operation.step", message, **payload)
+
     def step(self, name: str, message: str, **fields: Any) -> None:
-        self.logger.info(
-            "operation.step",
+        self._step(logging.INFO, name, message, **fields)
+
+    def step_warning(self, name: str, message: str, **fields: Any) -> None:
+        self._step(logging.WARNING, name, message, **fields)
+
+    def step_error(self, name: str, message: str, **fields: Any) -> None:
+        self._step(logging.ERROR, name, message, **fields)
+
+    def child(self, parent_step: str, child_name: str, message: str, **fields: Any) -> None:
+        self._step(
+            logging.INFO,
+            parent_step,
             message,
-            operation=self.name,
-            step=name,
+            child=child_name,
+            step_depth=2,
             **fields,
         )
 

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple
+from urllib.parse import urlparse
 from uuid import uuid4
 
 from sqlalchemy import select
@@ -31,6 +33,7 @@ from app.schemas.cluster import (
     NodeLeaseOut,
 )
 from app.services import cluster_settings
+from app.services import etcd as etcd_service
 from app.services.events import record_event
 
 _logger = get_logger("services.cluster")
@@ -66,6 +69,26 @@ def _lease_state(expires_at: Optional[datetime], *, now: Optional[datetime] = No
     if normalized_expires + timedelta(seconds=60) >= current:
         return "stale"
     return "dead"
+
+
+def _etcd_configured() -> bool:
+    return settings.etcd_enabled and bool(settings.etcd_endpoints.strip())
+
+
+def _resolve_etcd_peer_url(payload: NodeJoinRequest) -> str:
+    if payload.etcd_peer_url and payload.etcd_peer_url.strip():
+        return payload.etcd_peer_url.strip()
+    from_label = payload.labels.get("etcd_peer_url", "")
+    if isinstance(from_label, str) and from_label.strip():
+        return from_label.strip()
+    if payload.mesh_ip and payload.mesh_ip.strip():
+        return f"http://{payload.mesh_ip.strip()}:2380"
+    if payload.api_endpoint and payload.api_endpoint.strip():
+        parsed = urlparse(payload.api_endpoint.strip())
+        host = parsed.hostname or ""
+        if host:
+            return f"http://{host}:2380"
+    return ""
 
 
 async def create_join_token(
@@ -296,6 +319,84 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
         op.step("event.record", "Recorded node join event", cluster_event=event_name)
         await session.commit()
         op.step("db.commit", "Committed node join transaction")
+        if _etcd_configured():
+            try:
+                await etcd_service.put_value(
+                    key=f"nodes/{payload.node_id}",
+                    value=json.dumps(
+                        {
+                            "node_id": payload.node_id,
+                            "name": payload.name,
+                            "role": payload.role,
+                            "roles": [payload.role],
+                            "labels": payload.labels,
+                            "mesh_ip": payload.mesh_ip,
+                            "api_endpoint": payload.api_endpoint,
+                            "identity_fingerprint": identity_fingerprint,
+                            "lease_expires_at": lease_expires_at.isoformat(),
+                            "updated_at": now.isoformat(),
+                        },
+                        separators=(",", ":"),
+                    ),
+                )
+                op.step("etcd.node_upsert", "Upserted node record to etcd")
+            except Exception as exc:  # noqa: BLE001
+                op.step_warning(
+                    "etcd.node_upsert",
+                    "Failed to upsert node record to etcd",
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+        if payload.role == "core" and _etcd_configured():
+            peer_url = _resolve_etcd_peer_url(payload)
+            if peer_url:
+                try:
+                    members = await etcd_service.member_list()
+                    member_id = ""
+                    for member in members:
+                        if member.name == payload.node_id:
+                            member_id = member.member_id
+                            break
+                    if not member_id:
+                        added = await etcd_service.member_add(
+                            name=payload.node_id,
+                            peer_urls=[peer_url],
+                            is_learner=False,
+                        )
+                        member_id = added.member_id
+                        op.step(
+                            "etcd.member_add",
+                            "Added core node as etcd member",
+                            member_id=member_id,
+                            peer_url=peer_url,
+                        )
+                    else:
+                        op.step(
+                            "etcd.member_exists",
+                            "Core node already exists in etcd membership",
+                            member_id=member_id,
+                            peer_url=peer_url,
+                        )
+                    node.status = {
+                        **(node.status or {}),
+                        "etcd_member_id": member_id,
+                        "etcd_peer_url": peer_url,
+                    }
+                    await session.commit()
+                except Exception as exc:  # noqa: BLE001
+                    op.step_warning(
+                        "etcd.member_add",
+                        "Failed to ensure core node etcd member",
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                        peer_url=peer_url,
+                    )
+            else:
+                op.step_warning(
+                    "etcd.member_add",
+                    "Skipped etcd member add due to missing peer URL",
+                    node_id=payload.node_id,
+                )
         return NodeJoinOut(
             node_id=payload.node_id,
             lease_token=lease_token,
@@ -422,6 +523,29 @@ async def apply_heartbeat(
 
         await session.commit()
         op.step("db.commit", "Committed heartbeat update")
+        if _etcd_configured():
+            try:
+                lease_payload = {
+                    "node_id": node_id,
+                    "name": node.name,
+                    "roles": node.roles,
+                    "heartbeat_at": now.isoformat(),
+                    "lease_expires_at": lease_expires_at.isoformat(),
+                    "lease_state": _lease_state(lease_expires_at, now=now),
+                }
+                await etcd_service.put_json_with_lease(
+                    key=f"leases/{node_id}",
+                    payload=lease_payload,
+                    ttl_seconds=ttl_seconds,
+                )
+                op.step("etcd.lease_upsert", "Upserted node lease to etcd", ttl_seconds=ttl_seconds)
+            except Exception as exc:  # noqa: BLE001
+                op.step_warning(
+                    "etcd.lease_upsert",
+                    "Failed to upsert node lease to etcd",
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
         return HeartbeatOut(
             node_id=node_id,
             heartbeat_at=now,
@@ -431,6 +555,52 @@ async def apply_heartbeat(
 
 
 async def list_node_leases(session: AsyncSession, *, limit: int = 500) -> List[NodeLeaseOut]:
+    if _etcd_configured():
+        try:
+            rows = await etcd_service.get_prefix(key_prefix="leases/")
+            leases: list[NodeLeaseOut] = []
+            for raw in rows.values():
+                if not raw:
+                    continue
+                payload = json.loads(raw)
+                if not isinstance(payload, dict):
+                    continue
+                heartbeat_at = payload.get("heartbeat_at")
+                lease_expires_at = payload.get("lease_expires_at")
+                heartbeat_dt = (
+                    datetime.fromisoformat(heartbeat_at)
+                    if isinstance(heartbeat_at, str) and heartbeat_at
+                    else None
+                )
+                lease_dt = (
+                    datetime.fromisoformat(lease_expires_at)
+                    if isinstance(lease_expires_at, str) and lease_expires_at
+                    else None
+                )
+                roles = payload.get("roles")
+                lease = NodeLeaseOut(
+                    node_id=str(payload.get("node_id") or ""),
+                    name=str(payload.get("name") or payload.get("node_id") or ""),
+                    roles=[str(item) for item in roles] if isinstance(roles, list) else [],
+                    heartbeat_at=heartbeat_dt,
+                    lease_expires_at=lease_dt,
+                    lease_state=str(payload.get("lease_state") or _lease_state(lease_dt)),
+                )
+                if lease.node_id:
+                    leases.append(lease)
+            if leases:
+                order = {"alive": 0, "stale": 1, "dead": 2, "unknown": 3}
+                leases.sort(key=lambda item: (order.get(item.lease_state, 9), item.name))
+                _logger.info("lease.list.etcd", "Listed node leases from etcd", count=len(leases))
+                return leases[:limit]
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning(
+                "lease.list.etcd_error",
+                "Failed to list leases from etcd, falling back to DB",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+
     result = await session.execute(select(Node).limit(limit))
     nodes = list(result.scalars().all())
     now = _utcnow()

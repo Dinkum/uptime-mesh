@@ -16,8 +16,11 @@ _logger = get_logger("services.endpoints")
 
 
 async def list_endpoints(session: AsyncSession, limit: int = 200) -> List[Endpoint]:
-    result = await session.execute(select(Endpoint).limit(limit))
-    return list(result.scalars().all())
+    async with _logger.operation("endpoint.list", "Listing endpoints", limit=limit) as op:
+        result = await session.execute(select(Endpoint).limit(limit))
+        endpoints = list(result.scalars().all())
+        op.step("db.select", "Fetched endpoints", count=len(endpoints))
+        return endpoints
 
 
 async def get_endpoint(session: AsyncSession, endpoint_id: str) -> Optional[Endpoint]:
@@ -26,26 +29,37 @@ async def get_endpoint(session: AsyncSession, endpoint_id: str) -> Optional[Endp
 
 
 async def create_endpoint(session: AsyncSession, payload: EndpointCreate) -> Endpoint:
-    endpoint = Endpoint(
-        id=payload.id,
+    async with _logger.operation(
+        "endpoint.create",
+        "Creating endpoint",
+        endpoint_id=payload.id,
         replica_id=payload.replica_id,
         address=payload.address,
         port=payload.port,
-        healthy=payload.healthy,
-    )
-    session.add(endpoint)
-    await record_event(
-        session,
-        event_id=str(uuid4()),
-        category="endpoints",
-        name="endpoint.create",
-        level="INFO",
-        fields={"endpoint_id": endpoint.id, "replica_id": endpoint.replica_id},
-    )
-    await session.commit()
-    await session.refresh(endpoint)
-    _logger.info("endpoints.create", "Created endpoint", endpoint_id=endpoint.id)
-    return endpoint
+    ) as op:
+        endpoint = Endpoint(
+            id=payload.id,
+            replica_id=payload.replica_id,
+            address=payload.address,
+            port=payload.port,
+            healthy=payload.healthy,
+        )
+        session.add(endpoint)
+        op.step("db.insert", "Prepared endpoint row")
+        await record_event(
+            session,
+            event_id=str(uuid4()),
+            category="endpoints",
+            name="endpoint.create",
+            level="INFO",
+            fields={"endpoint_id": endpoint.id, "replica_id": endpoint.replica_id},
+        )
+        op.step("event.record", "Recorded endpoint create event")
+        await session.commit()
+        await session.refresh(endpoint)
+        op.step("db.commit", "Committed endpoint create transaction")
+        _logger.info("endpoints.create", "Created endpoint", endpoint_id=endpoint.id)
+        return endpoint
 
 
 async def update_endpoint(
@@ -53,22 +67,32 @@ async def update_endpoint(
     endpoint: Endpoint,
     payload: EndpointUpdate,
 ) -> Endpoint:
-    changed = False
-    if payload.healthy is not None:
-        endpoint.healthy = payload.healthy
-        endpoint.last_checked_at = datetime.now(timezone.utc)
-        changed = True
+    async with _logger.operation(
+        "endpoint.update",
+        "Updating endpoint",
+        endpoint_id=endpoint.id,
+    ) as op:
+        changed = False
+        if payload.healthy is not None:
+            endpoint.healthy = payload.healthy
+            endpoint.last_checked_at = datetime.now(timezone.utc)
+            changed = True
+            op.step("health.update", "Updated endpoint health", healthy=endpoint.healthy)
 
-    if changed:
-        await record_event(
-            session,
-            event_id=str(uuid4()),
-            category="endpoints",
-            name="endpoint.update",
-            level="INFO",
-            fields={"endpoint_id": endpoint.id, "healthy": endpoint.healthy},
-        )
+        if changed:
+            await record_event(
+                session,
+                event_id=str(uuid4()),
+                category="endpoints",
+                name="endpoint.update",
+                level="INFO",
+                fields={"endpoint_id": endpoint.id, "healthy": endpoint.healthy},
+            )
+            op.step("event.record", "Recorded endpoint update event")
+        else:
+            op.step("change.none", "No endpoint fields changed")
 
-    await session.commit()
-    await session.refresh(endpoint)
-    return endpoint
+        await session.commit()
+        await session.refresh(endpoint)
+        op.step("db.commit", "Committed endpoint update transaction")
+        return endpoint

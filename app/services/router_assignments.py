@@ -17,8 +17,15 @@ _logger = get_logger("services.router_assignments")
 async def list_router_assignments(
     session: AsyncSession, limit: int = 200
 ) -> List[RouterAssignment]:
-    result = await session.execute(select(RouterAssignment).limit(limit))
-    return list(result.scalars().all())
+    async with _logger.operation(
+        "router_assignment.list",
+        "Listing router assignments",
+        limit=limit,
+    ) as op:
+        result = await session.execute(select(RouterAssignment).limit(limit))
+        rows = list(result.scalars().all())
+        op.step("db.select", "Fetched router assignments", count=len(rows))
+        return rows
 
 
 async def get_router_assignment(
@@ -35,24 +42,38 @@ async def create_router_assignment(
     session: AsyncSession,
     payload: RouterAssignmentCreate,
 ) -> RouterAssignment:
-    assignment = RouterAssignment(
-        id=payload.id,
+    async with _logger.operation(
+        "router_assignment.create",
+        "Creating router assignment",
+        assignment_id=payload.id,
         node_id=payload.node_id,
-        primary_router_id=payload.primary_router_id,
-        secondary_router_id=payload.secondary_router_id,
-    )
-    session.add(assignment)
-    await record_event(
-        session,
-        event_id=str(uuid4()),
-        category="router_assignments",
-        name="router_assignment.create",
-        level="INFO",
-        fields={"assignment_id": assignment.id, "node_id": assignment.node_id},
-    )
-    await session.commit()
-    await session.refresh(assignment)
-    _logger.info(
-        "router_assignments.create", "Created router assignment", assignment_id=assignment.id
-    )
-    return assignment
+    ) as op:
+        assignment = RouterAssignment(
+            id=payload.id,
+            node_id=payload.node_id,
+            primary_router_id=payload.primary_router_id,
+            secondary_router_id=payload.secondary_router_id,
+        )
+        session.add(assignment)
+        op.step(
+            "db.insert",
+            "Prepared router assignment row",
+            primary_router_id=payload.primary_router_id,
+            secondary_router_id=payload.secondary_router_id,
+        )
+        await record_event(
+            session,
+            event_id=str(uuid4()),
+            category="router_assignments",
+            name="router_assignment.create",
+            level="INFO",
+            fields={"assignment_id": assignment.id, "node_id": assignment.node_id},
+        )
+        op.step("event.record", "Recorded router assignment create event")
+        await session.commit()
+        await session.refresh(assignment)
+        op.step("db.commit", "Committed router assignment transaction")
+        _logger.info(
+            "router_assignments.create", "Created router assignment", assignment_id=assignment.id
+        )
+        return assignment

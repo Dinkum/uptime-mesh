@@ -17,9 +17,11 @@ _logger = get_logger("services.nodes")
 
 
 async def list_nodes(session: AsyncSession, limit: int = 100) -> List[Node]:
-    _logger.debug("nodes.list", "Listing nodes", limit=limit)
-    result = await session.execute(select(Node).limit(limit))
-    return list(result.scalars().all())
+    async with _logger.operation("node.list", "Listing nodes", limit=limit) as op:
+        result = await session.execute(select(Node).limit(limit))
+        rows = list(result.scalars().all())
+        op.step("db.select", "Fetched nodes", count=len(rows))
+        return rows
 
 
 async def get_node(session: AsyncSession, node_id: str) -> Optional[Node]:
@@ -33,28 +35,37 @@ async def get_node_by_name(session: AsyncSession, name: str) -> Optional[Node]:
 
 
 async def create_node(session: AsyncSession, payload: NodeCreate) -> Node:
-    node = Node(
-        id=payload.id,
+    async with _logger.operation(
+        "node.create",
+        "Creating node",
+        node_id=payload.id,
         name=payload.name,
-        roles=payload.roles,
-        labels=payload.labels,
-        mesh_ip=payload.mesh_ip,
-        status=payload.status,
-        api_endpoint=payload.api_endpoint,
-    )
-    session.add(node)
-    await record_event(
-        session,
-        event_id=str(uuid4()),
-        category="nodes",
-        name="node.create",
-        level="INFO",
-        fields={"node_id": payload.id, "name": payload.name},
-    )
-    await session.commit()
-    await session.refresh(node)
-    _logger.info("nodes.create", "Created node", node_id=node.id, name=node.name)
-    return node
+    ) as op:
+        node = Node(
+            id=payload.id,
+            name=payload.name,
+            roles=payload.roles,
+            labels=payload.labels,
+            mesh_ip=payload.mesh_ip,
+            status=payload.status,
+            api_endpoint=payload.api_endpoint,
+        )
+        session.add(node)
+        op.step("db.insert", "Prepared node row", roles=len(payload.roles))
+        await record_event(
+            session,
+            event_id=str(uuid4()),
+            category="nodes",
+            name="node.create",
+            level="INFO",
+            fields={"node_id": payload.id, "name": payload.name},
+        )
+        op.step("event.record", "Recorded node create event")
+        await session.commit()
+        await session.refresh(node)
+        op.step("db.commit", "Committed node create transaction")
+        _logger.info("nodes.create", "Created node", node_id=node.id, name=node.name)
+        return node
 
 
 async def update_node(
@@ -62,39 +73,54 @@ async def update_node(
     node: Node,
     payload: NodeUpdate,
 ) -> Node:
-    changed = False
-    if payload.name is not None:
-        node.name = payload.name
-        changed = True
-    if payload.roles is not None:
-        node.roles = payload.roles
-        changed = True
-    if payload.labels is not None:
-        node.labels = payload.labels
-        changed = True
-    if payload.mesh_ip is not None:
-        node.mesh_ip = payload.mesh_ip
-        changed = True
-    if payload.status is not None:
-        node.status = payload.status
-        changed = True
-    if payload.api_endpoint is not None:
-        node.api_endpoint = payload.api_endpoint
-        changed = True
+    async with _logger.operation(
+        "node.update",
+        "Updating node",
+        node_id=node.id,
+    ) as op:
+        changed = False
+        if payload.name is not None:
+            node.name = payload.name
+            changed = True
+            op.step("name.update", "Updated node name", name=node.name)
+        if payload.roles is not None:
+            node.roles = payload.roles
+            changed = True
+            op.step("roles.update", "Updated node roles", roles=len(node.roles))
+        if payload.labels is not None:
+            node.labels = payload.labels
+            changed = True
+            op.step("labels.update", "Updated node labels", labels=len(node.labels))
+        if payload.mesh_ip is not None:
+            node.mesh_ip = payload.mesh_ip
+            changed = True
+            op.step("mesh_ip.update", "Updated mesh IP", mesh_ip=node.mesh_ip or "")
+        if payload.status is not None:
+            node.status = payload.status
+            changed = True
+            op.step("status.update", "Updated node status", status_fields=len(node.status or {}))
+        if payload.api_endpoint is not None:
+            node.api_endpoint = payload.api_endpoint
+            changed = True
+            op.step("api_endpoint.update", "Updated API endpoint", api_endpoint=node.api_endpoint or "")
 
-    if changed:
-        await record_event(
-            session,
-            event_id=str(uuid4()),
-            category="nodes",
-            name="node.update",
-            level="INFO",
-            fields={"node_id": node.id},
-        )
+        if changed:
+            await record_event(
+                session,
+                event_id=str(uuid4()),
+                category="nodes",
+                name="node.update",
+                level="INFO",
+                fields={"node_id": node.id},
+            )
+            op.step("event.record", "Recorded node update event")
+        else:
+            op.step("change.none", "No node fields changed")
 
-    await session.commit()
-    await session.refresh(node)
-    return node
+        await session.commit()
+        await session.refresh(node)
+        op.step("db.commit", "Committed node update transaction")
+        return node
 
 
 async def cordon_node(session: AsyncSession, node: Node) -> Node:

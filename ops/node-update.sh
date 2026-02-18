@@ -7,12 +7,12 @@
 
 set -eu
 
-UPDATER_VERSION="1.0.0"
-DEFAULT_VERSION_URL="https://raw.githubusercontent.com/your-org/uptime-mesh/main/version.json"
+UPDATER_VERSION="1.0.1"
+DEFAULT_VERSION_URL="https://raw.githubusercontent.com/Dinkum/uptime-mesh/main/version.json"
 
 VERSION_URL="${VERSION_URL:-$DEFAULT_VERSION_URL}"
 CHANNEL="${CHANNEL:-stable}"
-INSTALL_DIR="${INSTALL_DIR:-/opt/uptimemesh}"
+INSTALL_DIR="${INSTALL_DIR:-/opt/uptime-mesh}"
 BIN_DIR="${BIN_DIR:-/usr/local/bin}"
 STATE_DIR="${STATE_DIR:-/var/lib/uptimemesh}"
 LOCK_DIR="${LOCK_DIR:-/tmp/uptimemesh-update.lock}"

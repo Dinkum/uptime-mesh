@@ -1,0 +1,37 @@
+{% extends "layout.html" %}
+{% block content %}
+  <section class="grid gap-4">
+    <article class="bg-white rounded-2xl p-6 mesh-card">
+      <h2 class="text-lg font-semibold">DNS Domain</h2>
+      <p class="text-sm text-slate-500 mt-1">CoreDNS zone is generated from healthy endpoints only.</p>
+      <div class="mt-4 flex flex-wrap gap-3 items-center">
+        <span class="badge badge-outline mono py-3">{{ domain }}</span>
+        <a class="btn btn-sm btn-outline" href="{{ zone_endpoint }}" target="_blank" rel="noreferrer">View Zone File</a>
+      </div>
+    </article>
+
+    <article class="bg-white rounded-2xl p-6 mesh-card">
+      <h2 class="text-lg font-semibold">Service Records</h2>
+      <div class="mt-4 space-y-4">
+        {% for service in records %}
+          <div class="rounded-xl border border-slate-100 p-4">
+            <div class="flex flex-wrap gap-2 items-center">
+              <span class="mono text-sm">{{ service.service_fqdn }}</span>
+              <span class="badge badge-outline">{{ service.endpoints|length }} endpoints</span>
+            </div>
+            <div class="mt-3 space-y-1 text-sm">
+              {% for endpoint in service.endpoints %}
+                <div class="mono text-slate-600">
+                  {{ endpoint.host_fqdn }} -> {{ endpoint.address }}:{{ endpoint.port }}
+                </div>
+              {% endfor %}
+            </div>
+          </div>
+        {% else %}
+          <p class="text-slate-400">No healthy endpoints in registry.</p>
+        {% endfor %}
+      </div>
+    </article>
+  </section>
+{% endblock %}
+

@@ -13,6 +13,7 @@ Thumbs.db
 .env.*.local
 .envrc
 .python-version
+config.yaml
 test_servers.txt
 AGENTS.md
 ARCHITECTURE.md
@@ -43,6 +44,7 @@ ENV/
 
 # Packaging / build artifacts
 build/
+bin/
 dist/
 site/
 *.egg

@@ -192,6 +192,7 @@ def cmd_join(args: argparse.Namespace) -> int:
             "role": args.role,
             "mesh_ip": args.mesh_ip,
             "api_endpoint": args.api_endpoint,
+            "etcd_peer_url": args.etcd_peer_url,
             "labels": _parse_labels(args.label),
             "status": {},
             "lease_ttl_seconds": args.lease_ttl,
@@ -281,6 +282,117 @@ def cmd_nodes_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_etcd_status(args: argparse.Namespace) -> int:
+    session_token = _login(args.api_url, args.username, args.password)
+    result = _api_request(
+        base_url=args.api_url,
+        path="/etcd/status",
+        method="GET",
+        session_token=session_token,
+    )
+    if not isinstance(result, dict):
+        raise RuntimeError("Unexpected response for /etcd/status")
+    _print_json(result)
+    return 0
+
+
+def cmd_etcd_members(args: argparse.Namespace) -> int:
+    session_token = _login(args.api_url, args.username, args.password)
+    result = _api_request(
+        base_url=args.api_url,
+        path="/etcd/members",
+        method="GET",
+        session_token=session_token,
+    )
+    if not isinstance(result, list):
+        raise RuntimeError("Unexpected response for /etcd/members")
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_snapshot_run(args: argparse.Namespace) -> int:
+    session_token = _login(args.api_url, args.username, args.password)
+    body: Dict[str, Any] = {}
+    if args.id:
+        body["id"] = args.id
+    if args.requested_by:
+        body["requested_by"] = args.requested_by
+    result = _api_request(
+        base_url=args.api_url,
+        path="/etcd/snapshots",
+        method="POST",
+        json_body=body,
+        session_token=session_token,
+    )
+    if not isinstance(result, dict):
+        raise RuntimeError("Unexpected response for snapshot run")
+    _print_json(result)
+    return 0
+
+
+def cmd_snapshot_list(args: argparse.Namespace) -> int:
+    session_token = _login(args.api_url, args.username, args.password)
+    result = _api_request(
+        base_url=args.api_url,
+        path="/etcd/snapshots",
+        method="GET",
+        session_token=session_token,
+    )
+    if not isinstance(result, list):
+        raise RuntimeError("Unexpected response for /etcd/snapshots")
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_snapshot_restore(args: argparse.Namespace) -> int:
+    session_token = _login(args.api_url, args.username, args.password)
+    result = _api_request(
+        base_url=args.api_url,
+        path=f"/etcd/snapshots/{args.snapshot_id}/restore",
+        method="POST",
+        json_body={},
+        session_token=session_token,
+    )
+    if not isinstance(result, dict):
+        raise RuntimeError("Unexpected response for snapshot restore")
+    _print_json(result)
+    return 0
+
+
+def cmd_support_bundle_run(args: argparse.Namespace) -> int:
+    session_token = _login(args.api_url, args.username, args.password)
+    body: Dict[str, Any] = {}
+    if args.id:
+        body["id"] = args.id
+    if args.requested_by:
+        body["requested_by"] = args.requested_by
+    result = _api_request(
+        base_url=args.api_url,
+        path="/support-bundles",
+        method="POST",
+        json_body=body,
+        session_token=session_token,
+    )
+    if not isinstance(result, dict):
+        raise RuntimeError("Unexpected response for support bundle run")
+    _print_json(result)
+    return 0
+
+
+def cmd_support_bundle_list(args: argparse.Namespace) -> int:
+    session_token = _login(args.api_url, args.username, args.password)
+    result = _api_request(
+        base_url=args.api_url,
+        path="/support-bundles",
+        method="GET",
+        session_token=session_token,
+    )
+    if not isinstance(result, list):
+        raise RuntimeError("Unexpected response for /support-bundles")
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="uptimemesh", description="UptimeMesh ASCII-first CLI")
     parser.add_argument("--api-url", default="http://127.0.0.1:8000")
@@ -308,6 +420,7 @@ def build_parser() -> argparse.ArgumentParser:
     join.add_argument("--role", choices=["core", "worker", "gateway"], required=True)
     join.add_argument("--mesh-ip")
     join.add_argument("--api-endpoint")
+    join.add_argument("--etcd-peer-url")
     join.add_argument("--lease-ttl", type=int, default=45)
     join.add_argument("--identity-dir", default="data/identities")
     join.add_argument("--label", action="append", default=[])
@@ -325,6 +438,46 @@ def build_parser() -> argparse.ArgumentParser:
     nodes_status.add_argument("--username", default="admin")
     nodes_status.add_argument("--password", default="uptime")
     nodes_status.set_defaults(func=cmd_nodes_status)
+
+    etcd_status = sub.add_parser("etcd-status", help="Show etcd endpoint health")
+    etcd_status.add_argument("--username", default="admin")
+    etcd_status.add_argument("--password", default="uptime")
+    etcd_status.set_defaults(func=cmd_etcd_status)
+
+    etcd_members = sub.add_parser("etcd-members", help="List etcd members")
+    etcd_members.add_argument("--username", default="admin")
+    etcd_members.add_argument("--password", default="uptime")
+    etcd_members.set_defaults(func=cmd_etcd_members)
+
+    snapshot_run = sub.add_parser("snapshot-run", help="Run etcd snapshot now")
+    snapshot_run.add_argument("--username", default="admin")
+    snapshot_run.add_argument("--password", default="uptime")
+    snapshot_run.add_argument("--id")
+    snapshot_run.add_argument("--requested-by")
+    snapshot_run.set_defaults(func=cmd_snapshot_run)
+
+    snapshot_list = sub.add_parser("snapshot-list", help="List etcd snapshots")
+    snapshot_list.add_argument("--username", default="admin")
+    snapshot_list.add_argument("--password", default="uptime")
+    snapshot_list.set_defaults(func=cmd_snapshot_list)
+
+    snapshot_restore = sub.add_parser("snapshot-restore", help="Restore etcd snapshot")
+    snapshot_restore.add_argument("snapshot_id")
+    snapshot_restore.add_argument("--username", default="admin")
+    snapshot_restore.add_argument("--password", default="uptime")
+    snapshot_restore.set_defaults(func=cmd_snapshot_restore)
+
+    support_bundle_run = sub.add_parser("support-bundle-run", help="Generate support bundle")
+    support_bundle_run.add_argument("--username", default="admin")
+    support_bundle_run.add_argument("--password", default="uptime")
+    support_bundle_run.add_argument("--id")
+    support_bundle_run.add_argument("--requested-by")
+    support_bundle_run.set_defaults(func=cmd_support_bundle_run)
+
+    support_bundle_list = sub.add_parser("support-bundle-list", help="List support bundles")
+    support_bundle_list.add_argument("--username", default="admin")
+    support_bundle_list.add_argument("--password", default="uptime")
+    support_bundle_list.set_defaults(func=cmd_support_bundle_list)
 
     return parser
 

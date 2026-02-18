@@ -4,10 +4,10 @@
 
 set -u
 
-DEFAULT_VERSION_URL="https://raw.githubusercontent.com/your-org/uptime-mesh/main/version.json"
+DEFAULT_VERSION_URL="https://raw.githubusercontent.com/Dinkum/uptime-mesh/main/version.json"
 VERSION_URL="${VERSION_URL:-$DEFAULT_VERSION_URL}"
 CHANNEL="${CHANNEL:-stable}"
-INSTALL_DIR="${INSTALL_DIR:-/opt/uptimemesh}"
+INSTALL_DIR="${INSTALL_DIR:-/opt/uptime-mesh}"
 UPDATER_PATH="${UPDATER_PATH:-$INSTALL_DIR/node-update.sh}"
 
 log() {

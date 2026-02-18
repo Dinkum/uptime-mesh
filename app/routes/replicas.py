@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import get_db_session, get_writable_db_session
+from app.logger import get_logger
 from app.schemas.replicas import (
     ReplicaCreate,
     ReplicaMove,
@@ -14,10 +15,27 @@ from app.schemas.replicas import (
     ReplicaUpdate,
 )
 from app.services import nodes as node_service
+from app.services import lxd as lxd_service
 from app.services import replicas as replica_service
 from app.services import services as service_service
 
 router = APIRouter(prefix="/replicas", tags=["replicas"])
+_logger = get_logger("api.replicas")
+
+
+def _raise_lxd_http_error(exc: lxd_service.LXDOperationError) -> None:
+    status_code = 503 if isinstance(exc, lxd_service.LXDUnavailableError) else 409
+    _logger.warning(
+        "replica.lxd_error",
+        "Replica action failed due to LXD operation error",
+        action=exc.action,
+        detail=exc.detail,
+        status_code=status_code,
+    )
+    raise HTTPException(
+        status_code=status_code,
+        detail=f"LXD operation failed ({exc.action}): {exc.detail}",
+    ) from exc
 
 
 @router.get("", response_model=List[ReplicaOut])
@@ -50,7 +68,10 @@ async def create_replica(
         raise HTTPException(status_code=404, detail="Service not found")
     if await node_service.get_node(session, payload.node_id) is None:
         raise HTTPException(status_code=404, detail="Node not found")
-    replica = await replica_service.create_replica(session, payload)
+    try:
+        replica = await replica_service.create_replica(session, payload)
+    except lxd_service.LXDOperationError as exc:
+        _raise_lxd_http_error(exc)
     return ReplicaOut.model_validate(replica)
 
 
@@ -63,7 +84,10 @@ async def update_replica(
     replica = await replica_service.get_replica(session, replica_id)
     if replica is None:
         raise HTTPException(status_code=404, detail="Replica not found")
-    updated = await replica_service.update_replica(session, replica, payload)
+    try:
+        updated = await replica_service.update_replica(session, replica, payload)
+    except lxd_service.LXDOperationError as exc:
+        _raise_lxd_http_error(exc)
     return ReplicaOut.model_validate(updated)
 
 
@@ -78,7 +102,10 @@ async def move_replica(
         raise HTTPException(status_code=404, detail="Replica not found")
     if await node_service.get_node(session, payload.target_node_id) is None:
         raise HTTPException(status_code=404, detail="Target node not found")
-    updated = await replica_service.move_replica(session, replica, payload.target_node_id)
+    try:
+        updated = await replica_service.move_replica(session, replica, payload.target_node_id)
+    except lxd_service.LXDOperationError as exc:
+        _raise_lxd_http_error(exc)
     return ReplicaOut.model_validate(updated)
 
 
@@ -90,7 +117,10 @@ async def restart_replica(
     replica = await replica_service.get_replica(session, replica_id)
     if replica is None:
         raise HTTPException(status_code=404, detail="Replica not found")
-    updated = await replica_service.restart_replica(session, replica)
+    try:
+        updated = await replica_service.restart_replica(session, replica)
+    except lxd_service.LXDOperationError as exc:
+        _raise_lxd_http_error(exc)
     return ReplicaOut.model_validate(updated)
 
 
@@ -102,7 +132,10 @@ async def snapshot_replica(
     replica = await replica_service.get_replica(session, replica_id)
     if replica is None:
         raise HTTPException(status_code=404, detail="Replica not found")
-    updated = await replica_service.snapshot_replica(session, replica)
+    try:
+        updated = await replica_service.snapshot_replica(session, replica)
+    except lxd_service.LXDOperationError as exc:
+        _raise_lxd_http_error(exc)
     return ReplicaOut.model_validate(updated)
 
 
@@ -116,7 +149,10 @@ async def restore_replica(
     if replica is None:
         raise HTTPException(status_code=404, detail="Replica not found")
     snapshot_id = payload.snapshot_id if payload else None
-    updated = await replica_service.restore_replica(session, replica, snapshot_id)
+    try:
+        updated = await replica_service.restore_replica(session, replica, snapshot_id)
+    except lxd_service.LXDOperationError as exc:
+        _raise_lxd_http_error(exc)
     return ReplicaOut.model_validate(updated)
 
 
@@ -128,4 +164,7 @@ async def delete_replica(
     replica = await replica_service.get_replica(session, replica_id)
     if replica is None:
         raise HTTPException(status_code=404, detail="Replica not found")
-    await replica_service.delete_replica(session, replica)
+    try:
+        await replica_service.delete_replica(session, replica)
+    except lxd_service.LXDOperationError as exc:
+        _raise_lxd_http_error(exc)

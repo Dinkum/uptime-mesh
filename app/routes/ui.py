@@ -13,6 +13,7 @@ from app.security import SESSION_COOKIE_NAME, create_session_token
 from app.services import (
     auth as auth_service,
     cluster_settings,
+    discovery as discovery_service,
     events as event_service,
     nodes as node_service,
     replicas as replica_service,
@@ -157,6 +158,24 @@ async def wireguard_page(request: Request, session: AsyncSession = Depends(get_d
     return templates.TemplateResponse("wireguard.html", context)
 
 
+@router.get("/discovery")
+async def discovery_page(request: Request, session: AsyncSession = Depends(get_db_session)) -> Any:
+    records = await discovery_service.list_discovery_services(
+        session,
+        domain=settings.runtime_discovery_domain,
+    )
+    context = {
+        "request": request,
+        "title": "Discovery",
+        "subtitle": "CoreDNS records from healthy endpoint registry",
+        "records": records,
+        "domain": settings.runtime_discovery_domain,
+        "zone_endpoint": "/discovery/dns/zone",
+    }
+    context.update(await _base_context(request, session))
+    return templates.TemplateResponse("discovery.html", context)
+
+
 @router.get("/support")
 async def support_page(request: Request, session: AsyncSession = Depends(get_db_session)) -> Any:
     snapshots = await snapshot_service.list_snapshots(session)
@@ -174,16 +193,28 @@ async def support_page(request: Request, session: AsyncSession = Depends(get_db_
 
 @router.get("/settings")
 async def settings_page(request: Request, session: AsyncSession = Depends(get_db_session)) -> Any:
-    updated = request.query_params.get("updated") == "1"
+    password_updated = request.query_params.get("password_updated") == "1"
+    repo_updated = request.query_params.get("repo_updated") == "1"
+    settings_map = await cluster_settings.get_settings_map(session)
     context = {
         "request": request,
         "title": "Settings",
         "subtitle": "Authentication and cluster preferences",
         "username": await auth_service.get_username(session),
-        "success": "Password updated successfully." if updated else "",
-        "error": "",
+        "password_success": "Password updated successfully." if password_updated else "",
+        "password_error": "",
+        "repo_success": "Repository URL updated successfully." if repo_updated else "",
+        "repo_error": "",
+        "github_repo_url": settings_map.get("github_repo_url", "https://github.com/Dinkum/uptime-mesh"),
     }
-    context.update(await _base_context(request, session))
+    context.update(
+        {
+            "ui_prefix": "/ui",
+            "auth_user": getattr(request.state, "auth_user", ""),
+            "etcd_status": settings_map.get("etcd_status", "unknown"),
+            "etcd_last_sync_at": settings_map.get("etcd_last_sync_at"),
+        }
+    )
     return templates.TemplateResponse("settings.html", context)
 
 
@@ -225,7 +256,7 @@ async def change_password(
                 ttl_seconds=settings.auth_session_ttl_seconds,
             )
             response = RedirectResponse(
-                url="/ui/settings?updated=1", status_code=status.HTTP_303_SEE_OTHER
+                url="/ui/settings?password_updated=1", status_code=status.HTTP_303_SEE_OTHER
             )
             response.set_cookie(
                 key=SESSION_COOKIE_NAME,
@@ -246,8 +277,51 @@ async def change_password(
         "title": "Settings",
         "subtitle": "Authentication and cluster preferences",
         "username": username,
-        "success": success,
-        "error": error,
+        "password_success": success,
+        "password_error": error,
+        "repo_success": "",
+        "repo_error": "",
+        "github_repo_url": (await cluster_settings.get_settings_map(session)).get(
+            "github_repo_url",
+            "https://github.com/Dinkum/uptime-mesh",
+        ),
+    }
+    context.update(await _base_context(request, session))
+    return templates.TemplateResponse("settings.html", context, status_code=status_code)
+
+
+@router.post("/settings/repo")
+async def update_repo_url(
+    request: Request,
+    session: AsyncSession = Depends(get_db_session),
+    github_repo_url: str = Form(default=""),
+) -> Any:
+    clean_url = github_repo_url.strip()
+    error = ""
+    success = ""
+    status_code = status.HTTP_200_OK
+    if not clean_url:
+        error = "Repository URL is required."
+        status_code = status.HTTP_400_BAD_REQUEST
+    elif not clean_url.startswith("https://github.com/"):
+        error = "Repository URL must start with https://github.com/."
+        status_code = status.HTTP_400_BAD_REQUEST
+    else:
+        await cluster_settings.set_setting(session, "github_repo_url", clean_url)
+        success = "Repository URL updated successfully."
+        response = RedirectResponse(url="/ui/settings?repo_updated=1", status_code=status.HTTP_303_SEE_OTHER)
+        return response
+
+    context = {
+        "request": request,
+        "title": "Settings",
+        "subtitle": "Authentication and cluster preferences",
+        "username": await auth_service.get_username(session),
+        "password_success": "",
+        "password_error": "",
+        "repo_success": success,
+        "repo_error": error,
+        "github_repo_url": clean_url or "https://github.com/Dinkum/uptime-mesh",
     }
     context.update(await _base_context(request, session))
     return templates.TemplateResponse("settings.html", context, status_code=status_code)

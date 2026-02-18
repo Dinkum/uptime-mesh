@@ -17,15 +17,15 @@
       <div class="card-body">
         <h2 class="card-title">Change Password</h2>
 
-        {% if success %}
+        {% if password_success %}
           <div class="alert alert-success text-sm mt-2">
-            <span>{{ success }}</span>
+            <span>{{ password_success }}</span>
           </div>
         {% endif %}
 
-        {% if error %}
+        {% if password_error %}
           <div class="alert alert-error text-sm mt-2">
-            <span>{{ error }}</span>
+            <span>{{ password_error }}</span>
           </div>
         {% endif %}
 
@@ -66,6 +66,42 @@
           </label>
 
           <button class="btn btn-primary w-full mt-2" type="submit">Update Password</button>
+        </form>
+      </div>
+    </article>
+
+    <article class="card bg-white mesh-card">
+      <div class="card-body">
+        <h2 class="card-title">Repository</h2>
+        <p class="text-sm text-slate-500">
+          Source URL used by installer/update scripts when reading managed config.
+        </p>
+
+        {% if repo_success %}
+          <div class="alert alert-success text-sm mt-2">
+            <span>{{ repo_success }}</span>
+          </div>
+        {% endif %}
+
+        {% if repo_error %}
+          <div class="alert alert-error text-sm mt-2">
+            <span>{{ repo_error }}</span>
+          </div>
+        {% endif %}
+
+        <form method="post" action="{{ ui_prefix }}/settings/repo" class="space-y-3 mt-3">
+          <label class="form-control">
+            <span class="label-text text-sm">GitHub Repository URL</span>
+            <input
+              class="input input-bordered"
+              type="url"
+              name="github_repo_url"
+              required
+              value="{{ github_repo_url }}"
+              placeholder="https://github.com/Dinkum/uptime-mesh"
+            />
+          </label>
+          <button class="btn btn-primary w-full mt-2" type="submit">Update Repository URL</button>
         </form>
       </div>
     </article>

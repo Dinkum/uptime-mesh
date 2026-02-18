@@ -4,14 +4,23 @@
   <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
     <div class="mesh-card bg-white rounded-2xl p-6">
       <h2 class="text-lg font-semibold">etcd Snapshots</h2>
-      <p class="text-sm text-slate-500">Request snapshots and track recent runs.</p>
-      <p class="text-xs text-slate-400 mt-1">Requests are recorded here and executed by agents.</p>
+      <p class="text-sm text-slate-500">Run snapshots now and track execution status.</p>
       <button class="btn btn-sm btn-outline mt-4" id="snapshot-btn">Request snapshot</button>
       <div class="mt-4 space-y-2 text-sm" id="snapshot-list">
         {% for snapshot in snapshots %}
-          <div class="flex justify-between">
-            <span class="mono">{{ snapshot.id }}</span>
-            <span>{{ snapshot.status }}</span>
+          <div class="flex justify-between items-center gap-3">
+            <div class="flex flex-col">
+              <span class="mono">{{ snapshot.id }}</span>
+              {% if snapshot.location %}
+                <span class="text-xs text-slate-400">{{ snapshot.location }}</span>
+              {% endif %}
+            </div>
+            <div class="flex items-center gap-2">
+              <span>{{ snapshot.status }}</span>
+              {% if snapshot.status == "completed" %}
+                <button class="btn btn-xs btn-outline snapshot-restore-btn" data-snapshot-id="{{ snapshot.id }}">Restore</button>
+              {% endif %}
+            </div>
           </div>
         {% else %}
           <p class="text-slate-400">No snapshots yet.</p>
@@ -22,13 +31,17 @@
     <div class="mesh-card bg-white rounded-2xl p-6">
       <h2 class="text-lg font-semibold">Support Bundles</h2>
       <p class="text-sm text-slate-500">Collect logs and configs for diagnostics.</p>
-      <p class="text-xs text-slate-400 mt-1">Requests are recorded here and executed by agents.</p>
       <button class="btn btn-sm btn-outline mt-4" id="bundle-btn">Request bundle</button>
       <div class="mt-4 space-y-2 text-sm" id="bundle-list">
         {% for bundle in bundles %}
-          <div class="flex justify-between">
+          <div class="flex justify-between items-center gap-3">
             <span class="mono">{{ bundle.id }}</span>
-            <span>{{ bundle.status }}</span>
+            <div class="flex items-center gap-2">
+              <span>{{ bundle.status }}</span>
+              {% if bundle.status == "completed" and bundle.path %}
+                <a class="btn btn-xs btn-outline" href="/support-bundles/{{ bundle.id }}/download">Download</a>
+              {% endif %}
+            </div>
           </div>
         {% else %}
           <p class="text-slate-400">No bundles yet.</p>
@@ -41,12 +54,34 @@
     const snapshotBtn = document.getElementById("snapshot-btn");
     const bundleBtn = document.getElementById("bundle-btn");
 
-    function addRow(containerId, id, status) {
+    function addRow(containerId, id, status, extras) {
       const container = document.getElementById(containerId);
       const row = document.createElement("div");
-      row.className = "flex justify-between";
-      row.innerHTML = `<span class="mono">${id}</span><span>${status}</span>`;
+      row.className = "flex justify-between items-center gap-3";
+      if (containerId === "snapshot-list") {
+        const restoreButton = status === "completed"
+          ? `<button class="btn btn-xs btn-outline snapshot-restore-btn" data-snapshot-id="${id}">Restore</button>`
+          : "";
+        row.innerHTML = `<div class="flex flex-col"><span class="mono">${id}</span></div><div class="flex items-center gap-2"><span>${status}</span>${restoreButton}</div>`;
+      } else {
+        const download = extras && extras.download
+          ? `<a class="btn btn-xs btn-outline" href="${extras.download}">Download</a>`
+          : "";
+        row.innerHTML = `<span class="mono">${id}</span><div class="flex items-center gap-2"><span>${status}</span>${download}</div>`;
+      }
       container.prepend(row);
+    }
+
+    async function restoreSnapshot(snapshotId) {
+      const response = await fetch(`/etcd/snapshots/${snapshotId}/restore`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({})
+      });
+      if (response.ok) {
+        const data = await response.json();
+        addRow("snapshot-list", data.id, data.status, {});
+      }
     }
 
     snapshotBtn.addEventListener("click", async () => {
@@ -58,7 +93,7 @@
       });
       if (response.ok) {
         const data = await response.json();
-        addRow("snapshot-list", data.id, data.status);
+        addRow("snapshot-list", data.id, data.status, {});
       }
     });
 
@@ -71,8 +106,24 @@
       });
       if (response.ok) {
         const data = await response.json();
-        addRow("bundle-list", data.id, data.status);
+        const download = data.path ? `/support-bundles/${data.id}/download` : "";
+        addRow("bundle-list", data.id, data.status, { download });
       }
+    });
+
+    document.addEventListener("click", async (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) {
+        return;
+      }
+      if (!target.classList.contains("snapshot-restore-btn")) {
+        return;
+      }
+      const snapshotId = target.getAttribute("data-snapshot-id");
+      if (!snapshotId) {
+        return;
+      }
+      await restoreSnapshot(snapshotId);
     });
   </script>
 {% endblock %}

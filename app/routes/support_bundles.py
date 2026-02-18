@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import get_db_session, get_writable_db_session
@@ -29,3 +31,22 @@ async def request_support_bundle(
         raise HTTPException(status_code=409, detail="Support bundle id already exists")
     bundle = await support_bundle_service.create_support_bundle(session, payload)
     return SupportBundleOut.model_validate(bundle)
+
+
+@router.get("/{bundle_id}/download")
+async def download_support_bundle(
+    bundle_id: str,
+    session: AsyncSession = Depends(get_db_session),
+) -> FileResponse:
+    bundle = await support_bundle_service.get_support_bundle(session, bundle_id)
+    if bundle is None:
+        raise HTTPException(status_code=404, detail="Support bundle not found")
+    if not bundle.path:
+        raise HTTPException(status_code=409, detail="Support bundle artifact is not available")
+    if not Path(bundle.path).exists():
+        raise HTTPException(status_code=404, detail="Support bundle artifact file is missing")
+    return FileResponse(
+        path=bundle.path,
+        filename=f"{bundle_id}.tar.gz",
+        media_type="application/gzip",
+    )

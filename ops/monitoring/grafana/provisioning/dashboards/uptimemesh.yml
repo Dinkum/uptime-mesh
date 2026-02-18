@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: UptimeMesh
+    orgId: 1
+    folder: UptimeMesh
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/uptime-mesh/monitoring/grafana/dashboards

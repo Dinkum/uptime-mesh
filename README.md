@@ -1,173 +1,247 @@
 # UptimeMesh
 
-UptimeMesh is a small-control-plane cluster manager and private network fabric. This repo contains the FastAPI control UI and API service for V1.
+## Intro
+UptimeMesh is a self-healing private mesh control plane for small to mid-sized clusters.
 
-## Requirements
+It combines:
+- WireGuard for encrypted node-to-node transport
+- etcd for replicated cluster truth and coordination
+- a standalone Go node agent for continuous reconciliation and signed heartbeats
+- LXD-based workload sandboxes with snapshot/restore actions
+- a built-in Web UI plus ASCII-first CLI
+- Prometheus/Grafana-ready observability
 
-- Python 3.11+
-- SQLite for dev (WAL mode enabled automatically)
+This repository is the V1 control plane, UI, and operational tooling.
+
+## Features
+- Source-first deployment: no binary packaging required for V1.
+- One-command install path: local `./install.sh` or remote `curl ... | bash`.
+- Secure auth baseline: login page, session cookies, password change in UI.
+- Signed node identity flow: CSR-based cert issuance + signed heartbeat payloads.
+- Dedicated Go agent process (`uptimemesh-agent`) per node.
+- etcd operations:
+  - health and member management
+  - snapshot run and restore flow
+- Runtime failover foundations:
+  - dual WireGuard interface status model
+  - route metric preference switching
+- CoreDNS discovery projection:
+  - healthy endpoint registry -> zone rendering (`mesh.local`)
+- LXD operations wired to replica and service actions:
+  - create/move/restart/snapshot/restore/delete
+  - service rollout and rollback with snapshot-based safety behavior
+- High-signal structured logging to `app.log`.
+- Prometheus/Grafana-ready metrics and monitoring config scaffolding in `ops/monitoring`.
 
 ## Setup
-
-1. Create a virtualenv and install dependencies.
-2. Create a `.env` file (see `.env.example`).
-3. Run migrations.
-
+### 1. Local Development Setup
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
 alembic upgrade head
-```
-
-## Run
-
-```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-## UI
-
-The Web UI is available under `/ui`.
-
-## Authentication
-
-- Login page: `/auth/login`
-- API login: `POST /auth/token`
-- Default credentials after migration/seed: `admin` / `uptime`
-- Change password in UI: `/ui/settings`
-- Set `AUTH_SECRET_KEY` in `.env` for production-like environments.
-
-## Production Hardening
-
-- Set `APP_ENV=prod` (or `production`) to enable strict startup validation.
-- In production, startup now fails unless all are true:
-  - `AUTH_SECRET_KEY` is non-default and at least 32 chars.
-  - `CLUSTER_SIGNING_KEY` is non-default and at least 32 chars.
-  - `AUTH_COOKIE_SECURE=true`.
-- Rotate the default `admin/uptime` credential immediately after first bootstrap (`/ui/settings`).
-
-## Bootstrap and Enrollment
-
-- `POST /cluster/bootstrap` creates initial core/worker join tokens.
-- `POST /cluster/join-tokens` creates on-demand one-time join tokens.
-- `POST /cluster/join` enrolls a node using a one-time token + CSR, returns signed node cert + signed lease token.
-- `POST /cluster/heartbeat` requires signed heartbeat payload (node private key proof).
-- `GET /cluster/leases` lists node lease health (`alive`, `stale`, `dead`).
-
-## CLI
-
-ASCII-first CLI is available as `uptimemesh`:
-
+Build the Go agent locally (optional in dev, required for node installs):
 ```bash
-uptimemesh bootstrap --api-url http://127.0.0.1:8000
-uptimemesh join --api-url http://127.0.0.1:8000 --token <join-token> --node-id node-a --name node-a --role worker
-uptimemesh heartbeat --api-url http://127.0.0.1:8000 --node-id node-a
-uptimemesh nodes-status --api-url http://127.0.0.1:8000
+go build -o bin/uptimemesh-agent ./agent/cmd/uptimemesh-agent
 ```
 
-`uptimemesh join` stores identity artifacts under `data/identities/<node-id>/`:
+UI: `http://127.0.0.1:8000/ui`
 
-- `node.key` (private key)
-- `node.crt` (cluster-signed cert)
-- `ca.crt` (cluster CA)
-- `lease.token` (signed lease token)
+Default login after seed/migrations:
+- username: `admin`
+- password: `uptime`
 
-## Node Update Mechanism
-
-Node-side update tooling is included for GitHub-based distribution:
-
-- manifest: `version.json`
-- bootstrap shim: `ops/bootstrap.sh` (tiny handoff script)
-- robust updater: `ops/node-update.sh`
-
-Typical node invocation:
-
+### 2. Node Install (Source-First)
+Run from a checkout:
 ```bash
-VERSION_URL=https://raw.githubusercontent.com/<org>/<repo>/main/version.json sh ops/bootstrap.sh
+sudo ./install.sh --wizard
 ```
 
-See `ops/README.md` for release/checksum workflow.
+Direct from GitHub:
+```bash
+curl -fsSL https://raw.githubusercontent.com/Dinkum/uptime-mesh/main/install.sh | bash -s -- --wizard
+```
 
-## Runtime Controller (Phase 2)
+### 3. First Core Node (Bootstrap)
+```bash
+sudo ./install.sh \
+  --install-deps \
+  --install-monitoring \
+  --bootstrap \
+  --node-id node1 \
+  --name node1 \
+  --role core \
+  --api-endpoint http://<node1-ip>:8010 \
+  --etcd-peer-url http://<node1-ip>:2380
+```
 
-The API process can run a lightweight node runtime loop (source-first, no binaries required):
+### 4. Additional Nodes (Join)
+```bash
+sudo ./install.sh \
+  --install-deps \
+  --node-id node2 \
+  --name node2 \
+  --role worker \
+  --api-url http://<node1-ip>:8010 \
+  --api-endpoint http://<node2-ip>:8010 \
+  --token <join-token>
+```
 
-- signed heartbeat publishing to `/cluster/heartbeat`
-- WireGuard primary/secondary reachability checks
-- route-metric failover (`ip route replace`) between `wg-mesh0` and `wg-mesh1`
-- etcd endpoint health probing and `cluster_settings.etcd_status` reconciliation
+## Architecture
+```text
+                  +---------------------------+
+                  |        Web UI / CLI       |
+                  +------------+--------------+
+                               |
+                               v
+                  +---------------------------+
+                  |   FastAPI Control Plane   |
+                  | auth, APIs, events, UI    |
+                  +------------+--------------+
+                               |
+                +--------------+--------------+
+                |                             |
+                v                             v
+        +---------------+             +---------------+
+        |     etcd      |             |   Go Agent    |
+        | cluster truth |             | reconcile loop|
+        +-------+-------+             +-------+-------+
+                |                             |
+                v                             v
+        +---------------+             +---------------+
+        |  Discovery    |             |   WireGuard   |
+        | CoreDNS zone  |             | + LXD actions |
+        +---------------+             +---------------+
+```
 
-Enable with environment variables:
+### Role Model
+- Core node:
+  - API/UI
+  - etcd member (when configured)
+  - discovery/monitoring components
+- Worker node:
+  - Go agent loop
+  - LXD workload actions
+- Gateway node:
+  - reserved for ingress-focused behavior in V1/V2 roadmap
 
-- `RUNTIME_ENABLE=true`
-- `RUNTIME_NODE_ID=<node-id>`
-- optional:
-  - `RUNTIME_ETCD_ENDPOINTS=http://127.0.0.1:2379,http://10.0.0.2:2379`
-  - `RUNTIME_WG_PRIMARY_ROUTER_IP=<mesh-ip>`
-  - `RUNTIME_WG_SECONDARY_ROUTER_IP=<mesh-ip>`
+### Control Behavior
+- Writes are guarded when etcd status is `down`, `unavailable`, or `stale`.
+- Existing workloads and local runtime logic continue even during partial control-plane degradation.
 
-## Version Source of Truth
+## Configuration
+Configuration is split across:
+- `.env` for runtime environment settings (see `.env.example`)
+- `config.yaml` for managed cluster-level values (auto-generated and auto-healed on startup)
 
-- All runtime version reporting is sourced from `version.json`.
-- `/version` returns:
-  - `version` (active app version),
-  - `manifest_version`,
-  - `channel`,
-  - `agent_version`,
-  - `version_source`.
-- `APP_VERSION` is intentionally not used.
+`config.yaml` behavior:
+- created automatically if missing
+- rebuilt with defaults when keys are missing
+- written in stable key order with ASCII section comments
+- synchronized immediately when managed values are updated from UI/API flows
 
-## API Endpoints (Initial)
+### Core App
+- `APP_ENV`, `DATABASE_URL`
+- `LOG_LEVEL`, `LOG_FILE`
+- `METRICS_ENABLED`
 
-- `GET /health`
-- `GET /version`
-- `GET /nodes` / `POST /nodes` / `PATCH /nodes/{id}`
-- `POST /nodes/{id}/cordon` / `POST /nodes/{id}/uncordon` / `POST /nodes/{id}/drain`
-- `POST /nodes/{id}/reboot-marker` / `POST /nodes/{id}/rotate-wg-keys`
-- `GET /services` / `POST /services` / `PATCH /services/{id}`
-- `POST /services/{id}/rollout` / `POST /services/{id}/rollback`
-- `GET /replicas` / `POST /replicas` / `PATCH /replicas/{id}` / `POST /replicas/{id}/move`
-- `POST /replicas/{id}/restart` / `POST /replicas/{id}/snapshot` / `POST /replicas/{id}/restore`
-- `DELETE /replicas/{id}`
-- `GET /endpoints` / `POST /endpoints` / `PATCH /endpoints/{id}`
-- `GET /router-assignments` / `POST /router-assignments`
-- `GET /scheduler/plan/services/{id}` / `POST /scheduler/reconcile/services/{id}`
-- `GET /scheduler/plan/all` / `POST /scheduler/reconcile/all`
-- `GET /events` / `POST /events` / `GET /events/stream`
-- `GET /wireguard/status`
-- `GET /etcd/snapshots` / `POST /etcd/snapshots`
-- `GET /support-bundles` / `POST /support-bundles`
-- `GET /cluster-settings` / `GET /cluster-settings/{key}` / `PUT /cluster-settings/{key}`
-- `POST /cluster/bootstrap` / `POST /cluster/join-tokens`
-- `POST /cluster/join` / `POST /cluster/heartbeat` / `GET /cluster/leases`
+### Auth and Security
+- `AUTH_SECRET_KEY`
+- `AUTH_COOKIE_SECURE`
+- `CLUSTER_SIGNING_KEY`
+- `CLUSTER_PKI_DIR`
+- `NODE_CERT_VALIDITY_DAYS`
+- `CLUSTER_LEASE_TOKEN_TTL_SECONDS`
+- `HEARTBEAT_SIGNATURE_MAX_SKEW_SECONDS`
 
-Snapshot and support bundle requests are recorded in the API and are expected to be executed by agents.
-Write operations are rejected with `503` when `cluster_settings.etcd_status` is `down`, `unavailable`, or `stale`.
+### etcd and Backups
+- `ETCD_ENABLED`
+- `ETCD_ENDPOINTS`
+- `ETCDCTL_COMMAND`
+- `ETCD_PREFIX`
+- `ETCD_SNAPSHOT_DIR`
+- `ETCD_SNAPSHOT_RETENTION`
 
-## V2 Scheduler
+### Runtime Loop
+- `RUNTIME_ENABLE` (set `false` for Go-agent mode)
+- `RUNTIME_NODE_ID`, `RUNTIME_NODE_NAME`, `RUNTIME_NODE_ROLE`
+- `RUNTIME_API_BASE_URL`
+- `RUNTIME_HEARTBEAT_INTERVAL_SECONDS`, `RUNTIME_HEARTBEAT_TTL_SECONDS`
 
-V2 scheduler logic reads scheduling policy from `service.spec`:
+### WireGuard Runtime
+- `RUNTIME_WG_PRIMARY_IFACE`, `RUNTIME_WG_SECONDARY_IFACE`
+- `RUNTIME_WG_PRIMARY_ROUTER_IP`, `RUNTIME_WG_SECONDARY_ROUTER_IP`
+- `RUNTIME_ROUTE_PRIMARY_METRIC`, `RUNTIME_ROUTE_SECONDARY_METRIC`
+- `RUNTIME_FAILOVER_THRESHOLD`, `RUNTIME_FAILBACK_STABLE_COUNT`
 
-- `scheduling.desired_replicas` (or `replicas_desired`)
-- `scheduling.node_selector` (supports `role`, `node_id`, and label keys)
-- `scheduling.anti_affinity` (boolean)
-- `scheduling.reschedule_unhealthy` (boolean)
-- `rolling_update.max_surge` and `rolling_update.max_unavailable`
+### Discovery
+- `RUNTIME_DISCOVERY_ENABLE`
+- `RUNTIME_DISCOVERY_DOMAIN`
+- `RUNTIME_DISCOVERY_ZONE_PATH`
+- `RUNTIME_DISCOVERY_RELOAD_COMMAND`
 
-The scheduler can dry-run or apply reconcile actions (move unhealthy replicas, scale up/down, queue rolling updates).
+### LXD
+- `LXD_ENABLED`
+- `LXD_COMMAND`
+- `LXD_PROJECT`
+- `LXD_DEFAULT_IMAGE`, `LXD_DEFAULT_PROFILE`
+- `LXD_HEALTH_TIMEOUT_SECONDS`, `LXD_HEALTH_POLL_SECONDS`
 
-## Migrations and Seeds
+### Support Artifacts
+- `SUPPORT_BUNDLE_DIR`
 
-- Schema migrations use Alembic.
-- Repeatable seed steps run after every `alembic upgrade` and are safe to re-run.
+## CLI Commands
+The CLI entrypoint is `uptimemesh`.
 
-## Logging
+### Cluster Bootstrap and Join
+```bash
+uptimemesh bootstrap --api-url http://127.0.0.1:8010
+uptimemesh create-token --api-url http://127.0.0.1:8010 --role worker
 
-Logging is structured and ASCII-only. Each log line includes:
+uptimemesh join \
+  --api-url http://127.0.0.1:8010 \
+  --token <join-token> \
+  --node-id node-a \
+  --name node-a \
+  --role worker \
+  --api-endpoint http://<node-a-ip>:8010
 
-- timestamp
-- level (8-char width)
-- category
-- event name and message
-- context fields
+uptimemesh heartbeat --api-url http://127.0.0.1:8010 --node-id node-a
+uptimemesh nodes-status --api-url http://127.0.0.1:8010
+```
+
+### etcd Operations
+```bash
+uptimemesh etcd-status --api-url http://127.0.0.1:8010
+uptimemesh etcd-members --api-url http://127.0.0.1:8010
+```
+
+### Snapshot and Support Ops
+```bash
+uptimemesh snapshot-run --api-url http://127.0.0.1:8010
+uptimemesh snapshot-list --api-url http://127.0.0.1:8010
+uptimemesh snapshot-restore --api-url http://127.0.0.1:8010 <snapshot-id>
+
+uptimemesh support-bundle-run --api-url http://127.0.0.1:8010
+uptimemesh support-bundle-list --api-url http://127.0.0.1:8010
+```
+
+Node identity artifacts are stored under:
+- `data/identities/<node-id>/node.key`
+- `data/identities/<node-id>/node.crt`
+- `data/identities/<node-id>/ca.crt`
+- `data/identities/<node-id>/lease.token`
+
+## Versioning
+- `version.json` is the version source of truth.
+- Runtime version data is loaded from `version.json` (app/manifest/channel/agent).
+
+## Production Notes
+- Set `APP_ENV=prod` for strict startup validation.
+- Use strong, non-default values for:
+  - `AUTH_SECRET_KEY`
+  - `CLUSTER_SIGNING_KEY`
+- Set `AUTH_COOKIE_SECURE=true` behind HTTPS.

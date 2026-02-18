@@ -15,10 +15,14 @@ from app.config import (
     get_settings,
 )
 from app.logger import configure_logging, get_logger
+from app.metrics import observe_http_request
+from app.dependencies import get_sessionmaker
 from app.routes import (
     auth,
     cluster,
     cluster_settings,
+    discovery,
+    etcd,
     endpoints,
     events,
     nodes,
@@ -34,6 +38,7 @@ from app.routes import (
 )
 from app.runtime import RuntimeController
 from app.security import SESSION_COOKIE_NAME, decode_session_token
+from app.services import cluster_settings as cluster_settings_service
 
 settings = get_settings()
 configure_logging(settings.log_level, settings.log_file)
@@ -65,6 +70,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "security.cookies",
                 "AUTH_COOKIE_SECURE is disabled; enable it when serving over HTTPS",
             )
+    sessionmaker = get_sessionmaker(settings.database_url)
+    try:
+        async with sessionmaker() as session:
+            await cluster_settings_service.ensure_managed_config(session)
+        logger.info(
+            "config_yaml.ready",
+            "Reconciled managed config file from defaults and DB state",
+            path=settings.managed_config_path,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "config_yaml.warn",
+            "Failed to reconcile managed config file on startup",
+            error_type=type(exc).__name__,
+            error=str(exc),
+            path=settings.managed_config_path,
+        )
     runtime = RuntimeController(settings)
     app.state.runtime_controller = runtime
     await runtime.start()
@@ -140,6 +162,12 @@ async def request_logging(
             response = await call_next(request)
         except Exception as exc:
             duration_ms = (perf_counter() - start) * 1000
+            observe_http_request(
+                method=request.method,
+                path=request.url.path,
+                status=500,
+                duration_seconds=duration_ms / 1000,
+            )
             logger.exception(
                 "request.error",
                 "Failed",
@@ -159,6 +187,12 @@ async def request_logging(
             status_code=response.status_code,
             duration_ms=round(duration_ms, 1),
         )
+        observe_http_request(
+            method=request.method,
+            path=request.url.path,
+            status=response.status_code,
+            duration_seconds=duration_ms / 1000,
+        )
 
     response.headers["X-Request-ID"] = request_id
     return response
@@ -167,10 +201,12 @@ async def request_logging(
 app.include_router(system.router)
 app.include_router(auth.router)
 app.include_router(cluster.router)
+app.include_router(etcd.router)
 app.include_router(nodes.router)
 app.include_router(services.router)
 app.include_router(replicas.router)
 app.include_router(endpoints.router)
+app.include_router(discovery.router)
 app.include_router(router_assignments.router)
 app.include_router(scheduler.router)
 app.include_router(events.router)

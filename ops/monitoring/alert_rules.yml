@@ -1,0 +1,38 @@
+groups:
+  - name: uptimemesh
+    rules:
+      - alert: UptimeMeshApiDown
+        expr: up{job="uptimemesh"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "UptimeMesh API target down"
+          description: "Prometheus cannot scrape one or more UptimeMesh API targets."
+
+      - alert: UptimeMeshHighHttpLatencyP95
+        expr: histogram_quantile(0.95, sum(rate(uptimemesh_http_request_duration_seconds_bucket[5m])) by (le)) > 1.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High HTTP latency p95"
+          description: "UptimeMesh request latency p95 is above 1.5s for 10m."
+
+      - alert: UptimeMeshEtcdCommandFailures
+        expr: increase(uptimemesh_etcd_operations_total{result="error"}[10m]) > 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "etcd command failures detected"
+          description: "Multiple etcd operation failures occurred in the last 10m."
+
+      - alert: UptimeMeshRuntimeLoopFailures
+        expr: increase(uptimemesh_runtime_loops_total{result="error"}[10m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Runtime loop failures detected"
+          description: "One or more runtime reconciliation loops reported errors."
