@@ -19,3 +19,16 @@ class DiscoveryServiceOut(BaseModel):
     service_fqdn: str
     endpoints: list[DiscoveryEndpointOut]
 
+
+class DiscoveryStatusOut(BaseModel):
+    domain: str
+    ttl_seconds: int
+    zone_path: str
+    corefile_path: str
+    zone_exists: bool
+    corefile_exists: bool
+    zone_sha256: str
+    corefile_sha256: str
+    service_count: int
+    endpoint_count: int
+    last_sync_at: str

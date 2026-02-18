@@ -12,9 +12,28 @@ from dataclasses import dataclass, field
 from threading import Lock
 from typing import Deque, Dict, Optional, Tuple
 
+from argon2 import PasswordHasher
+from argon2 import exceptions as argon2_exceptions
+
 SESSION_COOKIE_NAME = "uptimemesh_session"
 PASSWORD_HASH_ALGORITHM = "pbkdf2_sha256"
 PASSWORD_HASH_ITERATIONS = 120_000
+LOGIN_ID_PREFIX = "UM"
+LOGIN_ID_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+LOGIN_ID_LENGTH = 16
+ARGON2_TIME_COST = 5
+ARGON2_MEMORY_COST_KIB = 65536
+ARGON2_PARALLELISM = 1
+ARGON2_HASH_LEN = 32
+ARGON2_SALT_LEN = 16
+
+_ARGON2_HASHER = PasswordHasher(
+    time_cost=ARGON2_TIME_COST,
+    memory_cost=ARGON2_MEMORY_COST_KIB,
+    parallelism=ARGON2_PARALLELISM,
+    hash_len=ARGON2_HASH_LEN,
+    salt_len=ARGON2_SALT_LEN,
+)
 
 
 def _b64url_encode(raw: bytes) -> str:
@@ -26,13 +45,20 @@ def _b64url_decode(value: str) -> bytes:
     return base64.urlsafe_b64decode(value + padding)
 
 
+def generate_login_id(char_count: int = LOGIN_ID_LENGTH) -> str:
+    if char_count < 16 or char_count > 20:
+        raise ValueError("login id length must be between 16 and 20 characters")
+    chars = "".join(secrets.choice(LOGIN_ID_ALPHABET) for _ in range(char_count))
+    groups = [chars[i : i + 4] for i in range(0, len(chars), 4)]
+    return f"{LOGIN_ID_PREFIX}-" + "-".join(groups)
+
+
 def hash_password(password: str, *, iterations: int = PASSWORD_HASH_ITERATIONS) -> str:
-    salt = secrets.token_bytes(16)
-    derived = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
-    return f"{PASSWORD_HASH_ALGORITHM}${iterations}${salt.hex()}${derived.hex()}"
+    del iterations  # backward-compatible signature for older callsites
+    return _ARGON2_HASHER.hash(password)
 
 
-def verify_password(password: str, encoded_hash: str) -> bool:
+def _verify_pbkdf2_password(password: str, encoded_hash: str) -> bool:
     parts = encoded_hash.split("$")
     if len(parts) != 4:
         return False
@@ -48,6 +74,28 @@ def verify_password(password: str, encoded_hash: str) -> bool:
 
     computed = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
     return hmac.compare_digest(computed, expected_digest)
+
+
+def verify_password(password: str, encoded_hash: str) -> bool:
+    if not encoded_hash:
+        return False
+    if encoded_hash.startswith("$argon2id$"):
+        try:
+            return _ARGON2_HASHER.verify(encoded_hash, password)
+        except (argon2_exceptions.VerifyMismatchError, argon2_exceptions.InvalidHashError):
+            return False
+    return _verify_pbkdf2_password(password, encoded_hash)
+
+
+def password_needs_rehash(encoded_hash: str) -> bool:
+    if not encoded_hash:
+        return True
+    if not encoded_hash.startswith("$argon2id$"):
+        return True
+    try:
+        return _ARGON2_HASHER.check_needs_rehash(encoded_hash)
+    except argon2_exceptions.InvalidHashError:
+        return True
 
 
 def create_session_token(

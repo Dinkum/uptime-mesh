@@ -89,6 +89,11 @@ def _identity_dir(root: str, node_id: str) -> Path:
     return Path(root) / node_id
 
 
+def _add_auth_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--username", "--login-id", dest="username", required=True)
+    parser.add_argument("--password", required=True)
+
+
 def _generate_key_and_csr(node_id: str) -> tuple[str, str]:
     key = ec.generate_private_key(ec.SECP256R1())
     subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, node_id)])
@@ -157,7 +162,6 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
         path="/cluster/bootstrap",
         method="POST",
         json_body={
-            "core_token_ttl_seconds": args.core_ttl,
             "worker_token_ttl_seconds": args.worker_ttl,
         },
         session_token=session_token,
@@ -282,6 +286,36 @@ def cmd_nodes_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_replica_move(args: argparse.Namespace) -> int:
+    session_token = _login(args.api_url, args.username, args.password)
+    result = _api_request(
+        base_url=args.api_url,
+        path=f"/replicas/{args.replica_id}/move",
+        method="POST",
+        json_body={"target_node_id": args.target_node_id},
+        session_token=session_token,
+    )
+    if not isinstance(result, dict):
+        raise RuntimeError("Unexpected response for replica move")
+    _print_json(result)
+    return 0
+
+
+def cmd_service_apply_pinned(args: argparse.Namespace) -> int:
+    session_token = _login(args.api_url, args.username, args.password)
+    result = _api_request(
+        base_url=args.api_url,
+        path=f"/services/{args.service_id}/apply-pinned",
+        method="POST",
+        json_body={},
+        session_token=session_token,
+    )
+    if not isinstance(result, dict):
+        raise RuntimeError("Unexpected response for pinned placement apply")
+    _print_json(result)
+    return 0
+
+
 def cmd_etcd_status(args: argparse.Namespace) -> int:
     session_token = _login(args.api_url, args.username, args.password)
     result = _api_request(
@@ -307,6 +341,38 @@ def cmd_etcd_members(args: argparse.Namespace) -> int:
     if not isinstance(result, list):
         raise RuntimeError("Unexpected response for /etcd/members")
     print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_etcd_quorum(args: argparse.Namespace) -> int:
+    session_token = _login(args.api_url, args.username, args.password)
+    result = _api_request(
+        base_url=args.api_url,
+        path="/etcd/quorum",
+        method="GET",
+        session_token=session_token,
+    )
+    if not isinstance(result, dict):
+        raise RuntimeError("Unexpected response for /etcd/quorum")
+    _print_json(result)
+    return 0
+
+
+def cmd_etcd_reconcile(args: argparse.Namespace) -> int:
+    session_token = _login(args.api_url, args.username, args.password)
+    path = "/etcd/quorum/reconcile"
+    if args.dry_run:
+        path = f"{path}?dry_run=true"
+    result = _api_request(
+        base_url=args.api_url,
+        path=path,
+        method="POST",
+        json_body={},
+        session_token=session_token,
+    )
+    if not isinstance(result, dict):
+        raise RuntimeError("Unexpected response for /etcd/quorum/reconcile")
+    _print_json(result)
     return 0
 
 
@@ -395,21 +461,18 @@ def cmd_support_bundle_list(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="uptimemesh", description="UptimeMesh ASCII-first CLI")
-    parser.add_argument("--api-url", default="http://127.0.0.1:8000")
+    parser.add_argument("--api-url", default="http://127.0.0.1:8010")
 
     sub = parser.add_subparsers(dest="command", required=True)
 
-    bootstrap = sub.add_parser("bootstrap", help="Bootstrap cluster and issue initial join tokens")
-    bootstrap.add_argument("--username", default="admin")
-    bootstrap.add_argument("--password", default="uptime")
-    bootstrap.add_argument("--core-ttl", type=int, default=1800)
+    bootstrap = sub.add_parser("bootstrap", help="Bootstrap cluster and issue initial join token")
+    _add_auth_args(bootstrap)
     bootstrap.add_argument("--worker-ttl", type=int, default=1800)
     bootstrap.set_defaults(func=cmd_bootstrap)
 
     create_token = sub.add_parser("create-token", help="Create a join token")
-    create_token.add_argument("--username", default="admin")
-    create_token.add_argument("--password", default="uptime")
-    create_token.add_argument("--role", choices=["core", "worker", "gateway"], required=True)
+    _add_auth_args(create_token)
+    create_token.add_argument("--role", choices=["worker", "gateway"], required=True)
     create_token.add_argument("--ttl", type=int, default=1800)
     create_token.set_defaults(func=cmd_create_token)
 
@@ -417,7 +480,7 @@ def build_parser() -> argparse.ArgumentParser:
     join.add_argument("--token", required=True)
     join.add_argument("--node-id", required=True)
     join.add_argument("--name", required=True)
-    join.add_argument("--role", choices=["core", "worker", "gateway"], required=True)
+    join.add_argument("--role", choices=["worker", "gateway"], required=True)
     join.add_argument("--mesh-ip")
     join.add_argument("--api-endpoint")
     join.add_argument("--etcd-peer-url")
@@ -435,48 +498,66 @@ def build_parser() -> argparse.ArgumentParser:
     heartbeat.set_defaults(func=cmd_heartbeat)
 
     nodes_status = sub.add_parser("nodes-status", help="Show lease status for nodes")
-    nodes_status.add_argument("--username", default="admin")
-    nodes_status.add_argument("--password", default="uptime")
+    _add_auth_args(nodes_status)
     nodes_status.set_defaults(func=cmd_nodes_status)
 
+    replica_move = sub.add_parser("replica-move", help="Move replica to another node")
+    _add_auth_args(replica_move)
+    replica_move.add_argument("--replica-id", required=True)
+    replica_move.add_argument("--target-node-id", required=True)
+    replica_move.set_defaults(func=cmd_replica_move)
+
+    service_apply_pinned = sub.add_parser(
+        "service-apply-pinned",
+        help="Apply pinned replica placement from service.spec",
+    )
+    _add_auth_args(service_apply_pinned)
+    service_apply_pinned.add_argument("--service-id", required=True)
+    service_apply_pinned.set_defaults(func=cmd_service_apply_pinned)
+
     etcd_status = sub.add_parser("etcd-status", help="Show etcd endpoint health")
-    etcd_status.add_argument("--username", default="admin")
-    etcd_status.add_argument("--password", default="uptime")
+    _add_auth_args(etcd_status)
     etcd_status.set_defaults(func=cmd_etcd_status)
 
     etcd_members = sub.add_parser("etcd-members", help="List etcd members")
-    etcd_members.add_argument("--username", default="admin")
-    etcd_members.add_argument("--password", default="uptime")
+    _add_auth_args(etcd_members)
     etcd_members.set_defaults(func=cmd_etcd_members)
 
+    etcd_quorum = sub.add_parser("etcd-quorum", help="Show etcd quorum state")
+    _add_auth_args(etcd_quorum)
+    etcd_quorum.set_defaults(func=cmd_etcd_quorum)
+
+    etcd_reconcile = sub.add_parser(
+        "etcd-reconcile",
+        help="Reconcile etcd membership against worker nodes",
+    )
+    _add_auth_args(etcd_reconcile)
+    etcd_reconcile.add_argument("--dry-run", action="store_true")
+    etcd_reconcile.set_defaults(func=cmd_etcd_reconcile)
+
     snapshot_run = sub.add_parser("snapshot-run", help="Run etcd snapshot now")
-    snapshot_run.add_argument("--username", default="admin")
-    snapshot_run.add_argument("--password", default="uptime")
+    _add_auth_args(snapshot_run)
     snapshot_run.add_argument("--id")
     snapshot_run.add_argument("--requested-by")
     snapshot_run.set_defaults(func=cmd_snapshot_run)
 
     snapshot_list = sub.add_parser("snapshot-list", help="List etcd snapshots")
-    snapshot_list.add_argument("--username", default="admin")
-    snapshot_list.add_argument("--password", default="uptime")
+    _add_auth_args(snapshot_list)
     snapshot_list.set_defaults(func=cmd_snapshot_list)
 
     snapshot_restore = sub.add_parser("snapshot-restore", help="Restore etcd snapshot")
     snapshot_restore.add_argument("snapshot_id")
-    snapshot_restore.add_argument("--username", default="admin")
-    snapshot_restore.add_argument("--password", default="uptime")
+    _add_auth_args(snapshot_restore)
     snapshot_restore.set_defaults(func=cmd_snapshot_restore)
 
     support_bundle_run = sub.add_parser("support-bundle-run", help="Generate support bundle")
-    support_bundle_run.add_argument("--username", default="admin")
-    support_bundle_run.add_argument("--password", default="uptime")
+    _add_auth_args(support_bundle_run)
     support_bundle_run.add_argument("--id")
     support_bundle_run.add_argument("--requested-by")
     support_bundle_run.set_defaults(func=cmd_support_bundle_run)
 
     support_bundle_list = sub.add_parser("support-bundle-list", help="List support bundles")
-    support_bundle_list.add_argument("--username", default="admin")
-    support_bundle_list.add_argument("--password", default="uptime")
+    _add_auth_args(support_bundle_list)
     support_bundle_list.set_defaults(func=cmd_support_bundle_list)
 
     return parser

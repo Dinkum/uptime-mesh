@@ -9,13 +9,8 @@ def seed_cluster_settings(connection: Connection) -> None:
         ("mesh_cidr", "10.42.0.0/16", True),
         ("etcd_status", "ok", True),
         ("etcd_last_sync_at", "", True),
-        ("auth_username", "admin", False),
-        (
-            "auth_password_hash",
-            "pbkdf2_sha256$120000$d95113ec8b7f0bd6ebf3644a72a6d89d$"
-            "8f0ddafd75770b8947c26e843f6c4ffd7ec198bc762920dc3b905dbdd1bc37f3",
-            False,
-        ),
+        ("auth_username", "", False),
+        ("auth_password_hash", "", False),
         ("auth_password_updated_at", "", False),
         ("cluster_bootstrapped", "false", False),
         ("cluster_bootstrapped_at", "", False),

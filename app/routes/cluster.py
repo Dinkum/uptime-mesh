@@ -29,14 +29,13 @@ async def bootstrap_cluster(
     session: AsyncSession = Depends(get_writable_db_session),
 ) -> ClusterBootstrapOut:
     requested_by = getattr(request.state, "auth_user", None)
-    bootstrapped, core_token, worker_token = await cluster_service.bootstrap_cluster(
+    bootstrapped, worker_token = await cluster_service.bootstrap_cluster(
         session,
         payload=payload,
         requested_by=requested_by,
     )
     return ClusterBootstrapOut(
         bootstrapped=bootstrapped,
-        core_token=core_token,
         worker_token=worker_token,
     )
 

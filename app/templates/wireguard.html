@@ -10,6 +10,10 @@
             <th>Node</th>
             <th>Primary Tunnel</th>
             <th>Secondary Tunnel</th>
+            <th>Primary Router</th>
+            <th>Secondary Router</th>
+            <th>Primary Peer</th>
+            <th>Secondary Peer</th>
             <th>Active Route</th>
             <th>Failover State</th>
           </tr>
@@ -20,12 +24,28 @@
               <td class="mono">{{ row.node_id }}</td>
               <td class="mono">{{ row.primary_tunnel or "-" }}</td>
               <td class="mono">{{ row.secondary_tunnel or "-" }}</td>
+              <td>{{ "reachable" if row.primary_router_reachable else "down" }}</td>
+              <td>{{ "reachable" if row.secondary_router_reachable else "down" }}</td>
+              <td class="mono">
+                {% if row.primary_peer_configured %}
+                  {{ row.primary_peer_endpoint or "configured" }}
+                {% else %}
+                  -
+                {% endif %}
+              </td>
+              <td class="mono">
+                {% if row.secondary_peer_configured %}
+                  {{ row.secondary_peer_endpoint or "configured" }}
+                {% else %}
+                  -
+                {% endif %}
+              </td>
               <td class="mono">{{ row.active_route or "-" }}</td>
               <td>{{ row.failover_state or "-" }}</td>
             </tr>
           {% else %}
             <tr>
-              <td colspan="5" class="text-center text-slate-400">No WireGuard status reported yet.</td>
+              <td colspan="9" class="text-center text-slate-400">No WireGuard status reported yet.</td>
             </tr>
           {% endfor %}
         </tbody>

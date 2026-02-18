@@ -167,13 +167,26 @@ async def _run_lxc_checked(
 
 
 async def container_exists(*, name: str, project: str) -> bool:
-    code, _, _ = await asyncio.to_thread(
+    code, out, _ = await asyncio.to_thread(
         _run_lxc,
         args=("list", name, "--format=json"),
         project=project,
         timeout_seconds=20,
     )
-    return code == 0
+    if code != 0:
+        return False
+    try:
+        payload = json.loads(out)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(payload, list):
+        return False
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("name", "")).strip() == name:
+            return True
+    return False
 
 
 async def container_status(*, name: str, project: str) -> str:
@@ -352,3 +365,14 @@ async def move_container(*, name: str, project: str, target_node: str) -> None:
         timeout_seconds=120,
     )
     await wait_for_running(name=name, project=project)
+
+
+async def rename_container(*, source_name: str, target_name: str, project: str) -> None:
+    if not source_name.strip() or not target_name.strip():
+        raise LXDOperationError("container.rename", "source and target names are required")
+    await _run_lxc_checked(
+        args=("move", source_name, target_name),
+        project=project,
+        action="container.rename",
+        timeout_seconds=120,
+    )

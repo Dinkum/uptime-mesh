@@ -7,12 +7,11 @@ from pydantic import BaseModel, Field
 
 
 class ClusterBootstrapRequest(BaseModel):
-    core_token_ttl_seconds: int = Field(default=1800, ge=60, le=86400)
     worker_token_ttl_seconds: int = Field(default=1800, ge=60, le=86400)
 
 
 class JoinTokenCreate(BaseModel):
-    role: str = Field(pattern="^(core|worker|gateway)$")
+    role: str = Field(pattern="^(worker|gateway)$")
     ttl_seconds: int = Field(default=1800, ge=60, le=86400)
 
 
@@ -25,7 +24,6 @@ class JoinTokenOut(BaseModel):
 
 class ClusterBootstrapOut(BaseModel):
     bootstrapped: bool
-    core_token: JoinTokenOut
     worker_token: JoinTokenOut
 
 
@@ -33,7 +31,7 @@ class NodeJoinRequest(BaseModel):
     token: str
     node_id: str
     name: str
-    role: str = Field(pattern="^(core|worker|gateway)$")
+    role: str = Field(pattern="^(worker|gateway)$")
     mesh_ip: Optional[str] = None
     api_endpoint: Optional[str] = None
     etcd_peer_url: Optional[str] = None
@@ -50,6 +48,8 @@ class NodeJoinOut(BaseModel):
     identity_fingerprint: str
     node_cert_pem: str
     ca_cert_pem: str
+    auth_secret_key: str
+    cluster_signing_key: str
 
 
 class HeartbeatRequest(BaseModel):

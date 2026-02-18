@@ -105,3 +105,18 @@ async def rollback_service(
     except lxd_service.LXDOperationError as exc:
         _raise_lxd_http_error(exc)
     return ServiceOut.model_validate(updated)
+
+
+@router.post("/{service_id}/apply-pinned", response_model=ServiceOut)
+async def apply_pinned_service_placement(
+    service_id: str,
+    session: AsyncSession = Depends(get_writable_db_session),
+) -> ServiceOut:
+    service = await service_service.get_service(session, service_id)
+    if service is None:
+        raise HTTPException(status_code=404, detail="Service not found")
+    try:
+        updated = await service_service.apply_pinned_placement(session, service)
+    except lxd_service.LXDOperationError as exc:
+        _raise_lxd_http_error(exc)
+    return ServiceOut.model_validate(updated)

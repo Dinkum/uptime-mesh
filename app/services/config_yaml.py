@@ -77,9 +77,9 @@ _FIELDS: tuple[_ConfigField, ...] = (
     _ConfigField(
         section="AUTH",
         key="auth_username",
-        default="admin",
-        description="Administrative username for UI and CLI login.",
-        possible_values="Non-empty username string.",
+        default="",
+        description="Administrative login ID for UI and CLI auth (auto-generated on first bootstrap).",
+        possible_values="UM-XXXX-XXXX-XXXX-XXXX style ID or empty before first bootstrap.",
         import_from_yaml=True,
     ),
     _ConfigField(
@@ -92,6 +92,7 @@ _FIELDS: tuple[_ConfigField, ...] = (
 )
 
 _FIELD_KEYS = {item.key for item in _FIELDS}
+_SENSITIVE_KEYS = {"auth_secret_key", "cluster_signing_key"}
 
 
 def _config_path() -> Path:
@@ -237,7 +238,9 @@ async def reconcile_with_db(session: AsyncSession) -> None:
         for field in _FIELDS:
             value = db_map.get(field.key, "").strip()
             managed_values[field.key] = value if value else field.default
-        extra_values = {k: v for k, v in db_map.items() if k not in _FIELD_KEYS}
+        extra_values = {
+            k: v for k, v in db_map.items() if k not in _FIELD_KEYS and k not in _SENSITIVE_KEYS
+        }
         rendered = _render_yaml(managed_values, extra_values)
         path.write_text(rendered, encoding="utf-8")
         op.step(
@@ -267,7 +270,9 @@ async def sync_from_db(session: AsyncSession) -> None:
             else:
                 fallback = existing.get(field.key, "").strip()
                 managed_values[field.key] = fallback if fallback else field.default
-        extra_values = {k: v for k, v in db_map.items() if k not in _FIELD_KEYS}
+        extra_values = {
+            k: v for k, v in db_map.items() if k not in _FIELD_KEYS and k not in _SENSITIVE_KEYS
+        }
         path.write_text(_render_yaml(managed_values, extra_values), encoding="utf-8")
         op.step(
             "file.write",

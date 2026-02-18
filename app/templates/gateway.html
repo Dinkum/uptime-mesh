@@ -1,0 +1,67 @@
+{% extends "layout.html" %}
+{% block content %}
+  <section class="grid gap-4">
+    <article class="bg-white rounded-2xl p-6 mesh-card">
+      <h2 class="text-lg font-semibold">Gateway Runtime</h2>
+      <p class="text-sm text-slate-500 mt-1">Rendered from healthy endpoints in real time.</p>
+      <div class="mt-4 flex flex-wrap gap-3 items-center">
+        <span class="badge badge-outline mono py-3">enabled: {{ enabled }}</span>
+        <span class="badge badge-outline mono py-3">status: {{ last_apply_status }}</span>
+        <a class="btn btn-sm btn-outline" href="{{ config_endpoint }}" target="_blank" rel="noreferrer">View NGINX Config</a>
+      </div>
+      {% if last_apply_error %}
+        <div class="mt-3 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm mono">
+          {{ last_apply_error }}
+        </div>
+      {% endif %}
+      <div class="mt-4 grid md:grid-cols-3 gap-3 text-sm">
+        <div class="rounded-xl border border-slate-100 p-3">
+          <div class="text-slate-500">Routes</div>
+          <div class="mono">{{ route_count }}</div>
+        </div>
+        <div class="rounded-xl border border-slate-100 p-3">
+          <div class="text-slate-500">Upstreams</div>
+          <div class="mono">{{ upstream_count }}</div>
+        </div>
+        <div class="rounded-xl border border-slate-100 p-3">
+          <div class="text-slate-500">Last Sync (UTC)</div>
+          <div class="mono">{{ last_sync_at or "n/a" }}</div>
+        </div>
+      </div>
+      <div class="mt-4 text-sm">
+        <div class="text-slate-500">Health checks</div>
+        {% if healthcheck_urls %}
+          <div class="mono mt-1">
+            {% for url in healthcheck_urls %}
+              <div>{{ url }}</div>
+            {% endfor %}
+          </div>
+        {% else %}
+          <div class="text-slate-400 mt-1">No post-reload healthcheck URLs configured.</div>
+        {% endif %}
+      </div>
+    </article>
+
+    <article class="bg-white rounded-2xl p-6 mesh-card">
+      <h2 class="text-lg font-semibold">Ingress Routes</h2>
+      <div class="mt-4 space-y-4">
+        {% for route in routes %}
+          <div class="rounded-xl border border-slate-100 p-4">
+            <div class="flex flex-wrap gap-2 items-center">
+              <span class="mono text-sm">{{ route.host }} {{ route.path }}</span>
+              <span class="badge badge-outline">{{ route.endpoint_count }} endpoints</span>
+            </div>
+            <div class="mt-2 mono text-xs text-slate-500">{{ route.upstream }} (service {{ route.service_name }})</div>
+            <div class="mt-3 space-y-1 text-sm">
+              {% for endpoint in route.endpoints %}
+                <div class="mono text-slate-600">{{ endpoint.address }}:{{ endpoint.port }}</div>
+              {% endfor %}
+            </div>
+          </div>
+        {% else %}
+          <p class="text-slate-400">No gateway-enabled services with healthy endpoints.</p>
+        {% endfor %}
+      </div>
+    </article>
+  </section>
+{% endblock %}

@@ -10,6 +10,7 @@ from app.schemas.cluster_settings import ClusterSettingOut, ClusterSettingUpsert
 from app.services import cluster_settings as cluster_settings_service
 
 router = APIRouter(prefix="/cluster-settings", tags=["cluster-settings"])
+_SENSITIVE_CLUSTER_SETTINGS = {"auth_secret_key", "cluster_signing_key"}
 
 
 @router.get("", response_model=List[ClusterSettingOut])
@@ -17,7 +18,8 @@ async def list_cluster_settings(
     session: AsyncSession = Depends(get_db_session),
 ) -> List[ClusterSettingOut]:
     settings = await cluster_settings_service.list_settings(session)
-    return [ClusterSettingOut.model_validate(item) for item in settings]
+    filtered = [item for item in settings if item.key not in _SENSITIVE_CLUSTER_SETTINGS]
+    return [ClusterSettingOut.model_validate(item) for item in filtered]
 
 
 @router.get("/{key}", response_model=ClusterSettingOut)
@@ -25,6 +27,8 @@ async def get_cluster_setting(
     key: str,
     session: AsyncSession = Depends(get_db_session),
 ) -> ClusterSettingOut:
+    if key in _SENSITIVE_CLUSTER_SETTINGS:
+        raise HTTPException(status_code=404, detail="Cluster setting not found")
     setting = await cluster_settings_service.get_setting(session, key)
     if setting is None:
         raise HTTPException(status_code=404, detail="Cluster setting not found")
@@ -37,5 +41,7 @@ async def put_cluster_setting(
     payload: ClusterSettingUpsert,
     session: AsyncSession = Depends(get_db_session),
 ) -> ClusterSettingOut:
+    if key in _SENSITIVE_CLUSTER_SETTINGS:
+        raise HTTPException(status_code=403, detail="Cluster setting key is internal and read-only")
     setting = await cluster_settings_service.set_setting(session, key, payload.value)
     return ClusterSettingOut.model_validate(setting)

@@ -11,6 +11,7 @@ from app.config import get_settings
 from app.logger import get_logger
 from app.models.replica import Replica
 from app.models.service import Service
+from app.schemas.replicas import ReplicaCreate, ReplicaUpdate
 from app.schemas.services import ServiceCreate, ServiceUpdate
 from app.services import lxd as lxd_service
 from app.services import replicas as replica_service
@@ -18,6 +19,50 @@ from app.services.events import record_event
 
 _logger = get_logger("services.services")
 _settings = get_settings()
+
+
+def _extract_pinned_placement(spec: dict[str, object]) -> tuple[list[dict[str, object]], bool]:
+    placement = spec.get("placement")
+    placement_map = placement if isinstance(placement, dict) else {}
+    raw = placement_map.get("pinned_replicas", spec.get("pinned_replicas", []))
+    strict = bool(placement_map.get("strict", spec.get("pinned_strict", False)))
+    if not isinstance(raw, list):
+        raise lxd_service.LXDOperationError(
+            "service.pinned.spec",
+            "pinned_replicas must be a list",
+        )
+
+    items: list[dict[str, object]] = []
+    for index, row in enumerate(raw):
+        if not isinstance(row, dict):
+            raise lxd_service.LXDOperationError(
+                "service.pinned.spec",
+                f"pinned_replicas[{index}] must be an object",
+            )
+        replica_id = str(row.get("replica_id", "")).strip()
+        node_id = str(row.get("node_id", "")).strip()
+        desired_state = str(row.get("desired_state", "running")).strip() or "running"
+        status = row.get("status")
+        status_map = status if isinstance(status, dict) else {}
+        if not replica_id:
+            raise lxd_service.LXDOperationError(
+                "service.pinned.spec",
+                f"pinned_replicas[{index}].replica_id is required",
+            )
+        if not node_id:
+            raise lxd_service.LXDOperationError(
+                "service.pinned.spec",
+                f"pinned_replicas[{index}].node_id is required",
+            )
+        items.append(
+            {
+                "replica_id": replica_id,
+                "node_id": node_id,
+                "desired_state": desired_state,
+                "status": status_map,
+            }
+        )
+    return items, strict
 
 
 async def list_services(session: AsyncSession, limit: int = 100) -> List[Service]:
@@ -310,4 +355,112 @@ async def rollback_service(
         await session.commit()
         await session.refresh(service)
         op.step("db.commit", "Committed rollback request")
+        return service
+
+
+async def apply_pinned_placement(
+    session: AsyncSession,
+    service: Service,
+) -> Service:
+    async with _logger.operation(
+        "service.pinned.apply",
+        "Applying pinned replica placement",
+        service_id=service.id,
+    ) as op:
+        spec = dict(service.spec or {})
+        pinned, strict = _extract_pinned_placement(spec)
+        op.step("spec.parse", "Parsed pinned placement", replicas=len(pinned), strict=strict)
+        if not pinned:
+            op.step("pinned.skip", "No pinned replicas defined in service spec")
+            return service
+
+        current = await replica_service.list_replicas_for_service(session, service.id)
+        current_by_id = {row.id: row for row in current}
+        desired_ids = {str(item["replica_id"]) for item in pinned}
+
+        created = 0
+        moved = 0
+        updated = 0
+        removed = 0
+
+        for item in pinned:
+            replica_id = str(item["replica_id"])
+            node_id = str(item["node_id"])
+            desired_state = str(item["desired_state"])
+            status_map = dict(item["status"] if isinstance(item["status"], dict) else {})
+
+            replica = current_by_id.get(replica_id)
+            if replica is None:
+                replica = await replica_service.create_replica(
+                    session,
+                    ReplicaCreate(
+                        id=replica_id,
+                        service_id=service.id,
+                        node_id=node_id,
+                        desired_state=desired_state,
+                        status=status_map,
+                    ),
+                )
+                current_by_id[replica_id] = replica
+                created += 1
+                op.child("pinned.apply", replica_id, "Created pinned replica", node_id=node_id)
+                continue
+
+            if replica.node_id != node_id:
+                replica = await replica_service.move_replica(session, replica, node_id)
+                current_by_id[replica_id] = replica
+                moved += 1
+                op.child("pinned.apply", replica_id, "Moved replica to pinned node", node_id=node_id)
+
+            desired_patch: ReplicaUpdate | None = None
+            patch_state = desired_state if replica.desired_state != desired_state else None
+            patch_status = status_map if status_map else None
+            if patch_state is not None or patch_status is not None:
+                desired_patch = ReplicaUpdate(desired_state=patch_state, status=patch_status)
+            if desired_patch is not None:
+                replica = await replica_service.update_replica(session, replica, desired_patch)
+                current_by_id[replica_id] = replica
+                updated += 1
+                op.child("pinned.apply", replica_id, "Updated pinned replica state")
+
+        if strict:
+            for replica in list(current_by_id.values()):
+                if replica.id in desired_ids:
+                    continue
+                await replica_service.delete_replica(session, replica)
+                removed += 1
+                op.child("pinned.apply", replica.id, "Deleted replica not present in strict pinned spec")
+
+        spec["pinned_last_applied_at"] = datetime.now(timezone.utc).isoformat()
+        spec["pinned_applied_count"] = len(pinned)
+        spec["pinned_strict_applied"] = strict
+        service.spec = spec
+        op.step(
+            "spec.mark",
+            "Updated pinned placement metadata",
+            created=created,
+            moved=moved,
+            updated=updated,
+            removed=removed,
+        )
+
+        await record_event(
+            session,
+            event_id=str(uuid4()),
+            category="services",
+            name="service.pinned.apply",
+            level="INFO",
+            fields={
+                "service_id": service.id,
+                "created": created,
+                "moved": moved,
+                "updated": updated,
+                "removed": removed,
+                "strict": strict,
+            },
+        )
+        op.step("event.record", "Recorded pinned placement apply event")
+        await session.commit()
+        await session.refresh(service)
+        op.step("db.commit", "Committed pinned placement apply")
         return service

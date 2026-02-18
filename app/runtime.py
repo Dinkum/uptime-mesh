@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -29,6 +30,7 @@ from app.models.router_assignment import RouterAssignment
 from app.security import SESSION_COOKIE_NAME
 from app.services import cluster_settings as cluster_settings_service
 from app.services import discovery as discovery_service
+from app.services import gateway as gateway_service
 
 _logger = get_logger("runtime")
 
@@ -89,6 +91,12 @@ def _http_json(
     return {}
 
 
+def _http_status(url: str, *, timeout_seconds: int = 5) -> int:
+    req = request.Request(url=url, method="GET")
+    with request.urlopen(req, timeout=timeout_seconds) as response:
+        return int(getattr(response, "status", 0))
+
+
 def _sign_heartbeat(private_key_pem: bytes, message: bytes) -> str:
     private_key = serialization.load_pem_private_key(private_key_pem, password=None)
     if isinstance(private_key, ec.EllipticCurvePrivateKey):
@@ -135,10 +143,17 @@ class RuntimeController:
         self._missing_identity_logged_at = 0.0
         self._missing_tools_logged_at = 0.0
         self._discovery_zone_sha = ""
+        self._discovery_corefile_sha = ""
+        self._gateway_config_sha = ""
 
     @property
     def enabled(self) -> bool:
-        return bool(self._settings.runtime_enable or self._settings.runtime_etcd_endpoints.strip())
+        return bool(
+            self._settings.runtime_enable
+            or self._settings.runtime_etcd_endpoints.strip()
+            or self._settings.runtime_discovery_enable
+            or self._settings.runtime_gateway_enable
+        )
 
     async def start(self) -> None:
         if not self.enabled:
@@ -162,7 +177,19 @@ class RuntimeController:
                 "Started discovery zone loop",
                 domain=self._settings.runtime_discovery_domain,
                 zone_path=self._settings.runtime_discovery_zone_path,
+                corefile_path=self._settings.runtime_discovery_corefile_path,
+                listen=self._settings.runtime_discovery_listen,
                 interval_seconds=self._settings.runtime_discovery_interval_seconds,
+            )
+
+        if self._settings.runtime_gateway_enable:
+            self._tasks.append(asyncio.create_task(self._gateway_config_loop()))
+            _logger.info(
+                "runtime.gateway.start",
+                "Started NGINX gateway config loop",
+                config_path=self._settings.runtime_gateway_config_path,
+                listen=self._settings.runtime_gateway_listen,
+                interval_seconds=self._settings.runtime_gateway_interval_seconds,
             )
 
         if self._settings.runtime_enable:
@@ -244,13 +271,18 @@ class RuntimeController:
         interval = self._settings.runtime_discovery_interval_seconds
         while not self._stop.is_set():
             try:
-                changed, services, endpoints = await self._sync_discovery_zone()
+                changed, zone_changed, corefile_changed, services, endpoints = (
+                    await self._sync_discovery_artifacts()
+                )
                 record_runtime_loop(loop="discovery_zone", ok=True)
                 if changed:
                     _logger.info(
                         "runtime.discovery.sync",
-                        "Updated CoreDNS zone from endpoint registry",
+                        "Updated discovery artifacts from healthy endpoint registry",
                         zone_path=self._settings.runtime_discovery_zone_path,
+                        zone_changed=zone_changed,
+                        corefile_path=self._settings.runtime_discovery_corefile_path,
+                        corefile_changed=corefile_changed,
                         services=services,
                         endpoints=endpoints,
                     )
@@ -268,43 +300,276 @@ class RuntimeController:
             except TimeoutError:
                 continue
 
-    async def _sync_discovery_zone(self) -> tuple[bool, int, int]:
+    def _write_discovery_text(self, *, path: Path, text: str, previous_sha: str) -> tuple[bool, str]:
+        data = text.encode("utf-8")
+        digest = hashlib.sha256(data).hexdigest()
+        if digest == previous_sha and path.exists():
+            return False, digest
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(f"{path.suffix}.tmp")
+        tmp_path.write_bytes(data)
+        os.replace(tmp_path, path)
+        return True, digest
+
+    async def _sync_discovery_artifacts(self) -> tuple[bool, bool, bool, int, int]:
         async with self._sessionmaker() as session:
             zone_text, service_count, endpoint_count = await discovery_service.render_zone_file(
                 session,
                 domain=self._settings.runtime_discovery_domain,
                 ttl_seconds=self._settings.runtime_discovery_ttl_seconds,
             )
-
-        data = zone_text.encode("utf-8")
-        digest = hashlib.sha256(data).hexdigest()
-        if digest == self._discovery_zone_sha:
-            return False, service_count, endpoint_count
+        corefile_text = discovery_service.render_corefile(
+            domain=self._settings.runtime_discovery_domain,
+            zone_file_path=self._settings.runtime_discovery_zone_path,
+            listen=self._settings.runtime_discovery_listen,
+            forwarders=self._settings.runtime_discovery_forwarders,
+        )
 
         zone_path = Path(self._settings.runtime_discovery_zone_path)
-        zone_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = zone_path.with_suffix(f"{zone_path.suffix}.tmp")
-        tmp_path.write_bytes(data)
-        os.replace(tmp_path, zone_path)
-        self._discovery_zone_sha = digest
+        zone_changed, zone_sha = self._write_discovery_text(
+            path=zone_path,
+            text=zone_text,
+            previous_sha=self._discovery_zone_sha,
+        )
+        self._discovery_zone_sha = zone_sha
 
-        reload_cmd = self._settings.runtime_discovery_reload_command.strip()
-        if reload_cmd:
-            code, out, err = _run_command(("sh", "-c", reload_cmd))
+        corefile_path = Path(self._settings.runtime_discovery_corefile_path)
+        corefile_changed, corefile_sha = self._write_discovery_text(
+            path=corefile_path,
+            text=corefile_text,
+            previous_sha=self._discovery_corefile_sha,
+        )
+        self._discovery_corefile_sha = corefile_sha
+        changed = zone_changed or corefile_changed
+
+        if changed:
+            await self._upsert_cluster_settings(
+                {
+                    "discovery_domain": self._settings.runtime_discovery_domain,
+                    "discovery_zone_path": self._settings.runtime_discovery_zone_path,
+                    "discovery_corefile_path": self._settings.runtime_discovery_corefile_path,
+                    "discovery_zone_sha256": zone_sha,
+                    "discovery_corefile_sha256": corefile_sha,
+                    "discovery_service_count": str(service_count),
+                    "discovery_endpoint_count": str(endpoint_count),
+                    "discovery_last_sync_at": _utcnow_iso(),
+                }
+            )
+
+            reload_cmd = self._settings.runtime_discovery_reload_command.strip()
+            if reload_cmd:
+                code, out, err = _run_command(("sh", "-c", reload_cmd))
+                if code != 0:
+                    _logger.warning(
+                        "runtime.discovery.reload_error",
+                        "Failed to reload CoreDNS after discovery update",
+                        command=reload_cmd,
+                        error=err or out or f"exit_{code}",
+                    )
+                else:
+                    _logger.info(
+                        "runtime.discovery.reload_ok",
+                        "Reloaded CoreDNS after discovery update",
+                        command=reload_cmd,
+                    )
+        return changed, zone_changed, corefile_changed, service_count, endpoint_count
+
+    def _write_bytes_atomic(self, *, path: Path, data: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(f"{path.suffix}.tmp")
+        tmp_path.write_bytes(data)
+        os.replace(tmp_path, path)
+
+    def _gateway_healthcheck_urls(self) -> list[str]:
+        return [
+            item.strip()
+            for item in self._settings.runtime_gateway_healthcheck_urls.split(",")
+            if item.strip()
+        ]
+
+    def _format_gateway_command(
+        self,
+        template: str,
+        *,
+        config_path: Path,
+        candidate_path: Path,
+        backup_path: Path,
+    ) -> str:
+        command = template.strip()
+        if not command:
+            return ""
+        return (
+            command.replace("{config_path}", shlex.quote(str(config_path)))
+            .replace("{candidate_path}", shlex.quote(str(candidate_path)))
+            .replace("{backup_path}", shlex.quote(str(backup_path)))
+        )
+
+    async def _mark_gateway_status(
+        self,
+        *,
+        status: str,
+        error_text: str,
+        route_count: int,
+        upstream_count: int,
+        digest: str = "",
+    ) -> None:
+        await self._upsert_cluster_settings(
+            {
+                "gateway_last_apply_status": status,
+                "gateway_last_apply_error": error_text,
+                "gateway_last_sync_at": _utcnow_iso(),
+                "gateway_route_count": str(route_count),
+                "gateway_upstream_count": str(upstream_count),
+                "gateway_config_sha256": digest,
+                "gateway_config_path": self._settings.runtime_gateway_config_path,
+            }
+        )
+
+    async def _gateway_config_loop(self) -> None:
+        interval = self._settings.runtime_gateway_interval_seconds
+        while not self._stop.is_set():
+            try:
+                changed, routes, upstreams = await self._sync_gateway_config()
+                record_runtime_loop(loop="gateway_config", ok=True)
+                if changed:
+                    _logger.info(
+                        "runtime.gateway.sync",
+                        "Applied NGINX gateway configuration safely",
+                        config_path=self._settings.runtime_gateway_config_path,
+                        routes=routes,
+                        upstreams=upstreams,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                record_runtime_loop(loop="gateway_config", ok=False)
+                _logger.exception(
+                    "runtime.gateway.error",
+                    "Gateway config sync failed",
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=interval)
+            except TimeoutError:
+                continue
+
+    async def _sync_gateway_config(self) -> tuple[bool, int, int]:
+        async with self._sessionmaker() as session:
+            rendered = await gateway_service.render_gateway_config(
+                session,
+                listen=self._settings.runtime_gateway_listen,
+                default_server_name=self._settings.runtime_gateway_server_name,
+            )
+
+        config_text = rendered.config
+        route_count = rendered.route_count
+        upstream_count = rendered.upstream_count
+        config_data = config_text.encode("utf-8")
+        digest = hashlib.sha256(config_data).hexdigest()
+
+        config_path, candidate_path, backup_path = gateway_service.resolve_gateway_paths(
+            config_path=self._settings.runtime_gateway_config_path,
+            candidate_path=self._settings.runtime_gateway_candidate_path,
+            backup_path=self._settings.runtime_gateway_backup_path,
+        )
+
+        if digest == self._gateway_config_sha and config_path.exists():
+            return False, route_count, upstream_count
+
+        self._write_bytes_atomic(path=candidate_path, data=config_data)
+        _logger.info(
+            "runtime.gateway.candidate",
+            "Wrote candidate NGINX config",
+            candidate_path=str(candidate_path),
+            routes=route_count,
+            upstreams=upstream_count,
+        )
+
+        validate_template = self._settings.runtime_gateway_validate_command
+        validate_command = self._format_gateway_command(
+            validate_template,
+            config_path=candidate_path,
+            candidate_path=candidate_path,
+            backup_path=backup_path,
+        )
+        if validate_command:
+            code, out, err = _run_command(("sh", "-c", validate_command))
             if code != 0:
-                _logger.warning(
-                    "runtime.discovery.reload_error",
-                    "Failed to reload CoreDNS after zone update",
-                    command=reload_cmd,
-                    error=err or out or f"exit_{code}",
+                error_text = err or out or f"exit_{code}"
+                await self._mark_gateway_status(
+                    status="validate_failed",
+                    error_text=error_text,
+                    route_count=route_count,
+                    upstream_count=upstream_count,
+                    digest=digest,
                 )
-            else:
-                _logger.info(
-                    "runtime.discovery.reload_ok",
-                    "Reloaded CoreDNS after zone update",
-                    command=reload_cmd,
+                raise RuntimeError(f"gateway validation failed: {error_text}")
+
+        previous_config: bytes | None = None
+        if config_path.exists():
+            previous_config = config_path.read_bytes()
+            self._write_bytes_atomic(path=backup_path, data=previous_config)
+
+        self._write_bytes_atomic(path=config_path, data=config_data)
+
+        reload_template = self._settings.runtime_gateway_reload_command
+        reload_command = self._format_gateway_command(
+            reload_template,
+            config_path=config_path,
+            candidate_path=candidate_path,
+            backup_path=backup_path,
+        )
+        if reload_command:
+            code, out, err = _run_command(("sh", "-c", reload_command))
+            if code != 0:
+                error_text = err or out or f"exit_{code}"
+                if previous_config is not None:
+                    self._write_bytes_atomic(path=config_path, data=previous_config)
+                    _run_command(("sh", "-c", reload_command))
+                await self._mark_gateway_status(
+                    status="reload_failed",
+                    error_text=error_text,
+                    route_count=route_count,
+                    upstream_count=upstream_count,
+                    digest=digest,
                 )
-        return True, service_count, endpoint_count
+                raise RuntimeError(f"gateway reload failed: {error_text}")
+
+        healthcheck_urls = self._gateway_healthcheck_urls()
+        expected_status = self._settings.runtime_gateway_healthcheck_expected_status
+        timeout_seconds = self._settings.runtime_gateway_healthcheck_timeout_seconds
+        for url in healthcheck_urls:
+            status_code = await asyncio.to_thread(
+                _http_status,
+                url,
+                timeout_seconds=timeout_seconds,
+            )
+            if status_code != expected_status:
+                error_text = f"healthcheck status {status_code} for {url} (expected {expected_status})"
+                if previous_config is not None:
+                    self._write_bytes_atomic(path=config_path, data=previous_config)
+                    if reload_command:
+                        _run_command(("sh", "-c", reload_command))
+                await self._mark_gateway_status(
+                    status="healthcheck_failed",
+                    error_text=error_text,
+                    route_count=route_count,
+                    upstream_count=upstream_count,
+                    digest=digest,
+                )
+                raise RuntimeError(f"gateway post-reload healthcheck failed: {error_text}")
+
+        self._gateway_config_sha = digest
+        await self._mark_gateway_status(
+            status="ok",
+            error_text="",
+            route_count=route_count,
+            upstream_count=upstream_count,
+            digest=digest,
+        )
+        return True, route_count, upstream_count
 
     async def _node_agent_loop(self) -> None:
         interval = self._settings.runtime_heartbeat_interval_seconds

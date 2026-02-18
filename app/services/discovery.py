@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from datetime import datetime, timezone
+from pathlib import Path
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -33,6 +34,17 @@ def _normalize_domain(domain: str) -> str:
     if not value:
         return "mesh.local"
     return value
+
+
+def _normalize_forwarders(raw: str) -> list[str]:
+    forwarders: list[str] = []
+    for item in raw.split():
+        value = item.strip()
+        if value:
+            forwarders.append(value)
+    if not forwarders:
+        return ["/etc/resolv.conf"]
+    return forwarders
 
 
 async def list_discovery_services(
@@ -161,3 +173,31 @@ async def render_zone_file(
             lines=len(lines),
         )
         return zone, len(services), endpoint_count
+
+
+def render_corefile(
+    *,
+    domain: str,
+    zone_file_path: str,
+    listen: str,
+    forwarders: str,
+) -> str:
+    dns_domain = _normalize_domain(domain)
+    listen_addr = listen.strip() or ".:53"
+    zone_path = Path(zone_file_path).expanduser()
+    if not zone_path.is_absolute():
+        zone_path = (Path.cwd() / zone_path).resolve()
+    forward_targets = " ".join(_normalize_forwarders(forwarders))
+
+    return (
+        f"{listen_addr} {{\n"
+        "    errors\n"
+        "    log\n"
+        "    health\n"
+        "    ready\n"
+        f"    file {zone_path} {dns_domain}\n"
+        "    reload 5s\n"
+        "    cache 30\n"
+        f"    forward . {forward_targets}\n"
+        "}\n"
+    )

@@ -7,6 +7,21 @@
       <div class="mt-4 flex flex-wrap gap-3 items-center">
         <span class="badge badge-outline mono py-3">{{ domain }}</span>
         <a class="btn btn-sm btn-outline" href="{{ zone_endpoint }}" target="_blank" rel="noreferrer">View Zone File</a>
+        <a class="btn btn-sm btn-outline" href="{{ corefile_endpoint }}" target="_blank" rel="noreferrer">View Corefile</a>
+      </div>
+      <div class="mt-4 grid md:grid-cols-3 gap-3 text-sm">
+        <div class="rounded-xl border border-slate-100 p-3">
+          <div class="text-slate-500">Services</div>
+          <div class="mono">{{ service_count }}</div>
+        </div>
+        <div class="rounded-xl border border-slate-100 p-3">
+          <div class="text-slate-500">Healthy Endpoints</div>
+          <div class="mono">{{ endpoint_count }}</div>
+        </div>
+        <div class="rounded-xl border border-slate-100 p-3">
+          <div class="text-slate-500">Last Sync (UTC)</div>
+          <div class="mono">{{ last_sync_at or "n/a" }}</div>
+        </div>
       </div>
     </article>
 
@@ -34,4 +49,3 @@
     </article>
   </section>
 {% endblock %}
-

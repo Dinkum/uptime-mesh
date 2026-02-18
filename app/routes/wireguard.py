@@ -25,8 +25,14 @@ async def wireguard_status(
                 node_id=node.id,
                 primary_tunnel=status.get("wg_primary_tunnel"),
                 secondary_tunnel=status.get("wg_secondary_tunnel"),
+                primary_router_reachable=status.get("wg_primary_router_reachable"),
+                secondary_router_reachable=status.get("wg_secondary_router_reachable"),
                 active_route=status.get("wg_active_route"),
                 failover_state=status.get("wg_failover_state"),
+                primary_peer_configured=status.get("wg_primary_peer_configured"),
+                secondary_peer_configured=status.get("wg_secondary_peer_configured"),
+                primary_peer_endpoint=status.get("wg_primary_peer_endpoint"),
+                secondary_peer_endpoint=status.get("wg_secondary_peer_endpoint"),
             )
         )
     return statuses

@@ -89,8 +89,23 @@ class Settings(BaseSettings):
     runtime_discovery_domain: str = Field(default="mesh.local")
     runtime_discovery_ttl_seconds: int = Field(default=30, ge=1, le=3600)
     runtime_discovery_zone_path: str = Field(default="data/coredns/db.mesh.local")
+    runtime_discovery_corefile_path: str = Field(default="data/coredns/Corefile")
+    runtime_discovery_listen: str = Field(default=".:53")
+    runtime_discovery_forwarders: str = Field(default="/etc/resolv.conf")
     runtime_discovery_interval_seconds: int = Field(default=10, ge=3, le=300)
     runtime_discovery_reload_command: str = Field(default="")
+    runtime_gateway_enable: bool = Field(default=False)
+    runtime_gateway_config_path: str = Field(default="data/nginx/nginx.conf")
+    runtime_gateway_candidate_path: str = Field(default="data/nginx/nginx.candidate.conf")
+    runtime_gateway_backup_path: str = Field(default="data/nginx/nginx.prev.conf")
+    runtime_gateway_listen: str = Field(default="0.0.0.0:80")
+    runtime_gateway_server_name: str = Field(default="_")
+    runtime_gateway_interval_seconds: int = Field(default=10, ge=3, le=300)
+    runtime_gateway_validate_command: str = Field(default="nginx -t -c {config_path}")
+    runtime_gateway_reload_command: str = Field(default="systemctl reload nginx")
+    runtime_gateway_healthcheck_urls: str = Field(default="")
+    runtime_gateway_healthcheck_timeout_seconds: int = Field(default=3, ge=1, le=60)
+    runtime_gateway_healthcheck_expected_status: int = Field(default=200, ge=100, le=599)
 
     model_config = SettingsConfigDict(
         env_file=".env",

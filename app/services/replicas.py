@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import List, Optional
 from uuid import uuid4
@@ -229,6 +230,10 @@ async def move_replica(
         current_node_id=replica.node_id,
         target_node_id=target_node_id,
     ) as op:
+        if replica.node_id == target_node_id:
+            op.step("move.skip", "Replica already pinned to target node")
+            return replica
+
         status = dict(replica.status or {})
         if _settings.lxd_enabled:
             service, target_node = await _service_and_node(
@@ -238,18 +243,85 @@ async def move_replica(
             )
             container_name = _container_name_for(replica, service)
             project = str(status.get("lxd_project") or _settings.lxd_project)
-            op.step(
-                "lxd.move",
-                "Moving LXD container to target node",
-                container=container_name,
-                project=project,
-                target_node=target_node.name,
-            )
-            await lxd_service.move_container(
-                name=container_name,
-                project=project,
-                target_node=target_node.name,
-            )
+            temp_name = f"{container_name}-mv-{uuid4().hex[:6]}"[:63].strip("-")
+            source_exists = await lxd_service.container_exists(name=container_name, project=project)
+            temp_created = False
+            cutover_started = False
+
+            try:
+                spec = lxd_service.build_container_spec(
+                    service_name=service.name,
+                    service_spec=service.spec or {},
+                    replica_id=replica.id,
+                    node_name=target_node.name,
+                    desired_state=replica.desired_state,
+                )
+                staged_spec = replace(
+                    spec,
+                    name=temp_name,
+                    project=project,
+                    target_node=target_node.name,
+                )
+                op.step(
+                    "lxd.stage.init",
+                    "Creating staged target container",
+                    source_container=container_name,
+                    staged_container=temp_name,
+                    project=project,
+                    target_node=target_node.name,
+                    source_exists=source_exists,
+                )
+                await lxd_service.ensure_container(staged_spec)
+                temp_created = True
+                staged_state = await lxd_service.container_status(name=temp_name, project=project)
+                op.step(
+                    "lxd.stage.health_gate",
+                    "Staged target container passed health gate",
+                    staged_container=temp_name,
+                    staged_state=staged_state,
+                )
+
+                cutover_started = True
+                if source_exists:
+                    op.step(
+                        "lxd.cutover.stop",
+                        "Stopping and deleting source container before cutover",
+                        source_container=container_name,
+                    )
+                    await lxd_service.delete_container(name=container_name, project=project)
+                else:
+                    op.step("lxd.cutover.source", "Source container missing; cutover continues")
+
+                await lxd_service.rename_container(
+                    source_name=temp_name,
+                    target_name=container_name,
+                    project=project,
+                )
+                op.step(
+                    "lxd.cutover.rename",
+                    "Renamed staged container to canonical name",
+                    source_container=temp_name,
+                    target_container=container_name,
+                )
+            except lxd_service.LXDOperationError:
+                if temp_created and not cutover_started:
+                    try:
+                        await lxd_service.delete_container(name=temp_name, project=project)
+                        op.step(
+                            "lxd.stage.cleanup",
+                            "Deleted staged container after pre-cutover failure",
+                            staged_container=temp_name,
+                        )
+                    except lxd_service.LXDOperationError as cleanup_exc:
+                        op.step_warning(
+                            "lxd.stage.cleanup",
+                            "Failed to delete staged container after move failure",
+                            staged_container=temp_name,
+                            error_type=type(cleanup_exc).__name__,
+                            error=cleanup_exc.detail,
+                        )
+                raise
+
             runtime_state = await lxd_service.container_status(name=container_name, project=project)
             status = _merge_lxd_status(
                 status,
@@ -257,11 +329,14 @@ async def move_replica(
                 lxd_project=project,
                 lxd_target_node=target_node.name,
                 lxd_state=runtime_state,
+                lxd_move_strategy="staged",
+                lxd_last_move_source_node=replica.node_id,
+                lxd_last_move_target_node=target_node_id,
                 lxd_last_error="",
-                lxd_last_action="move",
+                lxd_last_action="move.staged",
                 lxd_last_action_at=_utcnow_iso(),
             )
-            op.step("lxd.status", "Container move complete", lxd_state=runtime_state)
+            op.step("lxd.status", "Staged move complete", lxd_state=runtime_state)
         else:
             op.step("lxd.skip", "Skipped LXD move (disabled)")
         replica.node_id = target_node_id
@@ -272,7 +347,11 @@ async def move_replica(
             category="replicas",
             name="replica.move",
             level="INFO",
-            fields={"replica_id": replica.id, "target_node_id": target_node_id},
+            fields={
+                "replica_id": replica.id,
+                "target_node_id": target_node_id,
+                "strategy": "staged" if _settings.lxd_enabled else "logical",
+            },
         )
         op.step("event.record", "Recorded replica move event")
         await session.commit()

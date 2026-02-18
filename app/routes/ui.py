@@ -15,6 +15,7 @@ from app.services import (
     cluster_settings,
     discovery as discovery_service,
     events as event_service,
+    gateway as gateway_service,
     nodes as node_service,
     replicas as replica_service,
     router_assignments as router_assignment_service,
@@ -28,6 +29,13 @@ router = APIRouter(prefix="/ui", include_in_schema=False)
 
 templates = Jinja2Templates(directory="app/templates")
 settings = get_settings()
+
+
+def _safe_int(value: str, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:  # noqa: BLE001
+        return default
 
 
 async def _base_context(request: Request, session: AsyncSession) -> Dict[str, Any]:
@@ -143,8 +151,14 @@ async def wireguard_page(request: Request, session: AsyncSession = Depends(get_d
                 "node_id": node.id,
                 "primary_tunnel": status.get("wg_primary_tunnel"),
                 "secondary_tunnel": status.get("wg_secondary_tunnel"),
+                "primary_router_reachable": status.get("wg_primary_router_reachable"),
+                "secondary_router_reachable": status.get("wg_secondary_router_reachable"),
                 "active_route": status.get("wg_active_route"),
                 "failover_state": status.get("wg_failover_state"),
+                "primary_peer_configured": status.get("wg_primary_peer_configured"),
+                "secondary_peer_configured": status.get("wg_secondary_peer_configured"),
+                "primary_peer_endpoint": status.get("wg_primary_peer_endpoint"),
+                "secondary_peer_endpoint": status.get("wg_secondary_peer_endpoint"),
             }
         )
 
@@ -160,6 +174,7 @@ async def wireguard_page(request: Request, session: AsyncSession = Depends(get_d
 
 @router.get("/discovery")
 async def discovery_page(request: Request, session: AsyncSession = Depends(get_db_session)) -> Any:
+    settings_map = await cluster_settings.get_settings_map(session)
     records = await discovery_service.list_discovery_services(
         session,
         domain=settings.runtime_discovery_domain,
@@ -171,9 +186,42 @@ async def discovery_page(request: Request, session: AsyncSession = Depends(get_d
         "records": records,
         "domain": settings.runtime_discovery_domain,
         "zone_endpoint": "/discovery/dns/zone",
+        "corefile_endpoint": "/discovery/dns/corefile",
+        "service_count": _safe_int(settings_map.get("discovery_service_count", "0")),
+        "endpoint_count": _safe_int(settings_map.get("discovery_endpoint_count", "0")),
+        "last_sync_at": settings_map.get("discovery_last_sync_at", ""),
     }
     context.update(await _base_context(request, session))
     return templates.TemplateResponse("discovery.html", context)
+
+
+@router.get("/gateway")
+async def gateway_page(request: Request, session: AsyncSession = Depends(get_db_session)) -> Any:
+    settings_map = await cluster_settings.get_settings_map(session)
+    routes = await gateway_service.list_gateway_routes(session)
+    healthcheck_urls = [
+        item.strip()
+        for item in settings.runtime_gateway_healthcheck_urls.split(",")
+        if item.strip()
+    ]
+    context = {
+        "request": request,
+        "title": "Gateway",
+        "subtitle": "NGINX ingress routes with safe reload pipeline",
+        "enabled": settings.runtime_gateway_enable,
+        "config_endpoint": "/gateway/nginx/config",
+        "routes": routes,
+        "route_count": _safe_int(settings_map.get("gateway_route_count", "0"), default=len(routes)),
+        "upstream_count": _safe_int(
+            settings_map.get("gateway_upstream_count", "0"), default=len(routes)
+        ),
+        "last_sync_at": settings_map.get("gateway_last_sync_at", ""),
+        "last_apply_status": settings_map.get("gateway_last_apply_status", "unknown"),
+        "last_apply_error": settings_map.get("gateway_last_apply_error", ""),
+        "healthcheck_urls": healthcheck_urls,
+    }
+    context.update(await _base_context(request, session))
+    return templates.TemplateResponse("gateway.html", context)
 
 
 @router.get("/support")
@@ -200,7 +248,7 @@ async def settings_page(request: Request, session: AsyncSession = Depends(get_db
         "request": request,
         "title": "Settings",
         "subtitle": "Authentication and cluster preferences",
-        "username": await auth_service.get_username(session),
+        "login_id": await auth_service.get_login_id(session),
         "password_success": "Password updated successfully." if password_updated else "",
         "password_error": "",
         "repo_success": "Repository URL updated successfully." if repo_updated else "",
@@ -226,7 +274,7 @@ async def change_password(
     new_password: str = Form(default=""),
     confirm_password: str = Form(default=""),
 ) -> Any:
-    username = await auth_service.get_username(session)
+    login_id = await auth_service.get_login_id(session)
     error = ""
     success = ""
     status_code = status.HTTP_200_OK
@@ -276,7 +324,7 @@ async def change_password(
         "request": request,
         "title": "Settings",
         "subtitle": "Authentication and cluster preferences",
-        "username": username,
+        "login_id": login_id,
         "password_success": success,
         "password_error": error,
         "repo_success": "",
@@ -316,7 +364,7 @@ async def update_repo_url(
         "request": request,
         "title": "Settings",
         "subtitle": "Authentication and cluster preferences",
-        "username": await auth_service.get_username(session),
+        "login_id": await auth_service.get_login_id(session),
         "password_success": "",
         "password_error": "",
         "repo_success": success,

@@ -23,6 +23,7 @@
               <td>{{ service.description or "-" }}</td>
               <td>
                 <div class="flex gap-2">
+                  <button class="btn btn-xs btn-outline" onclick="serviceAction('{{ service.id }}', 'apply-pinned')">Apply Pinned</button>
                   <button class="btn btn-xs btn-outline" onclick="serviceAction('{{ service.id }}', 'rollout')">Rollout</button>
                   <button class="btn btn-xs btn-outline" onclick="serviceAction('{{ service.id }}', 'rollback')">Rollback</button>
                 </div>

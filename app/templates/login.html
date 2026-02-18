@@ -44,7 +44,7 @@
       <form method="post" action="/auth/login" class="mt-6 space-y-4">
         <input type="hidden" name="next" value="{{ next_path }}" />
         <label class="form-control">
-          <span class="label-text text-sm">Username</span>
+          <span class="label-text text-sm">Login ID</span>
           <input
             class="input input-bordered"
             type="text"
@@ -52,6 +52,7 @@
             value=""
             required
             autocomplete="username"
+            placeholder="UM-XXXX-XXXX-XXXX-XXXX"
             autofocus
           />
         </label>

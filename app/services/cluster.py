@@ -24,6 +24,7 @@ from app.identity import (
 from app.logger import get_logger
 from app.models.join_token import JoinToken
 from app.models.node import Node
+from app.models.router_assignment import RouterAssignment
 from app.schemas.cluster import (
     ClusterBootstrapRequest,
     HeartbeatOut,
@@ -41,6 +42,8 @@ settings = get_settings()
 
 BOOTSTRAPPED_KEY = "cluster_bootstrapped"
 BOOTSTRAP_AT_KEY = "cluster_bootstrapped_at"
+AUTH_SECRET_KEY_SETTING = "auth_secret_key"
+CLUSTER_SIGNING_KEY_SETTING = "cluster_signing_key"
 
 
 def _hash_secret(secret: str) -> str:
@@ -91,6 +94,181 @@ def _resolve_etcd_peer_url(payload: NodeJoinRequest) -> str:
     return ""
 
 
+def _is_worker_node(node: Node) -> bool:
+    roles = node.roles if isinstance(node.roles, list) else []
+    return any(str(role).strip().lower() == "worker" for role in roles)
+
+
+def _desired_router_pair(node_id: str, worker_ids: list[str]) -> tuple[str, str]:
+    others = [item for item in worker_ids if item != node_id]
+    if len(others) >= 2:
+        return others[0], others[1]
+    if len(others) == 1:
+        return others[0], others[0]
+    return node_id, node_id
+
+
+async def _reconcile_router_assignments(
+    session: AsyncSession,
+    *,
+    changed_node_id: str,
+) -> tuple[int, int]:
+    async with _logger.operation(
+        "router_assignment.reconcile",
+        "Reconciling router assignments for worker nodes",
+        changed_node_id=changed_node_id,
+    ) as op:
+        node_rows = await session.execute(select(Node))
+        nodes = list(node_rows.scalars().all())
+        worker_ids = sorted(node.id for node in nodes if _is_worker_node(node))
+        if not worker_ids:
+            op.step("worker.none", "No worker nodes found; skipping router assignment reconcile")
+            return 0, 0
+
+        assignment_rows = await session.execute(select(RouterAssignment))
+        assignments = list(assignment_rows.scalars().all())
+        by_node_id = {item.node_id: item for item in assignments}
+
+        created_count = 0
+        updated_count = 0
+        for node_id in worker_ids:
+            primary_router_id, secondary_router_id = _desired_router_pair(node_id, worker_ids)
+            current = by_node_id.get(node_id)
+            if current is None:
+                current = RouterAssignment(
+                    id=f"ra-{uuid4().hex[:16]}",
+                    node_id=node_id,
+                    primary_router_id=primary_router_id,
+                    secondary_router_id=secondary_router_id,
+                )
+                session.add(current)
+                created_count += 1
+                await record_event(
+                    session,
+                    event_id=str(uuid4()),
+                    category="router_assignments",
+                    name="router_assignment.create.auto",
+                    level="INFO",
+                    fields={
+                        "node_id": node_id,
+                        "primary_router_id": primary_router_id,
+                        "secondary_router_id": secondary_router_id,
+                    },
+                )
+                op.child(
+                    "assignment",
+                    node_id,
+                    "Created router assignment",
+                    primary_router_id=primary_router_id,
+                    secondary_router_id=secondary_router_id,
+                )
+                by_node_id[node_id] = current
+                continue
+
+            if (
+                current.primary_router_id != primary_router_id
+                or current.secondary_router_id != secondary_router_id
+            ):
+                current.primary_router_id = primary_router_id
+                current.secondary_router_id = secondary_router_id
+                updated_count += 1
+                await record_event(
+                    session,
+                    event_id=str(uuid4()),
+                    category="router_assignments",
+                    name="router_assignment.update.auto",
+                    level="INFO",
+                    fields={
+                        "node_id": node_id,
+                        "primary_router_id": primary_router_id,
+                        "secondary_router_id": secondary_router_id,
+                    },
+                )
+                op.child(
+                    "assignment",
+                    node_id,
+                    "Updated router assignment",
+                    primary_router_id=primary_router_id,
+                    secondary_router_id=secondary_router_id,
+                )
+
+        if created_count or updated_count:
+            await session.commit()
+            op.step(
+                "db.commit",
+                "Committed router assignment reconcile",
+                created=created_count,
+                updated=updated_count,
+            )
+
+            if _etcd_configured():
+                for node_id in worker_ids:
+                    assignment = by_node_id.get(node_id)
+                    if assignment is None:
+                        continue
+                    try:
+                        await etcd_service.put_value(
+                            key=f"router_assignments/{node_id}",
+                            value=json.dumps(
+                                {
+                                    "node_id": node_id,
+                                    "primary_router_id": assignment.primary_router_id,
+                                    "secondary_router_id": assignment.secondary_router_id,
+                                    "updated_at": _utcnow().isoformat(),
+                                },
+                                separators=(",", ":"),
+                            ),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        op.step_warning(
+                            "etcd.assignment_upsert",
+                            "Failed to upsert router assignment to etcd",
+                            node_id=node_id,
+                            error_type=type(exc).__name__,
+                            error=str(exc),
+                        )
+                op.step("etcd.assignment_upsert", "Upserted router assignments to etcd")
+            return created_count, updated_count
+
+        op.step("change.none", "Router assignments already in desired state")
+        return 0, 0
+
+
+async def _resolve_cluster_secrets(
+    session: AsyncSession,
+    *,
+    persist_if_missing: bool,
+) -> tuple[str, str, bool]:
+    settings_map = await cluster_settings.get_settings_map(session)
+    auth_secret_key = settings_map.get(AUTH_SECRET_KEY_SETTING, "").strip()
+    cluster_signing_key = settings_map.get(CLUSTER_SIGNING_KEY_SETTING, "").strip()
+    updates: dict[str, str] = {}
+
+    if not auth_secret_key:
+        auth_secret_key = settings.auth_secret_key
+        updates[AUTH_SECRET_KEY_SETTING] = auth_secret_key
+    elif auth_secret_key != settings.auth_secret_key:
+        _logger.warning(
+            "cluster.secrets.mismatch",
+            "Database auth secret differs from local process setting",
+            key=AUTH_SECRET_KEY_SETTING,
+        )
+    if not cluster_signing_key:
+        cluster_signing_key = settings.cluster_signing_key
+        updates[CLUSTER_SIGNING_KEY_SETTING] = cluster_signing_key
+    elif cluster_signing_key != settings.cluster_signing_key:
+        _logger.warning(
+            "cluster.secrets.mismatch",
+            "Database cluster signing key differs from local process setting",
+            key=CLUSTER_SIGNING_KEY_SETTING,
+        )
+
+    if updates and persist_if_missing:
+        await cluster_settings.upsert_settings(session, updates, sync_file=False)
+
+    return auth_secret_key, cluster_signing_key, bool(updates)
+
+
 async def create_join_token(
     session: AsyncSession,
     *,
@@ -135,7 +313,7 @@ async def bootstrap_cluster(
     *,
     payload: ClusterBootstrapRequest,
     requested_by: Optional[str],
-) -> Tuple[bool, JoinTokenOut, JoinTokenOut]:
+) -> Tuple[bool, JoinTokenOut]:
     async with _logger.operation(
         "cluster.bootstrap",
         "Handling bootstrap request",
@@ -143,6 +321,15 @@ async def bootstrap_cluster(
     ) as op:
         ensure_cluster_ca(settings.cluster_pki_dir)
         op.step("pki.ensure_ca", "Ensured cluster CA exists", pki_dir=settings.cluster_pki_dir)
+        _, _, secrets_persisted = await _resolve_cluster_secrets(
+            session,
+            persist_if_missing=True,
+        )
+        op.step(
+            "secrets.resolve",
+            "Resolved cluster-internal signing secrets",
+            persisted_missing_keys=secrets_persisted,
+        )
 
         is_bootstrapped_setting = await cluster_settings.get_setting(session, BOOTSTRAPPED_KEY)
         already_bootstrapped = (
@@ -154,12 +341,6 @@ async def bootstrap_cluster(
             already_bootstrapped=already_bootstrapped,
         )
 
-        core = await create_join_token(
-            session,
-            role="core",
-            ttl_seconds=payload.core_token_ttl_seconds,
-            issued_by=requested_by,
-        )
         worker = await create_join_token(
             session,
             role="worker",
@@ -168,8 +349,7 @@ async def bootstrap_cluster(
         )
         op.step(
             "token.issue",
-            "Issued bootstrap join tokens",
-            core_token_id=core.id,
+            "Issued bootstrap join token",
             worker_token_id=worker.id,
         )
 
@@ -181,7 +361,7 @@ async def bootstrap_cluster(
                 "Marked cluster as bootstrapped",
                 requested_by=requested_by or "unknown",
             )
-        return True, core, worker
+        return True, worker
 
 
 async def _get_join_token_for_use(
@@ -212,6 +392,15 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
         role=payload.role,
         node_name=payload.name,
     ) as op:
+        auth_secret_key, cluster_signing_key, secrets_persisted = await _resolve_cluster_secrets(
+            session,
+            persist_if_missing=True,
+        )
+        op.step(
+            "secrets.resolve",
+            "Resolved cluster-internal signing secrets",
+            persisted_missing_keys=secrets_persisted,
+        )
         join_token = await _get_join_token_for_use(
             session,
             payload.token,
@@ -256,7 +445,7 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
         lease_token = create_lease_token(
             node_id=payload.node_id,
             identity_fingerprint=identity_fingerprint,
-            secret_key=settings.cluster_signing_key,
+            secret_key=cluster_signing_key,
             ttl_seconds=settings.cluster_lease_token_ttl_seconds,
         )
         op.step(
@@ -347,7 +536,7 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
                     error_type=type(exc).__name__,
                     error=str(exc),
                 )
-        if payload.role == "core" and _etcd_configured():
+        if payload.role == "worker" and _etcd_configured():
             peer_url = _resolve_etcd_peer_url(payload)
             if peer_url:
                 try:
@@ -366,14 +555,14 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
                         member_id = added.member_id
                         op.step(
                             "etcd.member_add",
-                            "Added core node as etcd member",
+                            "Added worker node as etcd member",
                             member_id=member_id,
                             peer_url=peer_url,
                         )
                     else:
                         op.step(
                             "etcd.member_exists",
-                            "Core node already exists in etcd membership",
+                            "Worker node already exists in etcd membership",
                             member_id=member_id,
                             peer_url=peer_url,
                         )
@@ -386,7 +575,7 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
                 except Exception as exc:  # noqa: BLE001
                     op.step_warning(
                         "etcd.member_add",
-                        "Failed to ensure core node etcd member",
+                        "Failed to ensure worker node etcd member",
                         error_type=type(exc).__name__,
                         error=str(exc),
                         peer_url=peer_url,
@@ -397,6 +586,17 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
                     "Skipped etcd member add due to missing peer URL",
                     node_id=payload.node_id,
                 )
+        if payload.role == "worker":
+            created_assignments, updated_assignments = await _reconcile_router_assignments(
+                session,
+                changed_node_id=payload.node_id,
+            )
+            op.step(
+                "router_assignment.reconcile",
+                "Reconciled router assignments after worker join",
+                created=created_assignments,
+                updated=updated_assignments,
+            )
         return NodeJoinOut(
             node_id=payload.node_id,
             lease_token=lease_token,
@@ -404,6 +604,8 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
             identity_fingerprint=identity_fingerprint,
             node_cert_pem=node_cert_pem,
             ca_cert_pem=ca_cert_pem,
+            auth_secret_key=auth_secret_key,
+            cluster_signing_key=cluster_signing_key,
         )
 
 
@@ -423,7 +625,12 @@ async def apply_heartbeat(
         node_id=node_id,
         ttl_seconds=ttl_seconds,
     ) as op:
-        lease_claims = decode_lease_token(lease_token, settings.cluster_signing_key)
+        _, cluster_signing_key, _ = await _resolve_cluster_secrets(
+            session,
+            persist_if_missing=False,
+        )
+        op.step("secrets.resolve", "Resolved cluster signing key for heartbeat validation")
+        lease_claims = decode_lease_token(lease_token, cluster_signing_key)
         if lease_claims is None:
             _logger.warning(
                 "heartbeat.reject",

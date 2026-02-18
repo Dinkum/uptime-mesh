@@ -30,3 +30,36 @@ class EtcdMemberAddRequest(BaseModel):
     name: str
     peer_urls: list[str]
     is_learner: bool = False
+
+
+class EtcdQuorumOut(BaseModel):
+    enabled: bool
+    configured: bool
+    desired_member_ids: list[str]
+    current_member_ids: list[str]
+    missing_member_ids: list[str]
+    extra_member_ids: list[str]
+    endpoint_count: int
+    healthy_endpoint_count: int
+    quorum_required: int
+    has_quorum: bool
+    detail: str = ""
+
+
+class EtcdQuorumReconcileCandidateOut(BaseModel):
+    node_id: str
+    peer_url: str = ""
+    action: str
+    reason: str = ""
+    member_id: str = ""
+    error: str = ""
+
+
+class EtcdQuorumReconcileOut(BaseModel):
+    dry_run: bool
+    desired_member_count: int
+    current_member_count: int
+    added_count: int
+    skipped_count: int
+    failed_count: int
+    candidates: list[EtcdQuorumReconcileCandidateOut]
