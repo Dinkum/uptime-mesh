@@ -660,39 +660,88 @@ func (a *Agent) tick(ctx context.Context) error {
 func (a *Agent) reconcileWireGuard(ctx context.Context) map[string]any {
 	primaryPeer, secondaryPeer := a.peerIntents()
 	localAddress := normalizeAddress(a.cfg.WGLocalAddress)
+	primaryPeerConfigured := strings.TrimSpace(primaryPeer.publicKey) != ""
+	secondaryPeerConfigured := strings.TrimSpace(secondaryPeer.publicKey) != ""
+	primaryIfaceConfigured := primaryPeerConfigured || strings.TrimSpace(localAddress) != ""
+	secondaryIfaceConfigured := secondaryPeerConfigured || strings.TrimSpace(localAddress) != ""
 	primaryPublicKey := ""
 	secondaryPublicKey := ""
 
-	if err := a.ensureWireGuardInterface(
-		ctx,
-		a.cfg.PrimaryIface,
-		a.cfg.PrimaryListenPort,
-		localAddress,
-		primaryPeer,
-	); err != nil {
-		a.log.Warn("agent.wireguard", "interface.primary_error", "Failed to reconcile primary WireGuard interface", map[string]any{
-			"iface": a.cfg.PrimaryIface,
-			"error": err.Error(),
+	if !primaryIfaceConfigured && !secondaryIfaceConfigured {
+		a.mu.Lock()
+		if strings.TrimSpace(a.state.ActiveIface) == "" {
+			a.state.ActiveIface = a.cfg.PrimaryIface
+		}
+		activeIface := a.state.ActiveIface
+		a.state.PrimaryFailures = 0
+		a.state.PrimarySuccesses = 0
+		a.state.SecondaryFailures = 0
+		a.state.SecondarySuccesses = 0
+		a.mu.Unlock()
+
+		a.log.Info("agent.wireguard", "reconcile.skip_unconfigured", "Skipped WireGuard reconcile (no peer public keys configured)", map[string]any{
+			"primary_iface":          a.cfg.PrimaryIface,
+			"secondary_iface":        a.cfg.SecondaryIface,
+			"primary_peer_endpoint":  primaryPeer.endpoint,
+			"secondary_peer_endpoint": secondaryPeer.endpoint,
 		})
-	}
-	if err := a.ensureWireGuardInterface(
-		ctx,
-		a.cfg.SecondaryIface,
-		a.cfg.SecondaryListenPort,
-		localAddress,
-		secondaryPeer,
-	); err != nil {
-		a.log.Warn("agent.wireguard", "interface.secondary_error", "Failed to reconcile secondary WireGuard interface", map[string]any{
-			"iface": a.cfg.SecondaryIface,
-			"error": err.Error(),
-		})
+		return map[string]any{
+			"wg_primary_tunnel":            "down",
+			"wg_secondary_tunnel":          "down",
+			"wg_primary_health":            false,
+			"wg_secondary_health":          false,
+			"wg_primary_router_reachable":  false,
+			"wg_secondary_router_reachable": false,
+			"wg_active_route":              activeIface,
+			"wg_failover_state":            "unconfigured",
+			"wg_primary_public_key":        "",
+			"wg_secondary_public_key":      "",
+			"wg_public_key":                "",
+			"wg_primary_peer_endpoint":     primaryPeer.endpoint,
+			"wg_secondary_peer_endpoint":   secondaryPeer.endpoint,
+			"wg_primary_peer_configured":   false,
+			"wg_secondary_peer_configured": false,
+		}
 	}
 
-	primaryPublicKey = a.wireGuardPublicKey(ctx, a.cfg.PrimaryIface)
-	secondaryPublicKey = a.wireGuardPublicKey(ctx, a.cfg.SecondaryIface)
+	if primaryIfaceConfigured {
+		if err := a.ensureWireGuardInterface(
+			ctx,
+			a.cfg.PrimaryIface,
+			a.cfg.PrimaryListenPort,
+			localAddress,
+			primaryPeer,
+		); err != nil {
+			a.log.Warn("agent.wireguard", "interface.primary_error", "Failed to reconcile primary WireGuard interface", map[string]any{
+				"iface": a.cfg.PrimaryIface,
+				"error": err.Error(),
+			})
+		}
+	}
+	if secondaryIfaceConfigured {
+		if err := a.ensureWireGuardInterface(
+			ctx,
+			a.cfg.SecondaryIface,
+			a.cfg.SecondaryListenPort,
+			localAddress,
+			secondaryPeer,
+		); err != nil {
+			a.log.Warn("agent.wireguard", "interface.secondary_error", "Failed to reconcile secondary WireGuard interface", map[string]any{
+				"iface": a.cfg.SecondaryIface,
+				"error": err.Error(),
+			})
+		}
+	}
 
-	primaryUp := a.interfaceUp(ctx, a.cfg.PrimaryIface)
-	secondaryUp := a.interfaceUp(ctx, a.cfg.SecondaryIface)
+	if primaryIfaceConfigured {
+		primaryPublicKey = a.wireGuardPublicKey(ctx, a.cfg.PrimaryIface)
+	}
+	if secondaryIfaceConfigured {
+		secondaryPublicKey = a.wireGuardPublicKey(ctx, a.cfg.SecondaryIface)
+	}
+
+	primaryUp := primaryIfaceConfigured && a.interfaceUp(ctx, a.cfg.PrimaryIface)
+	secondaryUp := secondaryIfaceConfigured && a.interfaceUp(ctx, a.cfg.SecondaryIface)
 
 	primaryHealthy := primaryUp
 	secondaryHealthy := secondaryUp
@@ -762,7 +811,7 @@ func (a *Agent) reconcileWireGuard(ctx context.Context) map[string]any {
 	secondarySuccesses := a.state.SecondarySuccesses
 	a.mu.Unlock()
 
-	if activeAfter != activeBefore {
+	if activeAfter != activeBefore && (primaryIfaceConfigured || secondaryIfaceConfigured) {
 		a.applyRouteMetrics(ctx, activeAfter)
 		switch failoverEvent {
 		case "failover.engage":
@@ -773,7 +822,9 @@ func (a *Agent) reconcileWireGuard(ctx context.Context) map[string]any {
 			a.log.Info("agent.wireguard", failoverEvent, "Switched back to primary route", eventFields)
 		}
 	}
-	a.applyRouteMetrics(ctx, activeAfter)
+	if primaryIfaceConfigured || secondaryIfaceConfigured {
+		a.applyRouteMetrics(ctx, activeAfter)
+	}
 
 	failoverState := "primary"
 	if activeAfter == a.cfg.SecondaryIface {
@@ -794,8 +845,8 @@ func (a *Agent) reconcileWireGuard(ctx context.Context) map[string]any {
 		"wg_public_key":                firstNonEmpty(primaryPublicKey, secondaryPublicKey),
 		"wg_primary_peer_endpoint":     primaryPeer.endpoint,
 		"wg_secondary_peer_endpoint":   secondaryPeer.endpoint,
-		"wg_primary_peer_configured":   strings.TrimSpace(primaryPeer.publicKey) != "",
-		"wg_secondary_peer_configured": strings.TrimSpace(secondaryPeer.publicKey) != "",
+		"wg_primary_peer_configured":   primaryPeerConfigured,
+		"wg_secondary_peer_configured": secondaryPeerConfigured,
 	}
 	a.log.Info("agent.wireguard", "reconcile.status", "Reconciled WireGuard status", map[string]any{
 		"primary_up":         primaryUp,

@@ -651,7 +651,7 @@ setv("RUNTIME_HEARTBEAT_TTL_SECONDS", kv.get("RUNTIME_HEARTBEAT_TTL_SECONDS", "4
 setv("RUNTIME_MESH_CIDR", kv.get("RUNTIME_MESH_CIDR", "10.42.0.0/16") or "10.42.0.0/16")
 setv("RUNTIME_WG_PRIMARY_IFACE", kv.get("RUNTIME_WG_PRIMARY_IFACE", "wg-mesh0") or "wg-mesh0")
 setv("RUNTIME_WG_SECONDARY_IFACE", kv.get("RUNTIME_WG_SECONDARY_IFACE", "wg-mesh1") or "wg-mesh1")
-setv("RUNTIME_WG_CONFIGURE", kv.get("RUNTIME_WG_CONFIGURE", "true") or "true")
+setv("RUNTIME_WG_CONFIGURE", kv.get("RUNTIME_WG_CONFIGURE", "false") or "false")
 setv("RUNTIME_WG_KEY_DIR", kv.get("RUNTIME_WG_KEY_DIR", "data/wireguard") or "data/wireguard")
 setv("RUNTIME_WG_LOCAL_ADDRESS", kv.get("RUNTIME_WG_LOCAL_ADDRESS", ""))
 setv("RUNTIME_WG_PRIMARY_LISTEN_PORT", kv.get("RUNTIME_WG_PRIMARY_LISTEN_PORT", "51820") or "51820")
@@ -848,6 +848,36 @@ Environment=AGENT_UNIX_SOCKET=./data/agent.sock
 WantedBy=multi-user.target
 SYSTEMD
 
+cat > /etc/systemd/system/uptime-mesh-watchdog.service <<SYSTEMD
+[Unit]
+Description=UptimeMesh local self-heal watchdog
+After=network-online.target uptime-mesh.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=${APP_DIR}
+ExecStart=${APP_DIR}/.venv/bin/python ${APP_DIR}/ops/watchdog.py --api-url http://127.0.0.1:${PORT}/health --api-service uptime-mesh.service --agent-service uptime-mesh-agent.service
+Environment=PYTHONUNBUFFERED=1
+Environment=LOG_FILE=./data/app.log
+Environment=AGENT_LOG_FILE=./data/agent.log
+SYSTEMD
+
+cat > /etc/systemd/system/uptime-mesh-watchdog.timer <<SYSTEMD
+[Unit]
+Description=Run UptimeMesh self-heal watchdog every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+Unit=uptime-mesh-watchdog.service
+AccuracySec=10s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+SYSTEMD
+
 systemctl daemon-reload
 
 if [[ "$NODE_ROLE" == "worker" ]]; then
@@ -860,6 +890,8 @@ if [[ "$NODE_ROLE" == "worker" ]]; then
 fi
 
 systemctl enable --now uptime-mesh.service
+systemctl enable --now uptime-mesh-watchdog.timer
+systemctl start uptime-mesh-watchdog.service || true
 systemctl enable --now prometheus prometheus-node-exporter prometheus-alertmanager || true
 systemctl enable --now grafana-server || true
 
