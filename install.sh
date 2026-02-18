@@ -889,7 +889,8 @@ if [[ "$NODE_ROLE" == "worker" ]]; then
   fi
 fi
 
-systemctl enable --now uptime-mesh.service
+systemctl enable uptime-mesh.service
+systemctl restart uptime-mesh.service || systemctl start uptime-mesh.service
 systemctl enable --now uptime-mesh-watchdog.timer
 systemctl start uptime-mesh-watchdog.service || true
 systemctl enable --now prometheus prometheus-node-exporter prometheus-alertmanager || true
@@ -997,7 +998,8 @@ else
 fi
 
 if [[ -f "${APP_DIR}/data/identities/${NODE_ID}/node.key" && -f "${APP_DIR}/data/identities/${NODE_ID}/lease.token" ]]; then
-  systemctl enable --now uptime-mesh-agent.service
+  systemctl enable uptime-mesh-agent.service
+  systemctl restart uptime-mesh-agent.service || systemctl start uptime-mesh-agent.service
   echo "Go agent service started."
 else
   systemctl disable --now uptime-mesh-agent.service >/dev/null 2>&1 || true
