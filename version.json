@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
-  "version": "0.0.2",
+  "version": "0.0.3",
   "channels": {
     "stable": {
-      "version": "0.0.2",
+      "version": "0.0.3",
       "bootstrap": {
         "version": "1.0.1",
         "path": "ops/bootstrap.sh",

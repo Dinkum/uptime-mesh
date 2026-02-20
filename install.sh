@@ -40,14 +40,18 @@ run_quiet_command() {
   local label="$1"
   shift
   local tmp_file
+  local rc=0
   tmp_file="$(mktemp)"
   say "${label}"
-  if "$@" >"${tmp_file}" 2>&1; then
+  set +e
+  "$@" >"${tmp_file}" 2>&1
+  rc=$?
+  set -e
+  if [[ "${rc}" -eq 0 ]]; then
     cat "${tmp_file}" >> "${INSTALL_LOG}"
     rm -f "${tmp_file}"
     return 0
   fi
-  local rc=$?
   cat "${tmp_file}" >> "${INSTALL_LOG}"
   warn "${label} failed (exit ${rc})"
   warn "last output:"
@@ -73,7 +77,7 @@ apt_quiet_retry() {
 
 apt_install_optional() {
   local package_name="$1"
-  if ! apt_quiet_retry "Install optional package: ${package_name}" apt-get install -y "${package_name}"; then
+  if ! run_quiet_command "Install optional package: ${package_name}" apt-get install -y "${package_name}"; then
     warn "optional package not installed: ${package_name}"
   fi
 }
@@ -88,7 +92,7 @@ enable_service_if_exists() {
   if unit_exists "${unit}"; then
     systemctl enable --now "${unit}" >/dev/null 2>&1 || warn "failed to enable/start ${unit}"
   else
-    warn "service unit not found: ${unit}"
+    say "Skipping optional service (not installed): ${unit}"
   fi
 }
 
@@ -150,6 +154,11 @@ if [[ ! -d "${APP_DIR}/app" || ! -f "${APP_DIR}/pyproject.toml" ]]; then
 fi
 
 init_install_log
+cat <<'EOF'
++--------------------------------------------------------------+
+|                      UPTIMEMESH INSTALL                      |
++--------------------------------------------------------------+
+EOF
 
 usage() {
   cat <<'USAGE'
@@ -410,6 +419,7 @@ configure_self_signed_tls_proxy_nginx() {
 
   generate_self_signed_cert
   say "Configuring HTTPS reverse proxy (nginx)"
+  systemctl disable --now caddy >/dev/null 2>&1 || true
 
   cat > "${nginx_conf}" <<EOF
 server {
@@ -447,6 +457,7 @@ server {
 }
 EOF
 
+  rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf
   nginx -t
   systemctl enable --now nginx
   systemctl reload nginx || systemctl restart nginx
@@ -466,6 +477,7 @@ configure_self_signed_tls_proxy_caddy() {
 
   generate_self_signed_cert
   say "Configuring HTTPS reverse proxy (caddy)"
+  systemctl disable --now nginx >/dev/null 2>&1 || true
 
   install -d /etc/caddy
   cat > "${caddyfile}" <<EOF
@@ -712,6 +724,7 @@ print_install_summary() {
 | monitoring_seed   : ${INSTALL_MONITORING}
 | api_service       : ${api_status}
 | agent_service     : ${agent_status}
+| install_log       : ${INSTALL_LOG}
 | app_log           : ${APP_DIR}/data/app.log
 | agent_log         : ${APP_DIR}/data/agent.log
 | agent_socket      : ${APP_DIR}/data/agent.sock
@@ -822,14 +835,24 @@ if [[ -n "$JOIN_TARGET" && -z "$JOIN_TOKEN" ]]; then
 fi
 
 if [[ "$INSTALL_DEPS" -eq 1 ]]; then
+  say "Installing system dependencies (quiet mode, details in install.log)"
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y
-  apt-get install -y python3 python3-venv python3-pip curl ca-certificates git golang-go iproute2 iputils-ping openssl
-  apt-get install -y lxd || true
-  apt-get install -y etcd || apt-get install -y etcd-server etcd-client || true
-  apt-get install -y nginx || true
-  apt-get install -y caddy || true
-  apt-get install -y prometheus prometheus-node-exporter prometheus-alertmanager grafana || true
+  apt_quiet_retry "Refresh apt package index" apt-get update -y || fail "apt update failed"
+  apt_quiet_retry \
+    "Install required base packages" \
+    apt-get install -y python3 python3-venv python3-pip curl ca-certificates git golang-go iproute2 iputils-ping openssl \
+    || fail "required base package install failed"
+
+  apt_install_optional lxd
+  if ! run_quiet_command "Install optional package set: etcd" apt-get install -y etcd; then
+    run_quiet_command "Install optional package set: etcd-server + etcd-client" apt-get install -y etcd-server etcd-client || true
+  fi
+  apt_install_optional nginx
+  apt_install_optional caddy
+  run_quiet_command \
+    "Install optional package set: monitoring stack" \
+    apt-get install -y prometheus prometheus-node-exporter prometheus-alertmanager grafana \
+    || warn "monitoring stack packages were not fully installed"
 fi
 
 ETCD_AVAILABLE=0
@@ -842,18 +865,23 @@ require_cmd curl
 require_cmd systemctl
 
 cd "$APP_DIR"
+say "Preparing Python environment"
 
 if [[ ! -d .venv ]]; then
   python3 -m venv .venv
 fi
 
-.venv/bin/pip install --upgrade pip
-.venv/bin/pip install -e .
+run_quiet_command "Upgrade pip" .venv/bin/pip install --upgrade pip || fail "pip upgrade failed"
+run_quiet_command "Install Python app dependencies" .venv/bin/pip install -e . || fail "python dependency install failed"
 mkdir -p data
 
 require_cmd go
 mkdir -p bin
-go build -trimpath -ldflags="-s -w" -o "${APP_DIR}/bin/uptimemesh-agent" "./agent/cmd/uptimemesh-agent"
+say "Building Go agent binary"
+run_quiet_command \
+  "Compile Go agent" \
+  go build -trimpath -ldflags="-s -w" -o "${APP_DIR}/bin/uptimemesh-agent" "./agent/cmd/uptimemesh-agent" \
+  || fail "go agent build failed"
 
 if [[ ! -f .env ]]; then
   if [[ -f .env.example ]]; then
@@ -863,6 +891,7 @@ if [[ ! -f .env ]]; then
   fi
 fi
 
+say "Writing runtime environment defaults (.env)"
 python3 - <<PY
 import pathlib
 import secrets
@@ -1062,8 +1091,10 @@ ordered = sorted(kv.items(), key=lambda x: x[0])
 env_path.write_text("".join(f"{k}={v}\n" for k, v in ordered), encoding="utf-8")
 PY
 
-.venv/bin/alembic upgrade head
+say "Applying database migrations"
+run_quiet_command "Run Alembic migrations" .venv/bin/alembic upgrade head || fail "database migrations failed"
 
+say "Syncing monitoring configuration files"
 install -d /etc/uptime-mesh/monitoring/grafana/provisioning/dashboards
 install -d /etc/uptime-mesh/monitoring/grafana/provisioning/datasources
 install -d /etc/uptime-mesh/monitoring/grafana/dashboards
@@ -1086,6 +1117,7 @@ if [[ -d /etc/grafana/provisioning ]]; then
   cp "${APP_DIR}/ops/monitoring/grafana/dashboards/uptimemesh-overview.json" /var/lib/grafana/dashboards/uptimemesh-overview.json || true
 fi
 
+say "Installing systemd units"
 cat > /etc/systemd/system/uptime-mesh.service <<SYSTEMD
 [Unit]
 Description=UptimeMesh API
@@ -1159,24 +1191,21 @@ SYSTEMD
 
 systemctl daemon-reload
 
-if systemctl list-unit-files | awk '{print $1}' | grep -qx 'etcd.service'; then
-  systemctl enable --now etcd || true
-fi
-if systemctl list-unit-files | awk '{print $1}' | grep -qx 'etcd-server.service'; then
-  systemctl enable --now etcd-server || true
-fi
+enable_service_if_exists etcd.service
+enable_service_if_exists etcd-server.service
 
+say "Starting core services"
 systemctl enable uptime-mesh.service
 systemctl restart uptime-mesh.service || systemctl start uptime-mesh.service
-if command -v nginx >/dev/null 2>&1 && command -v openssl >/dev/null 2>&1; then
-  configure_self_signed_tls_proxy
-else
-  echo "warning: HTTPS proxy not configured (nginx and openssl are required)."
-fi
+ensure_self_signed_tls_proxy
 systemctl enable --now uptime-mesh-watchdog.timer
-systemctl start uptime-mesh-watchdog.service || true
-systemctl enable --now prometheus prometheus-node-exporter prometheus-alertmanager || true
-systemctl enable --now grafana-server || true
+if ! systemctl start uptime-mesh-watchdog.service >/dev/null 2>&1; then
+  warn "watchdog initial run failed; timer will retry automatically"
+fi
+enable_service_if_exists prometheus.service
+enable_service_if_exists prometheus-node-exporter.service
+enable_service_if_exists prometheus-alertmanager.service
+enable_service_if_exists grafana-server.service
 
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   if curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then

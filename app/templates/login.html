@@ -17,81 +17,132 @@
       * {
         box-sizing: border-box;
       }
-      body {
-        font-family: "Space Grotesk", sans-serif;
+      body.um-login {
         margin: 0;
-        color: #e2e8f0;
         min-height: 100vh;
-        background: radial-gradient(circle at 12% 12%, rgba(14, 165, 233, 0.18), transparent 32%),
-          radial-gradient(circle at 82% 18%, rgba(56, 189, 248, 0.14), transparent 28%),
-          linear-gradient(160deg, #030712 0%, #0b1220 55%, #0f172a 100%);
+        color: #e2e8f0;
+        font-family: "Space Grotesk", sans-serif;
+        background: radial-gradient(circle at 10% 14%, rgba(14, 165, 233, 0.2), transparent 32%),
+          radial-gradient(circle at 86% 18%, rgba(56, 189, 248, 0.12), transparent 28%),
+          linear-gradient(158deg, #020617 0%, #091225 54%, #0f172a 100%);
       }
-      .page {
+      .um-login .page {
         min-height: 100vh;
         display: grid;
         place-items: center;
         padding: 24px;
       }
-      .mesh-card {
-        width: min(100%, 460px);
-        border-radius: 20px;
-        padding: 30px;
-        border: 1px solid rgba(148, 163, 184, 0.22);
-        box-shadow: 0 28px 60px rgba(2, 6, 23, 0.6);
-        background: linear-gradient(180deg, rgba(15, 23, 42, 0.9), rgba(15, 23, 42, 0.82));
-        backdrop-filter: blur(8px);
+      .um-login .frame {
+        width: min(100%, 540px);
+        border-radius: 24px;
+        padding: 1px;
+        background: linear-gradient(150deg, rgba(56, 189, 248, 0.42), rgba(148, 163, 184, 0.12));
+        box-shadow: 0 30px 80px rgba(2, 6, 23, 0.68), 0 0 64px rgba(14, 165, 233, 0.1);
       }
-      h1 {
+      .um-login .mesh-card {
+        width: 100%;
+        border-radius: 23px;
+        padding: 34px;
+        border: 1px solid rgba(148, 163, 184, 0.16);
+        background: radial-gradient(circle at 16% -12%, rgba(56, 189, 248, 0.1), transparent 42%),
+          linear-gradient(180deg, rgba(15, 23, 42, 0.94), rgba(15, 23, 42, 0.84));
+        backdrop-filter: blur(12px);
+      }
+      .um-login h1 {
         margin: 0;
-        font-size: 2rem;
-        line-height: 1.1;
-        letter-spacing: -0.01em;
+        font-size: 2.8rem;
+        line-height: 1.05;
+        letter-spacing: -0.02em;
+        color: #f8fafc;
       }
-      .subtitle {
+      .um-login .subtitle {
         margin: 10px 0 0;
-        font-size: 0.96rem;
+        font-size: 1rem;
         color: #94a3b8;
       }
-      .form {
-        margin-top: 24px;
-      }
-      .field {
-        margin-top: 14px;
-      }
-      .field:first-child {
-        margin-top: 0;
-      }
-      .label {
-        display: block;
-        margin-bottom: 8px;
-        font-size: 0.9rem;
-        font-weight: 600;
-        color: #cbd5e1;
-      }
-      .input {
+      .um-login .form {
+        margin-top: 28px;
         width: 100%;
-        min-height: 48px;
+        display: grid !important;
+        gap: 16px;
+      }
+      .um-login .um-field {
+        width: 100%;
+        display: grid !important;
+        gap: 8px;
+      }
+      .um-login .um-label {
+        display: block !important;
+        margin: 0;
+        font-size: 0.79rem;
+        font-weight: 700;
+        color: #cbd5e1;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+      }
+      .um-login .um-input-wrap {
+        position: relative;
+        width: 100%;
+      }
+      .um-login input.um-input {
+        appearance: none;
+        -webkit-appearance: none;
+        display: block !important;
+        width: 100% !important;
+        min-width: 0 !important;
+        min-height: 50px;
         border-radius: 12px;
-        border: 1px solid rgba(148, 163, 184, 0.35);
-        background: rgba(15, 23, 42, 0.82);
-        color: #f8fafc;
+        border: 1px solid rgba(148, 163, 184, 0.34) !important;
+        background: rgba(2, 6, 23, 0.72) !important;
+        color: #f8fafc !important;
         font-size: 1rem;
-        padding: 12px 44px 12px 14px;
+        font-family: "Space Grotesk", sans-serif;
+        padding: 12px 46px 12px 14px;
+        line-height: 1.4;
         outline: none;
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
         transition: border-color 120ms ease, box-shadow 120ms ease, background 120ms ease;
       }
-      .input::placeholder {
-        color: #64748b;
+      .um-login input.um-input::placeholder {
+        color: #64748b !important;
       }
-      .input:focus {
-        border-color: rgba(56, 189, 248, 0.9);
-        box-shadow: 0 0 0 3px rgba(14, 165, 233, 0.22), 0 0 28px rgba(14, 165, 233, 0.18);
-        background: rgba(15, 23, 42, 0.95);
+      .um-login input.um-input:focus {
+        border-color: rgba(56, 189, 248, 0.88) !important;
+        background: rgba(2, 6, 23, 0.86) !important;
+        box-shadow: 0 0 0 3px rgba(14, 165, 233, 0.22), 0 0 30px rgba(14, 165, 233, 0.16);
       }
-      .submit {
-        margin-top: 18px;
+      .um-login input.um-input:-webkit-autofill,
+      .um-login input.um-input:-webkit-autofill:hover,
+      .um-login input.um-input:-webkit-autofill:focus {
+        -webkit-text-fill-color: #f8fafc !important;
+        -webkit-box-shadow: 0 0 0 1000px rgba(2, 6, 23, 0.86) inset !important;
+        box-shadow: 0 0 0 1000px rgba(2, 6, 23, 0.86) inset !important;
+        transition: background-color 5000s ease-in-out 0s;
+      }
+      .um-login .pw-toggle {
+        position: absolute;
+        right: 10px;
+        top: 50%;
+        transform: translateY(-50%);
+        width: 28px;
+        height: 28px;
+        border: 1px solid rgba(148, 163, 184, 0.3);
+        border-radius: 8px;
+        background: rgba(15, 23, 42, 0.7);
+        color: #cbd5e1;
+        font-size: 0.72rem;
+        font-weight: 700;
+        letter-spacing: 0.02em;
+        cursor: pointer;
+      }
+      .um-login .pw-toggle:hover {
+        border-color: rgba(56, 189, 248, 0.75);
+        color: #e2e8f0;
+      }
+      .um-login .submit {
+        margin-top: 6px;
         width: 100%;
-        min-height: 48px;
+        min-height: 50px;
         border: 0;
         border-radius: 12px;
         background: linear-gradient(95deg, #0ea5e9, #38bdf8);
@@ -99,18 +150,18 @@
         font-size: 1rem;
         font-weight: 700;
         cursor: pointer;
-        box-shadow: 0 10px 24px rgba(14, 165, 233, 0.32);
+        box-shadow: 0 12px 28px rgba(14, 165, 233, 0.32);
         transition: transform 100ms ease, box-shadow 100ms ease, filter 100ms ease;
       }
-      .submit:hover {
+      .um-login .submit:hover {
         filter: brightness(1.04);
         transform: translateY(-1px);
-        box-shadow: 0 14px 28px rgba(14, 165, 233, 0.38);
+        box-shadow: 0 14px 30px rgba(14, 165, 233, 0.38);
       }
-      .submit:active {
+      .um-login .submit:active {
         transform: translateY(0);
       }
-      .error {
+      .um-login .error {
         margin-top: 16px;
         border: 1px solid rgba(239, 68, 68, 0.45);
         border-radius: 12px;
@@ -119,49 +170,82 @@
         color: #fecaca;
         font-size: 0.9rem;
       }
+      @media (max-width: 640px) {
+        .um-login .mesh-card {
+          padding: 24px;
+        }
+        .um-login h1 {
+          font-size: 2.2rem;
+        }
+      }
     </style>
   </head>
-  <body>
+  <body class="um-login">
     <main class="page">
-      <section class="mesh-card">
-        <h1>Sign In</h1>
-        <p class="subtitle">Cluster administration requires authentication.</p>
+      <div class="frame">
+        <section class="mesh-card">
+          <h1>Sign In</h1>
+          <p class="subtitle">Cluster administration requires authentication.</p>
 
-        {% if error %}
-          <div class="error">{{ error }}</div>
-        {% endif %}
+          {% if error %}
+            <div class="error">{{ error }}</div>
+          {% endif %}
 
-        <form method="post" action="/auth/login" class="form">
-          <input type="hidden" name="next" value="{{ next_path }}" />
-          <div class="field">
-            <label class="label" for="username">Username</label>
-            <input
-              id="username"
-              class="input"
-              type="text"
-              name="username"
-              value=""
-              required
-              autocomplete="username"
-              placeholder="admin"
-              autofocus
-            />
-          </div>
-          <div class="field">
-            <label class="label" for="password">Password</label>
-            <input
-              id="password"
-              class="input"
-              type="password"
-              name="password"
-              required
-              autocomplete="current-password"
-              placeholder="Enter password"
-            />
-          </div>
-          <button class="submit" type="submit">Sign In</button>
-        </form>
-      </section>
+          <form method="post" action="/auth/login" class="form">
+            <input type="hidden" name="next" value="{{ next_path }}" />
+            <div class="um-field">
+              <label class="um-label" for="username">Username</label>
+              <div class="um-input-wrap">
+                <input
+                  id="username"
+                  class="um-input"
+                  type="text"
+                  name="username"
+                  value=""
+                  required
+                  autocomplete="username"
+                  placeholder="admin"
+                  autofocus
+                />
+              </div>
+            </div>
+            <div class="um-field">
+              <label class="um-label" for="password">Password</label>
+              <div class="um-input-wrap">
+                <input
+                  id="password"
+                  class="um-input"
+                  type="password"
+                  name="password"
+                  required
+                  autocomplete="current-password"
+                  placeholder="Enter password"
+                />
+                <button class="pw-toggle" type="button" aria-label="Toggle password visibility" onclick="togglePassword()">
+                  show
+                </button>
+              </div>
+            </div>
+            <button class="submit" type="submit">Sign In</button>
+          </form>
+        </section>
+      </div>
     </main>
+    <script>
+      function togglePassword() {
+        const input = document.getElementById("password");
+        const button = document.querySelector(".pw-toggle");
+        if (!input || !button) {
+          return;
+        }
+        if (input.type === "password") {
+          input.type = "text";
+          button.textContent = "hide";
+          return;
+        }
+        input.type = "password";
+        button.textContent = "show";
+      }
+    </script>
   </body>
 </html>
