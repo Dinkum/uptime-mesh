@@ -13,9 +13,9 @@ from app.models.endpoint import Endpoint
 from app.models.replica import Replica
 from app.models.service import Service
 from app.schemas.gateway import GatewayRouteEndpointOut, GatewayRouteOut
+from app.utils import sanitize_label
 
 _logger = get_logger("services.gateway")
-_NAME_SAFE_RE = re.compile(r"[^a-z0-9_]")
 
 
 @dataclass(frozen=True)
@@ -27,12 +27,11 @@ class GatewayRenderResult:
 
 
 def _sanitize_name(raw: str, fallback: str) -> str:
-    value = raw.strip().lower().replace("-", "_")
-    value = _NAME_SAFE_RE.sub("_", value)
+    value = sanitize_label(raw, max_len=63).replace("-", "_")
     value = re.sub(r"_+", "_", value).strip("_")
     if not value:
-        value = fallback
-    return value[:63]
+        value = sanitize_label(fallback, max_len=63).replace("-", "_")
+    return value or "item"
 
 
 def _normalize_path(raw: str, fallback: str) -> str:

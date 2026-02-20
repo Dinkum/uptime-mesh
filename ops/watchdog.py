@@ -81,7 +81,7 @@ def main() -> int:
 
     configure_logging(
         log_level=os.getenv("LOG_LEVEL", "INFO"),
-        log_file=os.getenv("LOG_FILE", "./data/app.log"),
+        log_file=os.getenv("LOG_FILE", "./data/logs/app.log"),
     )
     logger = get_logger("watchdog")
 

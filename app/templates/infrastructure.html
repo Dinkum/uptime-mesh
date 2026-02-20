@@ -1,0 +1,360 @@
+{% extends "layout.html" %}
+
+{% block content %}
+  <section class="grid grid-cols-1 md:grid-cols-5 gap-4 mb-6">
+    <div class="mesh-card rounded-2xl p-5">
+      <p class="text-sm text-slate-500">WireGuard Nodes</p>
+      <p class="text-2xl font-semibold">{{ wireguard_rows|length }}</p>
+    </div>
+    <div class="mesh-card rounded-2xl p-5">
+      <p class="text-sm text-slate-500">Discovery Services</p>
+      <p class="text-2xl font-semibold">{{ service_count }}</p>
+    </div>
+    <div class="mesh-card rounded-2xl p-5">
+      <p class="text-sm text-slate-500">Gateway Routes</p>
+      <p class="text-2xl font-semibold">{{ route_count }}</p>
+    </div>
+    <div class="mesh-card rounded-2xl p-5">
+      <p class="text-sm text-slate-500">Prometheus Targets</p>
+      <p class="text-2xl font-semibold">{{ api_target_count }}</p>
+    </div>
+    <div class="mesh-card rounded-2xl p-5">
+      <p class="text-sm text-slate-500">CDN Version</p>
+      <p class="text-2xl font-semibold">{{ cdn_version or "-" }}</p>
+    </div>
+  </section>
+
+  <div class="flex flex-wrap gap-3 mb-6">
+    <a class="btn btn-sm {% if infra_subtab == 'wireguard' %}btn-primary{% else %}btn-outline{% endif %}" href="{{ ui_prefix }}/infrastructure?tab=wireguard">WireGuard</a>
+    <a class="btn btn-sm {% if infra_subtab == 'discovery' %}btn-primary{% else %}btn-outline{% endif %}" href="{{ ui_prefix }}/infrastructure?tab=discovery">Discovery</a>
+    <a class="btn btn-sm {% if infra_subtab == 'gateway' %}btn-primary{% else %}btn-outline{% endif %}" href="{{ ui_prefix }}/infrastructure?tab=gateway">Gateway</a>
+    <a class="btn btn-sm {% if infra_subtab == 'monitoring' %}btn-primary{% else %}btn-outline{% endif %}" href="{{ ui_prefix }}/infrastructure?tab=monitoring">Monitoring</a>
+    <a class="btn btn-sm {% if infra_subtab == 'cdn' %}btn-primary{% else %}btn-outline{% endif %}" href="{{ ui_prefix }}/infrastructure?tab=cdn">CDN</a>
+  </div>
+
+  {% if infra_subtab == "wireguard" %}
+    <section class="mesh-card rounded-2xl p-6">
+      <h2 class="text-lg font-semibold">WireGuard Status</h2>
+      <p class="text-sm text-slate-500 mt-1">Tunnel, peer, and failover state reported by each node.</p>
+      <div class="overflow-x-auto mt-4">
+        <table class="table w-full">
+          <thead>
+            <tr>
+              <th>Node</th>
+              <th>Primary Tunnel</th>
+              <th>Secondary Tunnel</th>
+              <th>Primary Router</th>
+              <th>Secondary Router</th>
+              <th>Primary Peer</th>
+              <th>Secondary Peer</th>
+              <th>Active Route</th>
+              <th>Failover State</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in wireguard_rows %}
+              <tr>
+                <td class="mono">{{ row.node_id }}</td>
+                <td class="mono">{{ row.primary_tunnel or "-" }}</td>
+                <td class="mono">{{ row.secondary_tunnel or "-" }}</td>
+                <td>{{ "reachable" if row.primary_router_reachable else "down" }}</td>
+                <td>{{ "reachable" if row.secondary_router_reachable else "down" }}</td>
+                <td class="mono text-xs">{% if row.primary_peer_configured %}{{ row.primary_peer_endpoint or "configured" }}{% else %}-{% endif %}</td>
+                <td class="mono text-xs">{% if row.secondary_peer_configured %}{{ row.secondary_peer_endpoint or "configured" }}{% else %}-{% endif %}</td>
+                <td class="mono">{{ row.active_route or "-" }}</td>
+                <td>{{ row.failover_state or "-" }}</td>
+              </tr>
+            {% else %}
+              <tr>
+                <td colspan="9" class="text-center text-slate-400">No WireGuard status reported yet.</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+  {% elif infra_subtab == "discovery" %}
+    <section class="grid gap-4">
+      <article class="mesh-card rounded-2xl p-6">
+        <h2 class="text-lg font-semibold">DNS Domain</h2>
+        <p class="text-sm text-slate-500 mt-1">CoreDNS zone is generated from healthy endpoints only.</p>
+        <div class="mt-4 flex flex-wrap gap-3 items-center">
+          <span class="badge badge-outline mono py-3">{{ domain }}</span>
+          <a class="btn btn-sm btn-outline" href="{{ zone_endpoint }}" target="_blank" rel="noreferrer">View Zone File</a>
+          <a class="btn btn-sm btn-outline" href="{{ corefile_endpoint }}" target="_blank" rel="noreferrer">View Corefile</a>
+        </div>
+        <div class="mt-4 grid md:grid-cols-4 gap-3 text-sm">
+          <div class="rounded-xl border border-slate-700/40 p-3">
+            <div class="text-slate-500">Services</div>
+            <div class="mono">{{ service_count }}</div>
+          </div>
+          <div class="rounded-xl border border-slate-700/40 p-3">
+            <div class="text-slate-500">Healthy Endpoints</div>
+            <div class="mono">{{ endpoint_count }}</div>
+          </div>
+          <div class="rounded-xl border border-slate-700/40 p-3">
+            <div class="text-slate-500">Registry Endpoints</div>
+            <div class="mono">{{ endpoint_registry_total }}</div>
+          </div>
+          <div class="rounded-xl border border-slate-700/40 p-3">
+            <div class="text-slate-500">Last Sync (UTC)</div>
+            <div class="mono">{{ last_sync_at or "n/a" }}</div>
+          </div>
+        </div>
+      </article>
+
+      <article class="mesh-card rounded-2xl p-6">
+        <h2 class="text-lg font-semibold">Service Records</h2>
+        <div class="mt-4 space-y-4">
+          {% for service in records %}
+            <div class="rounded-xl border border-slate-700/40 p-4">
+              <div class="flex flex-wrap gap-2 items-center">
+                <span class="mono text-sm">{{ service.service_fqdn }}</span>
+                <span class="badge badge-outline">{{ service.endpoints|length }} endpoints</span>
+              </div>
+              <div class="mt-3 space-y-1 text-sm">
+                {% for endpoint in service.endpoints %}
+                  <div class="mono text-slate-400">{{ endpoint.host_fqdn }} -> {{ endpoint.address }}:{{ endpoint.port }}</div>
+                {% endfor %}
+              </div>
+            </div>
+          {% else %}
+            <p class="text-slate-400">No healthy endpoints in registry.</p>
+          {% endfor %}
+        </div>
+      </article>
+
+      <article class="mesh-card rounded-2xl p-6">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 class="text-lg font-semibold">Endpoint Registry (All States)</h2>
+            <p class="text-sm text-slate-500 mt-1">Healthy, unhealthy, and stale endpoints.</p>
+          </div>
+          <span class="badge badge-outline mono">stale > {{ endpoint_registry_stale_after_seconds }}s</span>
+        </div>
+
+        <div class="mt-4 grid grid-cols-1 md:grid-cols-3 gap-3 text-sm">
+          <div class="rounded-xl border border-slate-700/40 p-3">
+            <div class="text-slate-500">Healthy</div>
+            <div class="mono">{{ endpoint_registry_healthy }}</div>
+          </div>
+          <div class="rounded-xl border border-slate-700/40 p-3">
+            <div class="text-slate-500">Unhealthy</div>
+            <div class="mono">{{ endpoint_registry_unhealthy }}</div>
+          </div>
+          <div class="rounded-xl border border-slate-700/40 p-3">
+            <div class="text-slate-500">Stale</div>
+            <div class="mono">{{ endpoint_registry_stale }}</div>
+          </div>
+        </div>
+
+        <div class="overflow-x-auto mt-4">
+          <table class="table w-full align-middle">
+            <thead>
+              <tr>
+                <th>Service</th>
+                <th>Endpoint</th>
+                <th>Node</th>
+                <th>Replica</th>
+                <th>Health</th>
+                <th>Last Check</th>
+                <th>Age</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for endpoint in endpoint_rows %}
+                <tr>
+                  <td>
+                    <p class="font-semibold">{{ endpoint.service_name }}</p>
+                    <p class="mono text-[11px] text-slate-500">{{ endpoint.service_id }}</p>
+                  </td>
+                  <td class="mono text-xs">{{ endpoint.address }}:{{ endpoint.port }}</td>
+                  <td class="mono text-xs">{{ endpoint.node_id }}</td>
+                  <td class="mono text-xs">{{ endpoint.replica_id }}</td>
+                  <td>
+                    {% if endpoint.health_state == "healthy" %}
+                      <span class="badge badge-success badge-outline">healthy</span>
+                    {% elif endpoint.health_state == "unhealthy" %}
+                      <span class="badge badge-error badge-outline">unhealthy</span>
+                    {% elif endpoint.health_state == "stale" %}
+                      <span class="badge badge-warning badge-outline">stale</span>
+                    {% else %}
+                      <span class="badge badge-outline">{{ endpoint.health_state }}</span>
+                    {% endif %}
+                  </td>
+                  <td class="mono text-xs">{{ endpoint.last_checked_at }}</td>
+                  <td class="mono text-xs">{{ endpoint.age_text }}</td>
+                </tr>
+              {% else %}
+                <tr>
+                  <td colspan="7" class="text-center text-slate-400">No endpoints registered yet.</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </article>
+    </section>
+
+  {% elif infra_subtab == "gateway" %}
+    <section class="grid gap-4">
+      <article class="mesh-card rounded-2xl p-6">
+        <h2 class="text-lg font-semibold">Gateway Runtime</h2>
+        <p class="text-sm text-slate-500 mt-1">Rendered from healthy endpoints in real time.</p>
+        <div class="mt-4 flex flex-wrap gap-3 items-center">
+          <span class="badge badge-outline mono py-3">enabled: {{ gateway_enabled }}</span>
+          <span class="badge badge-outline mono py-3">status: {{ gateway_last_apply_status }}</span>
+          <a class="btn btn-sm btn-outline" href="{{ config_endpoint }}" target="_blank" rel="noreferrer">View NGINX Config</a>
+        </div>
+        {% if gateway_last_apply_error %}
+          <div class="alert alert-warning text-sm mt-4">
+            <span class="mono">{{ gateway_last_apply_error }}</span>
+          </div>
+        {% endif %}
+        <div class="mt-4 grid md:grid-cols-3 gap-3 text-sm">
+          <div class="rounded-xl border border-slate-700/40 p-3">
+            <div class="text-slate-500">Routes</div>
+            <div class="mono">{{ route_count }}</div>
+          </div>
+          <div class="rounded-xl border border-slate-700/40 p-3">
+            <div class="text-slate-500">Upstreams</div>
+            <div class="mono">{{ upstream_count }}</div>
+          </div>
+          <div class="rounded-xl border border-slate-700/40 p-3">
+            <div class="text-slate-500">Last Sync (UTC)</div>
+            <div class="mono">{{ gateway_last_sync_at or "n/a" }}</div>
+          </div>
+        </div>
+      </article>
+
+      <article class="mesh-card rounded-2xl p-6">
+        <h2 class="text-lg font-semibold">Ingress Routes</h2>
+        <div class="mt-4 space-y-4">
+          {% for route in routes %}
+            <div class="rounded-xl border border-slate-700/40 p-4">
+              <div class="flex flex-wrap gap-2 items-center">
+                <span class="mono text-sm">{{ route.host }} {{ route.path }}</span>
+                <span class="badge badge-outline">{{ route.endpoint_count }} endpoints</span>
+              </div>
+              <div class="mt-2 mono text-xs text-slate-500">{{ route.upstream }} (service {{ route.service_name }})</div>
+              <div class="mt-3 space-y-1 text-sm">
+                {% for endpoint in route.endpoints %}
+                  <div class="mono text-slate-400">{{ endpoint.address }}:{{ endpoint.port }}</div>
+                {% endfor %}
+              </div>
+            </div>
+          {% else %}
+            <p class="text-slate-400">No gateway-enabled services with healthy endpoints.</p>
+          {% endfor %}
+        </div>
+      </article>
+    </section>
+
+  {% elif infra_subtab == "monitoring" %}
+    <section class="grid gap-6">
+      <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+        <div class="mesh-card rounded-2xl p-5">
+          <p class="text-sm text-slate-500">API Targets</p>
+          <p class="text-2xl font-semibold">{{ api_target_count }}</p>
+        </div>
+        <div class="mesh-card rounded-2xl p-5">
+          <p class="text-sm text-slate-500">Node Exporters</p>
+          <p class="text-2xl font-semibold">{{ node_exporter_target_count }}</p>
+        </div>
+        <div class="mesh-card rounded-2xl p-5">
+          <p class="text-sm text-slate-500">Alertmanager Targets</p>
+          <p class="text-2xl font-semibold">{{ alertmanager_target_count }}</p>
+        </div>
+        <div class="mesh-card rounded-2xl p-5">
+          <p class="text-sm text-slate-500">Apply Status</p>
+          <p class="text-2xl font-semibold">{{ monitoring_last_apply_status }}</p>
+          <p class="text-xs text-slate-500 mt-1">{{ monitoring_last_sync_at or "never" }}</p>
+        </div>
+      </div>
+
+      {% if monitoring_last_apply_error %}
+        <div class="alert alert-error text-sm">
+          <span class="mono">{{ monitoring_last_apply_error }}</span>
+        </div>
+      {% endif %}
+
+      <article class="mesh-card rounded-2xl p-6">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <h2 class="text-lg font-semibold">Monitoring Config</h2>
+          <a class="btn btn-sm btn-outline" href="{{ monitoring_config_endpoint }}" target="_blank" rel="noreferrer">View Prometheus Config</a>
+        </div>
+        <div class="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
+          <div>
+            <p class="text-slate-500">Config path</p>
+            <p class="mono">{{ monitoring_config_path }}</p>
+          </div>
+          <div>
+            <p class="text-slate-500">SHA-256</p>
+            <p class="mono break-all">{{ monitoring_config_sha256 or "-" }}</p>
+          </div>
+        </div>
+      </article>
+
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <article class="mesh-card rounded-2xl p-5">
+          <h3 class="text-lg font-semibold">API Targets</h3>
+          <div class="mt-3 space-y-2 text-sm mono">
+            {% for target in api_targets %}
+              <p>{{ target }}</p>
+            {% else %}
+              <p class="text-slate-400">No targets available.</p>
+            {% endfor %}
+          </div>
+        </article>
+
+        <article class="mesh-card rounded-2xl p-5">
+          <h3 class="text-lg font-semibold">Node Exporter Targets</h3>
+          <div class="mt-3 space-y-2 text-sm mono">
+            {% for target in node_exporter_targets %}
+              <p>{{ target }}</p>
+            {% else %}
+              <p class="text-slate-400">No targets available.</p>
+            {% endfor %}
+          </div>
+        </article>
+
+        <article class="mesh-card rounded-2xl p-5">
+          <h3 class="text-lg font-semibold">Alertmanager Targets</h3>
+          <div class="mt-3 space-y-2 text-sm mono">
+            {% for target in alertmanager_targets %}
+              <p>{{ target }}</p>
+            {% else %}
+              <p class="text-slate-400">No targets available.</p>
+            {% endfor %}
+          </div>
+        </article>
+      </div>
+    </section>
+
+  {% else %}
+    <section class="mesh-card rounded-2xl p-6">
+      <h2 class="text-lg font-semibold">Internal CDN</h2>
+      <p class="text-sm text-slate-500 mt-1">Default content cache payload distributed with the mesh.</p>
+
+      <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mt-4">
+        <div class="rounded-xl border border-slate-700/40 p-3">
+          <div class="text-slate-500 text-sm">Active Version</div>
+          <div class="mono text-sm mt-1">{{ cdn_version or "-" }}</div>
+        </div>
+        <div class="rounded-xl border border-slate-700/40 p-3">
+          <div class="text-slate-500 text-sm">SHA-256</div>
+          <div class="mono text-xs break-all mt-1">{{ cdn_hash_sha256 or "-" }}</div>
+        </div>
+        <div class="rounded-xl border border-slate-700/40 p-3">
+          <div class="text-slate-500 text-sm">Payload Size</div>
+          <div class="mono text-sm mt-1">{{ cdn_size_bytes }} bytes</div>
+        </div>
+        <div class="rounded-xl border border-slate-700/40 p-3">
+          <div class="text-slate-500 text-sm">Seeded At</div>
+          <div class="mono text-sm mt-1">{{ cdn_seeded_at or "n/a" }}</div>
+        </div>
+      </div>
+    </section>
+  {% endif %}
+{% endblock %}

@@ -1,0 +1,305 @@
+{% extends "layout.html" %}
+
+{% block content %}
+  <section class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+    <div class="mesh-card rounded-2xl p-5">
+      <p class="text-sm text-slate-500">Services</p>
+      <p class="text-2xl font-semibold">{{ services|length }}</p>
+    </div>
+    <div class="mesh-card rounded-2xl p-5">
+      <p class="text-sm text-slate-500">Stalled Rollouts</p>
+      <p class="text-2xl font-semibold text-amber-200">{{ stalled_rollouts }}</p>
+    </div>
+    <div class="mesh-card rounded-2xl p-5">
+      <p class="text-sm text-slate-500">Error Rollouts</p>
+      <p class="text-2xl font-semibold text-rose-300">{{ error_rollouts }}</p>
+    </div>
+  </section>
+
+  <div class="flex flex-wrap gap-3 mb-6">
+    <a class="btn btn-sm {% if workloads_subtab == 'services' %}btn-primary{% else %}btn-outline{% endif %}" href="{{ ui_prefix }}/workloads?tab=services">Services</a>
+    <a class="btn btn-sm {% if workloads_subtab == 'replicas' %}btn-primary{% else %}btn-outline{% endif %}" href="{{ ui_prefix }}/workloads?tab=replicas">Replicas</a>
+    <a class="btn btn-sm {% if workloads_subtab == 'scheduler' %}btn-primary{% else %}btn-outline{% endif %}" href="{{ ui_prefix }}/workloads?tab=scheduler">Scheduler Plan</a>
+  </div>
+
+  {% if workloads_subtab == "services" %}
+    <section class="mesh-card rounded-2xl p-6">
+      <h2 class="text-lg font-semibold">Service Rollout Status</h2>
+      <div class="overflow-x-auto mt-4">
+        <table class="table w-full align-middle">
+          <thead>
+            <tr>
+              <th>Service</th>
+              <th>Generation</th>
+              <th>Progress</th>
+              <th>Replica State</th>
+              <th>Rollout</th>
+              <th>Requested</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in rollout_rows %}
+              <tr>
+                <td>
+                  <p class="font-semibold">{{ row.service_name }}</p>
+                  <p class="mono text-[11px] text-slate-500">{{ row.service_id }}</p>
+                </td>
+                <td class="mono">{{ row.generation }}</td>
+                <td>
+                  <p class="mono text-xs">{{ row.progress_pct }}%</p>
+                  <progress class="progress progress-info w-40" value="{{ row.progress_pct }}" max="100"></progress>
+                </td>
+                <td class="mono text-xs">
+                  up {{ row.up_to_date }} / {{ row.total }}
+                  <p class="text-[11px] text-slate-500 mt-1">outdated {{ row.outdated }} · pending {{ row.pending }} · active {{ row.in_progress }} · failed {{ row.failed }}</p>
+                </td>
+                <td>
+                  {% if row.state_key == "complete" %}
+                    <span class="badge badge-success badge-outline">{{ row.state_text }}</span>
+                  {% elif row.state_key == "rolling" %}
+                    <span class="badge badge-info badge-outline">{{ row.state_text }}</span>
+                  {% elif row.state_key in ["stalled", "outdated"] %}
+                    <span class="badge badge-warning badge-outline">{{ row.state_text }}</span>
+                  {% elif row.state_key == "error" %}
+                    <span class="badge badge-error badge-outline">{{ row.state_text }}</span>
+                  {% else %}
+                    <span class="badge badge-outline">{{ row.state_text }}</span>
+                  {% endif %}
+                </td>
+                <td class="mono text-xs">{{ row.rollout_requested_age }}</td>
+                <td>
+                  <div class="flex gap-2">
+                    <button class="btn btn-xs btn-outline" onclick="serviceAction('{{ row.service_id }}', 'apply-pinned')">Apply</button>
+                    <button class="btn btn-xs btn-outline" onclick="serviceAction('{{ row.service_id }}', 'rollout')">Rollout</button>
+                    <button class="btn btn-xs btn-outline" onclick="serviceAction('{{ row.service_id }}', 'rollback')">Rollback</button>
+                  </div>
+                </td>
+              </tr>
+            {% else %}
+              <tr>
+                <td colspan="7" class="text-center text-slate-400">No services defined yet.</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  {% elif workloads_subtab == "replicas" %}
+    <section class="mesh-card rounded-2xl p-6">
+      <h2 class="text-lg font-semibold">Replicas</h2>
+      <div class="overflow-x-auto mt-4">
+        <table class="table w-full">
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Service</th>
+              <th>Node</th>
+              <th>Desired</th>
+              <th>Update State</th>
+              <th>Generation</th>
+              <th>Updated</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for replica in replica_rows %}
+              <tr>
+                <td class="mono">{{ replica.id }}</td>
+                <td>
+                  <p class="font-medium">{{ replica.service_name }}</p>
+                  <p class="mono text-[11px] text-slate-500">{{ replica.service_id }}</p>
+                </td>
+                <td class="mono">{{ replica.node_id }}</td>
+                <td>{{ replica.desired_state }}</td>
+                <td>
+                  {% if replica.update_state in ["complete", "healthy", "ok"] %}
+                    <span class="badge badge-success badge-outline">{{ replica.update_state }}</span>
+                  {% elif replica.update_state in ["pending", "queued", "in_progress", "updating", "rolling", "restarting"] %}
+                    <span class="badge badge-info badge-outline">{{ replica.update_state }}</span>
+                  {% elif replica.update_state in ["failed", "error", "stalled"] %}
+                    <span class="badge badge-error badge-outline">{{ replica.update_state }}</span>
+                  {% else %}
+                    <span class="badge badge-outline">{{ replica.update_state }}</span>
+                  {% endif %}
+                </td>
+                <td class="mono text-xs">{{ replica.applied_generation }} / {{ replica.target_generation }}</td>
+                <td class="mono text-xs">{{ replica.updated_at }}</td>
+                <td>
+                  <div class="flex gap-2">
+                    <button class="btn btn-xs btn-outline" onclick="replicaAction('{{ replica.id }}', 'restart')">Restart</button>
+                    <button class="btn btn-xs btn-outline" onclick="replicaAction('{{ replica.id }}', 'snapshot')">Snapshot</button>
+                    <button class="btn btn-xs btn-outline" onclick="replicaAction('{{ replica.id }}', 'restore')">Restore</button>
+                  </div>
+                </td>
+              </tr>
+            {% else %}
+              <tr>
+                <td colspan="8" class="text-center text-slate-400">No replicas defined yet.</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  {% else %}
+    <section class="mesh-card rounded-2xl p-6">
+      <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+        <div>
+          <h2 class="text-lg font-semibold">Scheduler Plan</h2>
+          <p class="text-sm text-slate-500">Dry-run view of desired placement and update queue actions.</p>
+        </div>
+        <div class="flex gap-2">
+          <button class="btn btn-sm btn-outline" onclick="schedulerPlanAll()">Refresh Plan</button>
+          <button class="btn btn-sm btn-primary" onclick="schedulerReconcileAll()">Apply Reconcile</button>
+        </div>
+      </div>
+
+      <div id="scheduler-summary" class="mt-4 text-sm text-slate-300">
+        Services planned: <span class="mono">{{ plan.results | length }}</span>
+      </div>
+
+      <div id="scheduler-results" class="mt-6 space-y-4">
+        {% for result in plan.results %}
+          <div class="rounded-xl border border-slate-700/40 p-4">
+            <div class="flex items-center justify-between">
+              <p class="font-semibold mono">{{ result.service_id }}</p>
+              <p class="text-xs text-slate-500">desired: {{ result.desired_replicas }} · actual: {{ result.actual_replicas }}</p>
+            </div>
+            <p class="text-xs text-slate-500 mt-1">eligible nodes: {{ result.eligible_nodes }} · dry-run: {{ result.dry_run }}</p>
+
+            <div class="mt-3">
+              <p class="text-xs uppercase tracking-wide text-slate-400">Actions</p>
+              {% if result.actions %}
+                <div class="mt-2 space-y-1">
+                  {% for action in result.actions %}
+                    <p class="text-sm mono">{{ action.action }}{% if action.replica_id %} {{ action.replica_id }}{% endif %}{% if action.source_node_id %} from {{ action.source_node_id }}{% endif %}{% if action.target_node_id %} to {{ action.target_node_id }}{% endif %}</p>
+                  {% endfor %}
+                </div>
+              {% else %}
+                <p class="text-sm text-slate-400 mt-2">No actions required.</p>
+              {% endif %}
+            </div>
+
+            <div class="mt-3">
+              <p class="text-xs uppercase tracking-wide text-slate-400">Warnings</p>
+              {% if result.warnings %}
+                <div class="mt-2 space-y-1">
+                  {% for warning in result.warnings %}
+                    <p class="text-sm text-amber-300">{{ warning }}</p>
+                  {% endfor %}
+                </div>
+              {% else %}
+                <p class="text-sm text-slate-400 mt-2">No warnings.</p>
+              {% endif %}
+            </div>
+
+            <div class="mt-3">
+              <button class="btn btn-xs btn-outline" onclick="reconcileService('{{ result.service_id }}')">Reconcile Service</button>
+            </div>
+          </div>
+        {% else %}
+          <p class="text-sm text-slate-400">No services found to schedule.</p>
+        {% endfor %}
+      </div>
+    </section>
+  {% endif %}
+
+  <script>
+    async function serviceAction(serviceId, action) {
+      const response = await fetch(`/services/${serviceId}/${action}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}"
+      });
+      if (response.ok) window.location.reload();
+    }
+
+    async function replicaAction(replicaId, action) {
+      const response = await fetch(`/replicas/${replicaId}/${action}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}"
+      });
+      if (response.ok) window.location.reload();
+    }
+
+    function escapeHtml(input) {
+      return String(input)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
+    }
+
+    function renderResults(plan) {
+      const summary = document.getElementById("scheduler-summary");
+      const resultsContainer = document.getElementById("scheduler-results");
+      if (!summary || !resultsContainer) return;
+      summary.innerHTML = `Services planned: <span class="mono">${plan.results.length}</span> · dry-run: <span class="mono">${plan.dry_run}</span>`;
+
+      if (plan.results.length === 0) {
+        resultsContainer.innerHTML = '<p class="text-sm text-slate-400">No services found to schedule.</p>';
+        return;
+      }
+
+      resultsContainer.innerHTML = plan.results.map((result) => {
+        const actionsHtml = (result.actions || []).length
+          ? result.actions.map((action) => {
+              const bits = [escapeHtml(action.action)];
+              if (action.replica_id) bits.push(escapeHtml(action.replica_id));
+              if (action.source_node_id) bits.push(`from ${escapeHtml(action.source_node_id)}`);
+              if (action.target_node_id) bits.push(`to ${escapeHtml(action.target_node_id)}`);
+              return `<p class="text-sm mono">${bits.join(" ")}</p>`;
+            }).join("")
+          : '<p class="text-sm text-slate-400 mt-2">No actions required.</p>';
+
+        const warningsHtml = (result.warnings || []).length
+          ? result.warnings.map((warning) => `<p class="text-sm text-amber-300">${escapeHtml(warning)}</p>`).join("")
+          : '<p class="text-sm text-slate-400 mt-2">No warnings.</p>';
+
+        return `
+          <div class="rounded-xl border border-slate-700/40 p-4">
+            <div class="flex items-center justify-between">
+              <p class="font-semibold mono">${escapeHtml(result.service_id)}</p>
+              <p class="text-xs text-slate-500">desired: ${result.desired_replicas} · actual: ${result.actual_replicas}</p>
+            </div>
+            <p class="text-xs text-slate-500 mt-1">eligible nodes: ${result.eligible_nodes} · dry-run: ${result.dry_run}</p>
+            <div class="mt-3">
+              <p class="text-xs uppercase tracking-wide text-slate-400">Actions</p>
+              <div class="mt-2 space-y-1">${actionsHtml}</div>
+            </div>
+            <div class="mt-3">
+              <p class="text-xs uppercase tracking-wide text-slate-400">Warnings</p>
+              <div class="mt-2 space-y-1">${warningsHtml}</div>
+            </div>
+            <div class="mt-3">
+              <button class="btn btn-xs btn-outline" onclick="reconcileService('${escapeHtml(result.service_id)}')">Reconcile Service</button>
+            </div>
+          </div>
+        `;
+      }).join("");
+    }
+
+    async function schedulerPlanAll() {
+      const response = await fetch("/scheduler/plan/all");
+      if (!response.ok) return;
+      const data = await response.json();
+      renderResults(data);
+    }
+
+    async function schedulerReconcileAll() {
+      const response = await fetch("/scheduler/reconcile/all", { method: "POST" });
+      if (!response.ok) return;
+      const data = await response.json();
+      renderResults(data);
+    }
+
+    async function reconcileService(serviceId) {
+      const response = await fetch(`/scheduler/reconcile/services/${serviceId}`, { method: "POST" });
+      if (!response.ok) return;
+      await schedulerPlanAll();
+    }
+  </script>
+{% endblock %}

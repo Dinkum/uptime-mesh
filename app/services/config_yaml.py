@@ -182,7 +182,13 @@ def _load_yaml_map(path: Path) -> dict[str, str]:
     if yaml is not None:
         try:
             parsed = yaml.safe_load(raw)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            _logger.error(
+                "config_yaml.load_error",
+                "Failed to parse config.yaml",
+                path=str(path),
+                error=str(exc),
+            )
             parsed = {}
     else:
         parsed = {}
@@ -275,25 +281,29 @@ async def reconcile_with_db(session: AsyncSession) -> None:
         path=str(path),
     ) as op:
         yaml_map = _load_yaml_map(path)
-        db_map = await _db_settings_map(session)
+        existing_rows_result = await session.execute(select(ClusterSetting))
+        existing_rows = list(existing_rows_result.scalars().all())
+        db_map = {row.key: row.value for row in existing_rows}
 
         changed_db = False
-        existing_rows = await session.execute(select(ClusterSetting))
-        row_map = {row.key: row for row in existing_rows.scalars().all()}
+        row_map = {row.key: row for row in existing_rows}
         for field in _FIELDS:
             yaml_value = yaml_map.get(field.key, "").strip()
             desired = yaml_value if yaml_value else field.default
             row = row_map.get(field.key)
             if row is None:
-                session.add(ClusterSetting(key=field.key, value=desired))
+                created = ClusterSetting(key=field.key, value=desired)
+                session.add(created)
+                row_map[field.key] = created
+                db_map[field.key] = desired
                 changed_db = True
             elif field.import_from_yaml and yaml_value and row.value != desired:
                 row.value = desired
+                db_map[field.key] = desired
                 changed_db = True
 
         if changed_db:
             await session.commit()
-            db_map = await _db_settings_map(session)
             op.step("db.upsert", "Applied config defaults/overrides to DB", count=len(_FIELDS))
         else:
             op.step("db.upsert", "No DB config changes required")

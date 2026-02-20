@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import json
 import sys
@@ -15,8 +16,12 @@ from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from cryptography.hazmat.primitives.asymmetric.padding import PKCS1v15
 from cryptography.x509.oid import NameOID
 
+from app.config import get_settings
+from app.dependencies import get_sessionmaker
 from app.identity import heartbeat_signing_message
 from app.security import SESSION_COOKIE_NAME
+from app.services import auth as auth_service
+from app.services import cluster_settings
 
 
 def _api_request(
@@ -210,6 +215,38 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
         session_token=session_token,
     )
     _print_json(response)
+    return 0
+
+
+async def _prepare_bootstrap_admin_async(username: str) -> Dict[str, str]:
+    settings = get_settings()
+    sessionmaker = get_sessionmaker(settings.database_url)
+    async with sessionmaker() as session:
+        bootstrapped_setting = await cluster_settings.get_setting(session, "cluster_bootstrapped")
+        bootstrapped = (
+            bootstrapped_setting is not None
+            and str(bootstrapped_setting.value).strip().lower() == "true"
+        )
+        if bootstrapped:
+            return {"action": "already_bootstrapped"}
+
+        normalized_username = username.strip() or auth_service.DEFAULT_ADMIN_USERNAME
+        password = auth_service.generate_random_password()
+        await auth_service.set_credentials(
+            session,
+            username=normalized_username,
+            password=password,
+        )
+        return {
+            "action": "generated",
+            "username": normalized_username,
+            "password": password,
+        }
+
+
+def cmd_prepare_bootstrap_admin(args: argparse.Namespace) -> int:
+    payload = asyncio.run(_prepare_bootstrap_admin_async(args.username))
+    _print_json(payload)
     return 0
 
 
@@ -596,6 +633,13 @@ def build_parser() -> argparse.ArgumentParser:
     _add_auth_args(bootstrap)
     bootstrap.add_argument("--worker-ttl", type=int, default=1800)
     bootstrap.set_defaults(func=cmd_bootstrap)
+
+    prepare_bootstrap_admin = sub.add_parser(
+        "prepare-bootstrap-admin",
+        help="Generate initial admin credentials before first bootstrap",
+    )
+    prepare_bootstrap_admin.add_argument("--username", default="admin")
+    prepare_bootstrap_admin.set_defaults(func=cmd_prepare_bootstrap_admin)
 
     create_token = sub.add_parser("create-token", help="Create a join token")
     _add_auth_args(create_token)

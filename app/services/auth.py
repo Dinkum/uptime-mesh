@@ -21,9 +21,33 @@ _logger = get_logger("services.auth")
 
 
 def _generate_password_hash() -> str:
+    return hash_password(generate_random_password())
+
+
+def generate_random_password(length: int = 28) -> str:
     alphabet = string.ascii_letters + string.digits + "-_"
-    password = "".join(secrets.choice(alphabet) for _ in range(28))
-    return hash_password(password)
+    if length < 16:
+        length = 16
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+async def set_credentials(
+    session: AsyncSession,
+    *,
+    username: str,
+    password: str,
+) -> None:
+    normalized_username = username.strip() or DEFAULT_ADMIN_USERNAME
+    password_hash = hash_password(password)
+    updated_at = datetime.now(timezone.utc).isoformat()
+    await cluster_settings.set_setting(session, AUTH_USERNAME_KEY, normalized_username)
+    await cluster_settings.set_setting(session, AUTH_PASSWORD_HASH_KEY, password_hash)
+    await cluster_settings.set_setting(session, AUTH_PASSWORD_UPDATED_AT_KEY, updated_at)
+    _logger.info(
+        "auth.credentials.set",
+        "Set cluster admin credentials",
+        username=normalized_username,
+    )
 
 
 async def ensure_auth_defaults(session: AsyncSession) -> Tuple[str, str]:

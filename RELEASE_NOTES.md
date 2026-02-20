@@ -1,5 +1,44 @@
 # Release Notes
 
+## v0.0.4
+
+### Major
+- Reworked install/bootstrap/update lifecycle for safer production operation:
+  - Hardened `install.sh` into a first-node and join-node entrypoint with clearer defaults, generated credentials, and service bootstrap wiring.
+  - Added manifest-driven `ops/bootstrap.sh` dispatcher + hourly systemd timer flow for unattended update checks.
+  - Added full `ops/update.sh` update pipeline with lock control, staged apply, health gating, rollback path, and persistent `update-state.json`.
+  - Added dedicated `ops/agent-update.sh` path for Go-agent-only rollouts.
+  - Standardized operational logs into `data/logs` (`install.log`, `update.log`, `bootstrap.log`, `app.log`, `agent.log`).
+- Strengthened cluster security and trust boundaries:
+  - Removed cluster-wide signing secrets from node join responses and installer join handling.
+  - Added explicit throttling for public join and heartbeat endpoints.
+  - Redacted sensitive cluster settings/secrets from support bundle output.
+  - Hardened heartbeat signature validation and sequencing paths with richer rejection telemetry.
+- Upgraded Go agent SWIM behavior and role actuation stability:
+  - Added SWIM indirect probing (`ping-req` / `indirect-ack`) to reduce false dead detection on transient/asymmetric links.
+  - Added SWIM gossip piggybacking with bounded fanout and merge rules to propagate membership state peer-to-peer faster.
+  - Added load-aware SWIM flags and state handling with CPU/RAM/DISK/NETWORK/TOTAL load reporting.
+  - Added hash-gated backend/proxy runtime reconciliation to avoid unnecessary nginx/caddy reload churn.
+- Expanded operator UI information architecture and visibility:
+  - Added consolidated `Infrastructure` and `Workloads` pages and deeper node-level diagnostics.
+  - Added richer network/node visualizations, role placement visibility, rollout progress surfaces, and endpoint state visibility.
+  - Updated login and dashboard experience toward consistent dark-mode-first styling and clearer controls.
+
+### Minor
+- Added migration `0006_events_index_and_node_cleanup` to improve event query performance and clean obsolete node schema surface.
+- Improved settings/config reconciliation and reduced redundant DB reads/queries in key settings and UI flows.
+- Added shared utility helpers and route/service refactors to move heavy business logic out of route handlers.
+- Improved event query correctness for filtered timelines and broadened structured logging coverage for config, runtime, and failure paths.
+- Updated `.env.example`, CLI workflows, and ops docs to match the new install/update/bootstrap model.
+
+## Included Changes Since v0.0.3
+- This release includes all work since `v0.0.3`, including:
+  - install/bootstrap/update pipeline hardening with rollback + logging,
+  - Go agent SWIM reliability upgrades (indirect probes + gossip),
+  - cluster security boundary fixes for join/heartbeat/support artifacts,
+  - large UI/UX restructuring for node/workload/infrastructure visibility,
+  - and DB/settings/runtime performance and maintainability improvements.
+
 ## v0.0.3
 
 ### Major
@@ -12,7 +51,7 @@
   - Added cached load sampling aligned to heartbeat interval to reduce per-tick recomputation overhead.
   - Added load-aware SWIM local state behavior (degrade when total load is high or critical runtime/heartbeat errors are present).
 - Hardened first-node install flow for production-like bootstrap reliability:
-  - Introduced installer command logging to `data/install.log`.
+  - Introduced installer command logging to `data/logs/install.log`.
   - Added quieter step-oriented install output with retained deep command logs.
   - Enforced self-signed HTTPS UI proxy provisioning with nginx/caddy fallback and explicit fail path when unavailable.
   - Added safer service enable/start behavior for optional units to avoid noisy false alarms.

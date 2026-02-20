@@ -23,6 +23,25 @@
           <div class="mono">{{ last_sync_at or "n/a" }}</div>
         </div>
       </div>
+      <div class="mt-4 grid md:grid-cols-4 gap-3 text-sm">
+        <div class="rounded-xl border border-slate-100 p-3">
+          <div class="text-slate-500">Registry Endpoints</div>
+          <div class="mono">{{ endpoint_registry_total }}</div>
+        </div>
+        <div class="rounded-xl border border-slate-100 p-3">
+          <div class="text-slate-500">Healthy</div>
+          <div class="mono">{{ endpoint_registry_healthy }}</div>
+        </div>
+        <div class="rounded-xl border border-slate-100 p-3">
+          <div class="text-slate-500">Unhealthy</div>
+          <div class="mono">{{ endpoint_registry_unhealthy }}</div>
+        </div>
+        <div class="rounded-xl border border-slate-100 p-3">
+          <div class="text-slate-500">Stale</div>
+          <div class="mono">{{ endpoint_registry_stale }}</div>
+        </div>
+      </div>
+      <p class="text-xs text-slate-500 mt-3">Stale threshold: {{ endpoint_registry_stale_after_seconds }}s.</p>
     </article>
 
     <article class="bg-white rounded-2xl p-6 mesh-card">
@@ -45,6 +64,58 @@
         {% else %}
           <p class="text-slate-400">No healthy endpoints in registry.</p>
         {% endfor %}
+      </div>
+    </article>
+
+    <article class="bg-white rounded-2xl p-6 mesh-card">
+      <h2 class="text-lg font-semibold">Endpoint Registry (All States)</h2>
+      <p class="text-sm text-slate-500 mt-1">
+        Includes healthy, unhealthy, and stale endpoints. Stale means no fresh check inside threshold.
+      </p>
+      <div class="overflow-x-auto mt-4">
+        <table class="table w-full align-middle">
+          <thead>
+            <tr>
+              <th>Service</th>
+              <th>Endpoint</th>
+              <th>Node</th>
+              <th>Replica</th>
+              <th>Health</th>
+              <th>Last Check</th>
+              <th>Age</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for endpoint in endpoint_rows %}
+              <tr>
+                <td>
+                  <p class="font-semibold">{{ endpoint.service_name }}</p>
+                  <p class="mono text-[11px] text-slate-500">{{ endpoint.service_id }}</p>
+                </td>
+                <td class="mono text-xs">{{ endpoint.address }}:{{ endpoint.port }}</td>
+                <td class="mono text-xs">{{ endpoint.node_id }}</td>
+                <td class="mono text-xs">{{ endpoint.replica_id }}</td>
+                <td>
+                  {% if endpoint.health_state == "healthy" %}
+                    <span class="badge badge-success badge-outline">healthy</span>
+                  {% elif endpoint.health_state == "unhealthy" %}
+                    <span class="badge badge-error badge-outline">unhealthy</span>
+                  {% elif endpoint.health_state == "stale" %}
+                    <span class="badge badge-warning badge-outline">stale</span>
+                  {% else %}
+                    <span class="badge badge-outline">{{ endpoint.health_state }}</span>
+                  {% endif %}
+                </td>
+                <td class="mono text-xs">{{ endpoint.last_checked_at }}</td>
+                <td class="mono text-xs">{{ endpoint.age_text }}</td>
+              </tr>
+            {% else %}
+              <tr>
+                <td colspan="7" class="text-center text-slate-400">No endpoints registered yet.</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
       </div>
     </article>
   </section>

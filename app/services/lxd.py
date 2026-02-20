@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import subprocess
 import time
 from dataclasses import dataclass
@@ -11,9 +10,9 @@ from typing import Any, Iterable
 from app.config import get_settings
 from app.logger import get_logger
 from app.metrics import record_lxd_operation
+from app.utils import sanitize_label
 
 _logger = get_logger("lxd")
-_NAME_SAFE_RE = re.compile(r"[^a-z0-9-]")
 
 
 class LXDOperationError(RuntimeError):
@@ -39,12 +38,10 @@ class LXDContainerSpec:
 
 
 def _sanitize_label(raw: str, fallback: str) -> str:
-    value = raw.strip().lower().replace("_", "-").replace(" ", "-")
-    value = _NAME_SAFE_RE.sub("-", value)
-    value = re.sub(r"-{2,}", "-", value).strip("-")
+    value = sanitize_label(raw, max_len=63)
     if not value:
-        value = fallback
-    return value[:63]
+        value = sanitize_label(fallback, max_len=63)
+    return value or "item"
 
 
 def container_name(service_name: str, replica_id: str) -> str:

@@ -23,7 +23,6 @@ class Node(TimestampMixin, Base):
     lease_expires_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    lease_token_hash: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     identity_fingerprint: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     identity_cert_pem: Mapped[Optional[str]] = mapped_column(String(8192), nullable=True)
     identity_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)

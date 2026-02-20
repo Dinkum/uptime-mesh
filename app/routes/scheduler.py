@@ -29,9 +29,11 @@ async def reconcile_service(
     session: AsyncSession = Depends(get_writable_db_session),
 ) -> SchedulerResultOut:
     try:
-        return await scheduler_service.reconcile_service(
+        result = await scheduler_service.reconcile_service(
             session, service_id=service_id, dry_run=False
         )
+        await scheduler_service.refresh_cached_plan(session)
+        return result
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -40,11 +42,13 @@ async def reconcile_service(
 async def reconcile_all_services(
     session: AsyncSession = Depends(get_writable_db_session),
 ) -> SchedulerBulkResultOut:
-    return await scheduler_service.reconcile_all_services(session, dry_run=False)
+    result = await scheduler_service.reconcile_all_services(session, dry_run=False)
+    await scheduler_service.refresh_cached_plan(session)
+    return result
 
 
 @router.get("/plan/all", response_model=SchedulerBulkResultOut)
 async def plan_all_services(
     session: AsyncSession = Depends(get_db_session),
 ) -> SchedulerBulkResultOut:
-    return await scheduler_service.reconcile_all_services(session, dry_run=True)
+    return await scheduler_service.get_cached_plan(session)

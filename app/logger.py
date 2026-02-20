@@ -129,6 +129,9 @@ class Operation:
     def step(self, name: str, message: str, **fields: Any) -> None:
         self._step(logging.INFO, name, message, **fields)
 
+    def step_debug(self, name: str, message: str, **fields: Any) -> None:
+        self._step(logging.DEBUG, name, message, **fields)
+
     def step_warning(self, name: str, message: str, **fields: Any) -> None:
         self._step(logging.WARNING, name, message, **fields)
 

@@ -64,19 +64,21 @@ async def _base_context(request: Request, session: AsyncSession) -> Dict[str, An
     settings_map = await cluster_settings.get_settings_map(session)
     path = request.url.path or "/ui"
     tab_prefixes = [
-        ("/ui/network", "network"),
         ("/ui/nodes", "nodes"),
-        ("/ui/roles", "roles"),
-        ("/ui/services", "services"),
-        ("/ui/replicas", "replicas"),
-        ("/ui/scheduler", "scheduler"),
-        ("/ui/wireguard", "wireguard"),
-        ("/ui/discovery", "discovery"),
-        ("/ui/gateway", "gateway"),
-        ("/ui/monitoring", "monitoring"),
+        ("/ui/network", "nodes"),
+        ("/ui/roles", "nodes"),
+        ("/ui/workloads", "workloads"),
+        ("/ui/services", "workloads"),
+        ("/ui/replicas", "workloads"),
+        ("/ui/scheduler", "workloads"),
+        ("/ui/infrastructure", "infrastructure"),
+        ("/ui/wireguard", "infrastructure"),
+        ("/ui/discovery", "infrastructure"),
+        ("/ui/gateway", "infrastructure"),
+        ("/ui/monitoring", "infrastructure"),
         ("/ui/events", "events"),
-        ("/ui/support", "support"),
         ("/ui/settings", "settings"),
+        ("/ui/support", "settings"),
     ]
     current_tab = "overview"
     if path == "/ui":
@@ -167,6 +169,26 @@ def _build_node_summary(node: Any, now: datetime) -> dict[str, Any]:
     load_total = _safe_float(node_status.get("load_total_score"), default=None)
     swim_state = str(node_status.get("swim_state", "unknown")).strip().lower() or "unknown"
     swim_incarnation = _safe_int(str(node_status.get("swim_incarnation", "0")), default=0)
+    identity_expires = _as_utc(node.identity_expires_at)
+    if identity_expires is None:
+        identity_expiry_state = "unknown"
+        identity_expiry_text = "Unknown"
+        identity_expires_in = "-"
+    else:
+        seconds_until_expiry = int((identity_expires - now).total_seconds())
+        identity_expires_in = _format_remaining(now, identity_expires)
+        if seconds_until_expiry <= 0:
+            identity_expiry_state = "expired"
+            identity_expiry_text = "Expired"
+        elif seconds_until_expiry <= 3 * 24 * 3600:
+            identity_expiry_state = "critical"
+            identity_expiry_text = "Expiring Soon"
+        elif seconds_until_expiry <= 14 * 24 * 3600:
+            identity_expiry_state = "warning"
+            identity_expiry_text = "Expiring"
+        else:
+            identity_expiry_state = "ok"
+            identity_expiry_text = "Valid"
 
     if lease_expires and lease_expires > now:
         lease_state = f"Active ({_format_remaining(now, lease_expires)})"
@@ -193,7 +215,10 @@ def _build_node_summary(node: Any, now: datetime) -> dict[str, Any]:
         "wg_failover": wg_failover,
         "wg_failover_secondary": failover_state == "failover_secondary",
         "fingerprint": node.identity_fingerprint or "-",
-        "identity_expires_at": _format_timestamp(node.identity_expires_at),
+        "identity_expires_at": _format_timestamp(identity_expires),
+        "identity_expires_in": identity_expires_in,
+        "identity_expiry_state": identity_expiry_state,
+        "identity_expiry_text": identity_expiry_text,
         "load_cpu": load_cpu,
         "load_ram": load_ram,
         "load_disk": load_disk,
@@ -203,6 +228,52 @@ def _build_node_summary(node: Any, now: datetime) -> dict[str, Any]:
         "swim_incarnation": swim_incarnation,
         "status": node_status,
     }
+
+
+def _extract_role_actuation_rows(node_status: dict[str, Any]) -> list[dict[str, Any]]:
+    role_fields: dict[str, dict[str, Any]] = {}
+    for key, value in node_status.items():
+        if not isinstance(key, str) or not key.startswith("role."):
+            continue
+        parts = key.split(".")
+        if len(parts) != 3:
+            continue
+        _, role_name, field_name = parts
+        role_fields.setdefault(role_name, {})[field_name] = value
+
+    rows: list[dict[str, Any]] = []
+    for role_name in sorted(role_fields.keys()):
+        fields = role_fields[role_name]
+        apply_ok_raw = fields.get("apply_ok")
+        if isinstance(apply_ok_raw, bool):
+            apply_ok = apply_ok_raw
+        elif isinstance(apply_ok_raw, str):
+            apply_ok = apply_ok_raw.strip().lower() in {"1", "true", "yes"}
+        else:
+            apply_ok = None
+        reload_exit_code_raw = fields.get("reload_exit_code")
+        reload_exit_code = (
+            _safe_int(str(reload_exit_code_raw), default=0)
+            if reload_exit_code_raw is not None and str(reload_exit_code_raw).strip() != ""
+            else None
+        )
+        template_hash = str(fields.get("template_hash") or "").strip()
+        error = str(fields.get("error") or "").strip()
+        rows.append(
+            {
+                "role_name": role_name,
+                "apply_ok": apply_ok,
+                "apply_state": (
+                    "healthy"
+                    if apply_ok is True
+                    else "error" if apply_ok is False and error else "unknown"
+                ),
+                "template_hash": template_hash or "-",
+                "reload_exit_code": reload_exit_code,
+                "error": error or "-",
+            }
+        )
+    return rows
 
 
 @router.get("")
@@ -291,11 +362,29 @@ async def overview(request: Request, session: AsyncSession = Depends(get_db_sess
 
 @router.get("/network")
 async def network_page(request: Request, session: AsyncSession = Depends(get_db_session)) -> Any:
+    return RedirectResponse(url="/ui/nodes?view=map", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@router.get("/nodes")
+async def nodes_page(request: Request, session: AsyncSession = Depends(get_db_session)) -> Any:
+    view_mode = (request.query_params.get("view") or "table").strip().lower()
+    if view_mode not in {"table", "map"}:
+        view_mode = "table"
+
     nodes = await node_service.list_nodes(session, limit=500)
     now = datetime.now(timezone.utc)
     node_rows = [_build_node_summary(node, now) for node in nodes]
+    online_count = sum(1 for row in node_rows if row["health_key"] == "online")
+    stale_count = sum(1 for row in node_rows if row["health_key"] == "stale")
+    offline_count = sum(1 for row in node_rows if row["health_key"] == "offline")
+    failover_count = sum(1 for row in node_rows if row["wg_failover_secondary"])
+    cert_expired = sum(1 for row in node_rows if row["identity_expiry_state"] == "expired")
+    cert_critical = sum(1 for row in node_rows if row["identity_expiry_state"] == "critical")
+    cert_warning = sum(1 for row in node_rows if row["identity_expiry_state"] == "warning")
+
     swim_members = await cluster_service.list_swim_members(session)
     placement = await role_service.get_latest_placement(session)
+    placement_rows = placement.get("roles", []) if isinstance(placement, dict) else []
     node_assignments = placement.get("node_assignments", {}) if isinstance(placement, dict) else {}
 
     links_set: set[tuple[str, str]] = set()
@@ -304,12 +393,9 @@ async def network_page(request: Request, session: AsyncSession = Depends(get_db_
         if not isinstance(peers, dict):
             continue
         for peer_node_id in peers.keys():
-            if not isinstance(peer_node_id, str):
+            if not isinstance(peer_node_id, str) or peer_node_id == source_node_id:
                 continue
-            if peer_node_id == source_node_id:
-                continue
-            pair = tuple(sorted((source_node_id, peer_node_id)))
-            links_set.add(pair)
+            links_set.add(tuple(sorted((source_node_id, peer_node_id))))
     links = [{"source": source, "target": target} for source, target in sorted(links_set)]
 
     node_map_rows = []
@@ -317,10 +403,7 @@ async def network_page(request: Request, session: AsyncSession = Depends(get_db_
         node_id = row["id"]
         swim_row = swim_members.get(node_id, {})
         placement_roles = node_assignments.get(node_id, []) if isinstance(node_assignments, dict) else []
-        normalized_roles = [str(item) for item in placement_roles if isinstance(item, str)]
-        if not normalized_roles:
-            normalized_roles = row["roles"]
-
+        normalized_roles = [str(item) for item in placement_roles if isinstance(item, str)] or row["roles"]
         node_map_rows.append(
             {
                 "id": node_id,
@@ -338,6 +421,25 @@ async def network_page(request: Request, session: AsyncSession = Depends(get_db_
             }
         )
 
+    role_rows = []
+    if isinstance(placement_rows, list):
+        for item in placement_rows:
+            if not isinstance(item, dict):
+                continue
+            holders = item.get("holders", [])
+            if not isinstance(holders, list):
+                holders = []
+            role_rows.append(
+                {
+                    "name": str(item.get("name") or ""),
+                    "desired": int(item.get("desired") or 0),
+                    "assigned": int(item.get("assigned") or 0),
+                    "deficit": int(item.get("deficit") or 0),
+                    "holders": holders,
+                }
+            )
+    role_rows.sort(key=lambda row: row["name"])
+
     etcd_context = {
         "enabled": settings.etcd_enabled,
         "configured": bool(settings.etcd_endpoints.strip()),
@@ -354,48 +456,31 @@ async def network_page(request: Request, session: AsyncSession = Depends(get_db_
             endpoint_health = await etcd_service.endpoint_health()
             etcd_context["member_count"] = len(members)
             etcd_context["endpoint_count"] = len(endpoint_health)
-            etcd_context["healthy_endpoint_count"] = sum(
-                1 for item in endpoint_health if item.healthy
-            )
+            etcd_context["healthy_endpoint_count"] = sum(1 for item in endpoint_health if item.healthy)
             quorum_required = (max(etcd_context["member_count"], 1) // 2) + 1
             etcd_context["quorum_required"] = quorum_required
-            etcd_context["has_quorum"] = (
-                etcd_context["healthy_endpoint_count"] >= quorum_required
-            )
+            etcd_context["has_quorum"] = etcd_context["healthy_endpoint_count"] >= quorum_required
         except Exception as exc:  # noqa: BLE001
             etcd_context["error"] = f"{type(exc).__name__}: {exc}"
 
     context = {
         "request": request,
-        "title": "Network",
-        "subtitle": "Topology, SWIM membership, load, and control-plane health",
-        "nodes": node_map_rows,
-        "links": links,
-        "etcd": etcd_context,
-    }
-    context.update(await _base_context(request, session))
-    return templates.TemplateResponse("network.html", context)
-
-
-@router.get("/nodes")
-async def nodes_page(request: Request, session: AsyncSession = Depends(get_db_session)) -> Any:
-    nodes = await node_service.list_nodes(session)
-    now = datetime.now(timezone.utc)
-    node_rows = [_build_node_summary(node, now) for node in nodes]
-    online_count = sum(1 for row in node_rows if row["health_key"] == "online")
-    stale_count = sum(1 for row in node_rows if row["health_key"] == "stale")
-    offline_count = sum(1 for row in node_rows if row["health_key"] == "offline")
-    failover_count = sum(1 for row in node_rows if row["wg_failover_secondary"])
-    context = {
-        "request": request,
         "title": "Nodes",
-        "subtitle": "Live node status, identity, and quick actions",
+        "subtitle": "Inventory, topology, and role placement",
+        "view_mode": view_mode,
         "nodes": node_rows,
+        "map_nodes": node_map_rows,
+        "map_links": links,
+        "role_rows": role_rows,
+        "etcd": etcd_context,
         "node_total": len(node_rows),
         "node_online": online_count,
         "node_stale": stale_count,
         "node_offline": offline_count,
         "node_failover": failover_count,
+        "cert_expired": cert_expired,
+        "cert_critical": cert_critical,
+        "cert_warning": cert_warning,
     }
     context.update(await _base_context(request, session))
     return templates.TemplateResponse("nodes.html", context)
@@ -414,6 +499,7 @@ async def node_detail_page(
     now = datetime.now(timezone.utc)
     node_row = _build_node_summary(node, now)
     node_status = node.status or {}
+    role_actuation_rows = _extract_role_actuation_rows(node_status)
     swim_members = await cluster_service.list_swim_members(session)
     swim_member = swim_members.get(node.id, {})
     swim_peers = swim_member.get("peers") if isinstance(swim_member, dict) else {}
@@ -490,7 +576,7 @@ async def node_detail_page(
     extra_status_rows = [
         {"key": key, "label": key.replace("_", " ").title(), "value": _format_value(node_status.get(key))}
         for key in sorted(node_status.keys())
-        if key not in known_key_set
+        if key not in known_key_set and not str(key).startswith("role.")
     ]
 
     context = {
@@ -506,6 +592,7 @@ async def node_detail_page(
         "extra_status_rows": extra_status_rows,
         "placement_roles": [str(item) for item in placement_roles if isinstance(item, str)],
         "role_holder_rows": role_holder_rows,
+        "role_actuation_rows": role_actuation_rows,
         "swim_member": swim_member if isinstance(swim_member, dict) else {},
         "swim_peer_rows": swim_peer_rows,
     }
@@ -591,43 +678,74 @@ async def role_detail_page(
     return templates.TemplateResponse("role_detail.html", context)
 
 
-@router.get("/services")
-async def services_page(request: Request, session: AsyncSession = Depends(get_db_session)) -> Any:
-    services = await service_service.list_services(session)
+@router.get("/workloads")
+async def workloads_page(request: Request, session: AsyncSession = Depends(get_db_session)) -> Any:
+    subtab = (request.query_params.get("tab") or "services").strip().lower()
+    if subtab not in {"services", "replicas", "scheduler"}:
+        subtab = "services"
+
+    services = await service_service.list_services(session, limit=2000)
+    replicas = await replica_service.list_replicas(session, limit=2000)
+    now = datetime.now(timezone.utc)
+    rollout_rows = service_service.build_rollout_rows(services, replicas, now=now)
+    stalled_rollouts = sum(1 for row in rollout_rows if row["state_key"] == "stalled")
+    error_rollouts = sum(1 for row in rollout_rows if row["state_key"] == "error")
+    service_name_by_id = {str(service.id): str(service.name) for service in services}
+    service_generation_by_id = {
+        str(service.id): int(getattr(service, "generation", 0) or 0) for service in services
+    }
+    replica_rows: list[dict[str, Any]] = []
+    for replica in replicas:
+        status = replica.status if isinstance(replica.status, dict) else {}
+        service_id = str(replica.service_id)
+        current_generation = service_generation_by_id.get(service_id, 0)
+        applied_generation = _safe_int(str(status.get("applied_generation", "0")), default=0)
+        update_state = str(status.get("update_state", "unknown")).strip().lower() or "unknown"
+        replica_rows.append(
+            {
+                "id": replica.id,
+                "service_id": service_id,
+                "service_name": service_name_by_id.get(service_id, service_id),
+                "node_id": replica.node_id,
+                "desired_state": replica.desired_state,
+                "update_state": update_state,
+                "applied_generation": applied_generation,
+                "target_generation": current_generation,
+                "updated_at": _format_timestamp(_as_utc(getattr(replica, "updated_at", None))),
+            }
+        )
+    replica_rows.sort(key=lambda row: (row["service_name"].lower(), row["id"]))
+    plan = await scheduler_service.get_cached_plan(session)
+
     context = {
         "request": request,
-        "title": "Services",
-        "subtitle": "Desired state and pinned placement",
+        "title": "Workloads",
+        "subtitle": "Services, replicas, and scheduler plan",
+        "workloads_subtab": subtab,
         "services": services,
-    }
-    context.update(await _base_context(request, session))
-    return templates.TemplateResponse("services.html", context)
-
-
-@router.get("/replicas")
-async def replicas_page(request: Request, session: AsyncSession = Depends(get_db_session)) -> Any:
-    replicas = await replica_service.list_replicas(session)
-    context = {
-        "request": request,
-        "title": "Replicas",
-        "subtitle": "Sandbox instances and health gates",
-        "replicas": replicas,
-    }
-    context.update(await _base_context(request, session))
-    return templates.TemplateResponse("replicas.html", context)
-
-
-@router.get("/scheduler")
-async def scheduler_page(request: Request, session: AsyncSession = Depends(get_db_session)) -> Any:
-    plan = await scheduler_service.reconcile_all_services(session, dry_run=True)
-    context = {
-        "request": request,
-        "title": "Scheduler",
-        "subtitle": "Policy-driven placement, reschedule, and rolling update planning",
+        "rollout_rows": rollout_rows,
+        "stalled_rollouts": stalled_rollouts,
+        "error_rollouts": error_rollouts,
+        "replica_rows": replica_rows,
         "plan": plan,
     }
     context.update(await _base_context(request, session))
-    return templates.TemplateResponse("scheduler.html", context)
+    return templates.TemplateResponse("workloads.html", context)
+
+
+@router.get("/services")
+async def services_page() -> Any:
+    return RedirectResponse(url="/ui/workloads?tab=services", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@router.get("/replicas")
+async def replicas_page() -> Any:
+    return RedirectResponse(url="/ui/workloads?tab=replicas", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@router.get("/scheduler")
+async def scheduler_page() -> Any:
+    return RedirectResponse(url="/ui/workloads?tab=scheduler", status_code=status.HTTP_303_SEE_OTHER)
 
 
 @router.get("/events")
@@ -643,8 +761,13 @@ async def events_page(request: Request, session: AsyncSession = Depends(get_db_s
     return templates.TemplateResponse("events.html", context)
 
 
-@router.get("/wireguard")
-async def wireguard_page(request: Request, session: AsyncSession = Depends(get_db_session)) -> Any:
+@router.get("/infrastructure")
+async def infrastructure_page(request: Request, session: AsyncSession = Depends(get_db_session)) -> Any:
+    subtab = (request.query_params.get("tab") or "wireguard").strip().lower()
+    if subtab not in {"wireguard", "discovery", "gateway", "monitoring", "cdn"}:
+        subtab = "wireguard"
+
+    settings_map = await cluster_settings.get_settings_map(session)
     nodes = await node_service.list_nodes(session, limit=500)
     wireguard_rows = []
     for node in nodes:
@@ -665,71 +788,46 @@ async def wireguard_page(request: Request, session: AsyncSession = Depends(get_d
             }
         )
 
-    context = {
-        "request": request,
-        "title": "WireGuard",
-        "subtitle": "Dual tunnel state and active route preference",
-        "wireguard_rows": wireguard_rows,
-    }
-    context.update(await _base_context(request, session))
-    return templates.TemplateResponse("wireguard.html", context)
-
-
-@router.get("/discovery")
-async def discovery_page(request: Request, session: AsyncSession = Depends(get_db_session)) -> Any:
-    settings_map = await cluster_settings.get_settings_map(session)
     records = await discovery_service.list_discovery_services(
         session,
         domain=settings.runtime_discovery_domain,
     )
-    context = {
-        "request": request,
-        "title": "Discovery",
-        "subtitle": "CoreDNS records from healthy endpoint registry",
-        "records": records,
-        "domain": settings.runtime_discovery_domain,
-        "zone_endpoint": "/discovery/dns/zone",
-        "corefile_endpoint": "/discovery/dns/corefile",
-        "service_count": _safe_int(settings_map.get("discovery_service_count", "0")),
-        "endpoint_count": _safe_int(settings_map.get("discovery_endpoint_count", "0")),
-        "last_sync_at": settings_map.get("discovery_last_sync_at", ""),
-    }
-    context.update(await _base_context(request, session))
-    return templates.TemplateResponse("discovery.html", context)
+    stale_after_seconds = max(settings.runtime_discovery_interval_seconds * 3, 90)
+    endpoint_registry = await discovery_service.list_endpoint_registry(
+        session,
+        stale_after_seconds=stale_after_seconds,
+    )
+    endpoint_rows: list[dict[str, Any]] = []
+    for endpoint in endpoint_registry:
+        age_seconds = endpoint.get("age_seconds")
+        age_text = "-"
+        if isinstance(age_seconds, int) and age_seconds >= 0:
+            age_text = _format_duration(age_seconds)
+        endpoint_rows.append(
+            {
+                "endpoint_id": endpoint.get("endpoint_id", ""),
+                "service_name": endpoint.get("service_name", ""),
+                "service_id": endpoint.get("service_id", ""),
+                "replica_id": endpoint.get("replica_id", ""),
+                "node_id": endpoint.get("node_id", ""),
+                "address": endpoint.get("address", ""),
+                "port": endpoint.get("port", ""),
+                "health_state": endpoint.get("health_state", "unknown"),
+                "last_checked_at": _format_timestamp(_as_utc(endpoint.get("last_checked_at"))),
+                "age_text": age_text,
+            }
+        )
+    healthy_total = sum(1 for item in endpoint_rows if item["health_state"] == "healthy")
+    unhealthy_total = sum(1 for item in endpoint_rows if item["health_state"] == "unhealthy")
+    stale_total = sum(1 for item in endpoint_rows if item["health_state"] == "stale")
 
-
-@router.get("/gateway")
-async def gateway_page(request: Request, session: AsyncSession = Depends(get_db_session)) -> Any:
-    settings_map = await cluster_settings.get_settings_map(session)
     routes = await gateway_service.list_gateway_routes(session)
     healthcheck_urls = [
         item.strip()
         for item in settings.runtime_gateway_healthcheck_urls.split(",")
         if item.strip()
     ]
-    context = {
-        "request": request,
-        "title": "Gateway",
-        "subtitle": "NGINX ingress routes with safe reload pipeline",
-        "enabled": settings.runtime_gateway_enable,
-        "config_endpoint": "/gateway/nginx/config",
-        "routes": routes,
-        "route_count": _safe_int(settings_map.get("gateway_route_count", "0"), default=len(routes)),
-        "upstream_count": _safe_int(
-            settings_map.get("gateway_upstream_count", "0"), default=len(routes)
-        ),
-        "last_sync_at": settings_map.get("gateway_last_sync_at", ""),
-        "last_apply_status": settings_map.get("gateway_last_apply_status", "unknown"),
-        "last_apply_error": settings_map.get("gateway_last_apply_error", ""),
-        "healthcheck_urls": healthcheck_urls,
-    }
-    context.update(await _base_context(request, session))
-    return templates.TemplateResponse("gateway.html", context)
 
-
-@router.get("/monitoring")
-async def monitoring_page(request: Request, session: AsyncSession = Depends(get_db_session)) -> Any:
-    settings_map = await cluster_settings.get_settings_map(session)
     paths = monitoring_service.resolve_monitoring_paths(
         config_path=settings.runtime_monitoring_prometheus_config_path,
         candidate_path=settings.runtime_monitoring_prometheus_candidate_path,
@@ -742,14 +840,43 @@ async def monitoring_page(request: Request, session: AsyncSession = Depends(get_
     api_targets = split_csv(settings_map.get("monitoring_api_targets", ""))
     node_exporter_targets = split_csv(settings_map.get("monitoring_node_exporter_targets", ""))
     alertmanager_targets = split_csv(settings_map.get("monitoring_alertmanager_targets", ""))
+    content = await cluster_service.get_active_content(session)
+    cdn_seeded_at = settings_map.get("internal_cdn_seeded_at", "")
+
     context = {
         "request": request,
-        "title": "Monitoring",
-        "subtitle": "Prometheus targets, alerting paths, and sync status",
-        "enabled": settings.runtime_monitoring_enable,
-        "config_endpoint": "/monitoring/prometheus/config",
-        "config_path": str(paths.config_path),
-        "config_sha256": settings_map.get("monitoring_config_sha256", ""),
+        "title": "Infrastructure",
+        "subtitle": "WireGuard, discovery, gateway, monitoring, and content cache",
+        "infra_subtab": subtab,
+        "wireguard_rows": wireguard_rows,
+        "records": records,
+        "domain": settings.runtime_discovery_domain,
+        "zone_endpoint": "/discovery/dns/zone",
+        "corefile_endpoint": "/discovery/dns/corefile",
+        "service_count": _safe_int(settings_map.get("discovery_service_count", "0")),
+        "endpoint_count": _safe_int(settings_map.get("discovery_endpoint_count", "0")),
+        "last_sync_at": settings_map.get("discovery_last_sync_at", ""),
+        "endpoint_rows": endpoint_rows,
+        "endpoint_registry_total": len(endpoint_rows),
+        "endpoint_registry_healthy": healthy_total,
+        "endpoint_registry_unhealthy": unhealthy_total,
+        "endpoint_registry_stale": stale_total,
+        "endpoint_registry_stale_after_seconds": stale_after_seconds,
+        "gateway_enabled": settings.runtime_gateway_enable,
+        "config_endpoint": "/gateway/nginx/config",
+        "routes": routes,
+        "route_count": _safe_int(settings_map.get("gateway_route_count", "0"), default=len(routes)),
+        "upstream_count": _safe_int(
+            settings_map.get("gateway_upstream_count", "0"), default=len(routes)
+        ),
+        "gateway_last_sync_at": settings_map.get("gateway_last_sync_at", ""),
+        "gateway_last_apply_status": settings_map.get("gateway_last_apply_status", "unknown"),
+        "gateway_last_apply_error": settings_map.get("gateway_last_apply_error", ""),
+        "healthcheck_urls": healthcheck_urls,
+        "monitoring_enabled": settings.runtime_monitoring_enable,
+        "monitoring_config_endpoint": "/monitoring/prometheus/config",
+        "monitoring_config_path": str(paths.config_path),
+        "monitoring_config_sha256": settings_map.get("monitoring_config_sha256", ""),
         "api_targets": api_targets,
         "node_exporter_targets": node_exporter_targets,
         "alertmanager_targets": alertmanager_targets,
@@ -765,53 +892,68 @@ async def monitoring_page(request: Request, session: AsyncSession = Depends(get_
             settings_map.get("monitoring_alertmanager_target_count", "0"),
             default=len(alertmanager_targets),
         ),
-        "last_sync_at": settings_map.get("monitoring_last_sync_at", ""),
-        "last_apply_status": settings_map.get("monitoring_last_apply_status", "unknown"),
-        "last_apply_error": settings_map.get("monitoring_last_apply_error", ""),
+        "monitoring_last_sync_at": settings_map.get("monitoring_last_sync_at", ""),
+        "monitoring_last_apply_status": settings_map.get("monitoring_last_apply_status", "unknown"),
+        "monitoring_last_apply_error": settings_map.get("monitoring_last_apply_error", ""),
+        "cdn_version": str(content.get("version") or ""),
+        "cdn_hash_sha256": str(content.get("hash_sha256") or ""),
+        "cdn_size_bytes": _safe_int(content.get("size_bytes"), default=0),
+        "cdn_seeded_at": cdn_seeded_at,
     }
     context.update(await _base_context(request, session))
-    return templates.TemplateResponse("monitoring.html", context)
+    return templates.TemplateResponse("infrastructure.html", context)
+
+
+@router.get("/wireguard")
+async def wireguard_page() -> Any:
+    return RedirectResponse(url="/ui/infrastructure?tab=wireguard", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@router.get("/discovery")
+async def discovery_page() -> Any:
+    return RedirectResponse(url="/ui/infrastructure?tab=discovery", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@router.get("/gateway")
+async def gateway_page() -> Any:
+    return RedirectResponse(url="/ui/infrastructure?tab=gateway", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@router.get("/monitoring")
+async def monitoring_page() -> Any:
+    return RedirectResponse(url="/ui/infrastructure?tab=monitoring", status_code=status.HTTP_303_SEE_OTHER)
 
 
 @router.get("/support")
-async def support_page(request: Request, session: AsyncSession = Depends(get_db_session)) -> Any:
-    snapshots = await snapshot_service.list_snapshots(session)
-    bundles = await support_bundle_service.list_support_bundles(session)
-    context = {
-        "request": request,
-        "title": "Support",
-        "subtitle": "Snapshots, bundles, and break-glass tooling",
-        "snapshots": snapshots,
-        "bundles": bundles,
-    }
-    context.update(await _base_context(request, session))
-    return templates.TemplateResponse("support.html", context)
+async def support_page() -> Any:
+    return RedirectResponse(url="/ui/settings?section=support", status_code=status.HTTP_303_SEE_OTHER)
 
 
 @router.get("/settings")
 async def settings_page(request: Request, session: AsyncSession = Depends(get_db_session)) -> Any:
     password_updated = request.query_params.get("password_updated") == "1"
     repo_updated = request.query_params.get("repo_updated") == "1"
+    active_section = (request.query_params.get("section") or "auth").strip().lower()
+    if active_section not in {"auth", "support"}:
+        active_section = "auth"
     settings_map = await cluster_settings.get_settings_map(session)
+    snapshots = await snapshot_service.list_snapshots(session)
+    bundles = await support_bundle_service.list_support_bundles(session)
     context = {
         "request": request,
         "title": "Settings",
-        "subtitle": "Authentication and cluster preferences",
+        "subtitle": "Authentication, preferences, snapshots, and support bundles",
+        "settings_section": active_section,
         "username": await auth_service.get_username(session),
         "password_success": "Password updated successfully." if password_updated else "",
         "password_error": "",
         "repo_success": "Repository URL updated successfully." if repo_updated else "",
         "repo_error": "",
         "github_repo_url": settings_map.get("github_repo_url", "https://github.com/Dinkum/uptime-mesh"),
+        "snapshots": snapshots,
+        "bundles": bundles,
     }
-    context.update(
-        {
-            "ui_prefix": "/ui",
-            "auth_user": getattr(request.state, "auth_user", ""),
-            "etcd_status": settings_map.get("etcd_status", "unknown"),
-            "etcd_last_sync_at": settings_map.get("etcd_last_sync_at"),
-        }
-    )
+    context.update(await _base_context(request, session))
     return templates.TemplateResponse("settings.html", context)
 
 
@@ -824,6 +966,9 @@ async def change_password(
     confirm_password: str = Form(default=""),
 ) -> Any:
     username = await auth_service.get_username(session)
+    settings_map = await cluster_settings.get_settings_map(session)
+    snapshots = await snapshot_service.list_snapshots(session)
+    bundles = await support_bundle_service.list_support_bundles(session)
     error = ""
     success = ""
     status_code = status.HTTP_200_OK
@@ -872,16 +1017,19 @@ async def change_password(
     context = {
         "request": request,
         "title": "Settings",
-        "subtitle": "Authentication and cluster preferences",
+        "subtitle": "Authentication, preferences, snapshots, and support bundles",
+        "settings_section": "auth",
         "username": username,
         "password_success": success,
         "password_error": error,
         "repo_success": "",
         "repo_error": "",
-        "github_repo_url": (await cluster_settings.get_settings_map(session)).get(
+        "github_repo_url": settings_map.get(
             "github_repo_url",
             "https://github.com/Dinkum/uptime-mesh",
         ),
+        "snapshots": snapshots,
+        "bundles": bundles,
     }
     context.update(await _base_context(request, session))
     return templates.TemplateResponse("settings.html", context, status_code=status_code)
@@ -912,13 +1060,16 @@ async def update_repo_url(
     context = {
         "request": request,
         "title": "Settings",
-        "subtitle": "Authentication and cluster preferences",
+        "subtitle": "Authentication, preferences, snapshots, and support bundles",
+        "settings_section": "auth",
         "username": await auth_service.get_username(session),
         "password_success": "",
         "password_error": "",
         "repo_success": success,
         "repo_error": error,
         "github_repo_url": clean_url or "https://github.com/Dinkum/uptime-mesh",
+        "snapshots": await snapshot_service.list_snapshots(session),
+        "bundles": await support_bundle_service.list_support_bundles(session),
     }
     context.update(await _base_context(request, session))
     return templates.TemplateResponse("settings.html", context, status_code=status_code)

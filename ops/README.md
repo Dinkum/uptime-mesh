@@ -1,44 +1,47 @@
-# Node Bootstrap + Update
+# Node Lifecycle Scripts
 
-This directory contains node-side operational scripts:
+This directory contains the node-side lifecycle scripts used in production.
 
-- `bootstrap.sh`: tiny shim that fetches/verifies updater and hands off.
-- `node-update.sh`: robust updater with locking, retries, checksum verification, atomic install, and rollback.
+## Scripts
 
-## Safety model
+- `bootstrap.sh`: tiny dispatcher used by systemd timer and manual recovery.
+  - Acquires lock.
+  - Fetches `version.json`.
+  - Verifies script checksum.
+  - Runs `install.sh` (if node not installed) or `update.sh` (if installed).
 
-- Bootstrap is intentionally minimal and only does:
-  1. fetch manifest,
-  2. fetch updater,
-  3. execute updater (or fallback to local updater).
-- Updater is the only component that applies binary changes.
-- Updater validates SHA-256 from `version.json` before installing anything.
-- Updater installs atomically and rolls back if post-update health checks fail.
+- `update.sh`: full in-place application update.
+  - Compares installed `VERSION` vs latest release.
+  - Uses `update-state.json` failed-version gate.
+  - Backs up app dir + sqlite DB + agent binary.
+  - Downloads and verifies source tarball checksum.
+  - Applies source update, rebuilds Go agent, runs migrations.
+  - Restarts services and enforces health gate.
+  - Rolls back on failure.
 
-## Manifest
+- `agent-update.sh`: agent-only rebuild/swap/restart flow.
 
-`version.json` at repo root is the source of truth.
+- `node-update.sh`: compatibility wrapper to `agent-update.sh`.
 
-The updater reads:
+## Manifest contract (`version.json`)
 
-- `channels.<name>.updater`
-- `channels.<name>.bootstrap`
-- `channels.<name>.agent.artifacts.<os-arch>`
+`channels.<name>` should include:
 
-Example target keys:
+- `version`
+- `bootstrap.path`, `bootstrap.sha256`
+- `install.path`, `install.sha256`
+- `update.path`, `update.sha256`
+- `source.url`, `source.sha256`
 
-- `linux-amd64`
-- `linux-arm64`
+## Systemd
 
-## Release checklist
+Installed by `install.sh`:
 
-1. Build and upload node agent artifacts (GitHub Releases recommended).
-2. Update `version.json`:
-   - bump `channels.stable.version`,
-   - set `agent.version`,
-   - set artifact URLs and SHA-256 values.
-3. Recompute script checksums when scripts change:
-   - `shasum -a 256 ops/bootstrap.sh ops/node-update.sh`
-   - update `bootstrap.sha256` and `updater.sha256` in `version.json`.
-4. Validate in a test node:
-   - `VERSION_URL=<raw-version-json-url> sh ops/bootstrap.sh`
+- `uptime-mesh-update.service`
+- `uptime-mesh-update.timer` (hourly)
+
+Manual recovery:
+
+```bash
+sudo /opt/uptime-mesh/ops/bootstrap.sh
+```

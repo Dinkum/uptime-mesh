@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import base64
 import json
@@ -15,6 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.dependencies import get_sessionmaker
 from app.identity import (
     create_lease_token,
     decode_lease_token,
@@ -52,6 +54,12 @@ CONTENT_HASH_KEY = "internal_cdn_active_hash_sha256"
 CONTENT_SIZE_KEY = "internal_cdn_active_size_bytes"
 CONTENT_BODY_KEY = "internal_cdn_active_body_base64"
 CONTENT_SEEDED_AT_KEY = "internal_cdn_seeded_at"
+_SECRETS_CACHE_TTL_SECONDS = 300
+_secrets_cache = {
+    "auth_secret_key": "",
+    "cluster_signing_key": "",
+    "expires_at_monotonic": 0.0,
+}
 
 _ROLE_ALIASES = {
     "worker": "general",
@@ -105,6 +113,33 @@ _DEFAULT_CONTENT_HTML = """<!doctype html>
 
 def _hash_secret(secret: str) -> str:
     return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+
+def _set_secrets_cache(*, auth_secret_key: str, cluster_signing_key: str) -> None:
+    _secrets_cache["auth_secret_key"] = auth_secret_key
+    _secrets_cache["cluster_signing_key"] = cluster_signing_key
+    _secrets_cache["expires_at_monotonic"] = time.monotonic() + _SECRETS_CACHE_TTL_SECONDS
+
+
+def _read_secrets_cache() -> tuple[str, str] | None:
+    expires_at = float(_secrets_cache.get("expires_at_monotonic", 0.0) or 0.0)
+    if expires_at <= time.monotonic():
+        return None
+    auth_secret_key = str(_secrets_cache.get("auth_secret_key", "") or "").strip()
+    cluster_signing_key = str(_secrets_cache.get("cluster_signing_key", "") or "").strip()
+    if not auth_secret_key or not cluster_signing_key:
+        return None
+    return auth_secret_key, cluster_signing_key
+
+
+def invalidate_cluster_secrets_cache(*, reason: str = "manual") -> None:
+    _set_secrets_cache(auth_secret_key="", cluster_signing_key="")
+    _secrets_cache["expires_at_monotonic"] = 0.0
+    _logger.info(
+        "cluster.secrets.cache_invalidate",
+        "Invalidated cluster secrets cache",
+        reason=reason,
+    )
 
 
 def _content_sha256(raw: bytes) -> str:
@@ -173,6 +208,54 @@ def _resolve_etcd_peer_url(payload: NodeJoinRequest) -> str:
         if host:
             return f"http://{host}:2380"
     return ""
+
+
+async def _persist_node_etcd_member_metadata(
+    *,
+    node_id: str,
+    member_id: str,
+    peer_url: str,
+) -> None:
+    sessionmaker = get_sessionmaker(settings.database_url)
+    try:
+        async with sessionmaker() as persist_session:
+            node = await persist_session.get(Node, node_id)
+            if node is None:
+                _logger.warning(
+                    "etcd.member_metadata.node_missing",
+                    "Skipped etcd member metadata persist because node was missing",
+                    node_id=node_id,
+                    member_id=member_id,
+                )
+                return
+            status = node.status if isinstance(node.status, dict) else {}
+            current_member_id = str(status.get("etcd_member_id", "") or "")
+            current_peer_url = str(status.get("etcd_peer_url", "") or "")
+            if current_member_id == member_id and current_peer_url == peer_url:
+                return
+            node.status = {
+                **status,
+                "etcd_member_id": member_id,
+                "etcd_peer_url": peer_url,
+            }
+            await persist_session.commit()
+            _logger.info(
+                "etcd.member_metadata.persist",
+                "Persisted node etcd membership metadata",
+                node_id=node_id,
+                member_id=member_id,
+                peer_url=peer_url,
+            )
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning(
+            "etcd.member_metadata.persist_error",
+            "Best-effort node etcd membership metadata persist failed",
+            node_id=node_id,
+            member_id=member_id,
+            peer_url=peer_url,
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
 
 
 def _is_worker_node(node: Node) -> bool:
@@ -325,6 +408,11 @@ async def _resolve_cluster_secrets(
     *,
     persist_if_missing: bool,
 ) -> tuple[str, str, bool]:
+    cached = _read_secrets_cache()
+    if cached is not None:
+        auth_secret_key, cluster_signing_key = cached
+        return auth_secret_key, cluster_signing_key, False
+
     settings_map = await cluster_settings.get_settings_map(session)
     auth_secret_key = settings_map.get(AUTH_SECRET_KEY_SETTING, "").strip()
     cluster_signing_key = settings_map.get(CLUSTER_SIGNING_KEY_SETTING, "").strip()
@@ -352,7 +440,12 @@ async def _resolve_cluster_secrets(
     if updates and persist_if_missing:
         await cluster_settings.upsert_settings(session, updates, sync_file=False)
 
-    return auth_secret_key, cluster_signing_key, bool(updates)
+    _set_secrets_cache(
+        auth_secret_key=auth_secret_key,
+        cluster_signing_key=cluster_signing_key,
+    )
+
+    return auth_secret_key, cluster_signing_key, bool(updates and persist_if_missing)
 
 
 async def _ensure_default_content_registry(session: AsyncSession) -> None:
@@ -523,7 +616,7 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
         role=canonical_role,
         node_name=payload.name,
     ) as op:
-        auth_secret_key, cluster_signing_key, secrets_persisted = await _resolve_cluster_secrets(
+        _, cluster_signing_key, secrets_persisted = await _resolve_cluster_secrets(
             session,
             persist_if_missing=True,
         )
@@ -599,7 +692,6 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
                 api_endpoint=payload.api_endpoint,
                 heartbeat_at=now,
                 lease_expires_at=lease_expires_at,
-                lease_token_hash=None,
                 identity_fingerprint=identity_fingerprint,
                 identity_cert_pem=node_cert_pem,
                 identity_expires_at=identity_expires_at,
@@ -615,7 +707,6 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
             node.status = {**(node.status or {}), **status}
             node.heartbeat_at = now
             node.lease_expires_at = lease_expires_at
-            node.lease_token_hash = None
             node.identity_fingerprint = identity_fingerprint
             node.identity_cert_pem = node_cert_pem
             node.identity_expires_at = identity_expires_at
@@ -696,12 +787,19 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
                             member_id=member_id,
                             peer_url=peer_url,
                         )
-                    node.status = {
-                        **(node.status or {}),
-                        "etcd_member_id": member_id,
-                        "etcd_peer_url": peer_url,
-                    }
-                    await session.commit()
+                    asyncio.create_task(
+                        _persist_node_etcd_member_metadata(
+                            node_id=payload.node_id,
+                            member_id=member_id,
+                            peer_url=peer_url,
+                        )
+                    )
+                    op.step(
+                        "etcd.member_metadata.queue",
+                        "Queued best-effort etcd member metadata persistence",
+                        member_id=member_id,
+                        peer_url=peer_url,
+                    )
                 except Exception as exc:  # noqa: BLE001
                     op.step_warning(
                         "etcd.member_add",
@@ -734,8 +832,6 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
             identity_fingerprint=identity_fingerprint,
             node_cert_pem=node_cert_pem,
             ca_cert_pem=ca_cert_pem,
-            auth_secret_key=auth_secret_key,
-            cluster_signing_key=cluster_signing_key,
         )
 
 
@@ -759,7 +855,7 @@ async def apply_heartbeat(
             session,
             persist_if_missing=False,
         )
-        op.step("secrets.resolve", "Resolved cluster signing key for heartbeat validation")
+        op.step_debug("secrets.resolve", "Resolved cluster signing key for heartbeat validation")
         lease_claims = decode_lease_token(lease_token, cluster_signing_key)
         if lease_claims is None:
             _logger.warning(
@@ -776,7 +872,7 @@ async def apply_heartbeat(
                 lease_node_id=lease_claims.get("n"),
             )
             return None
-        op.step("lease.validate", "Validated signed lease token")
+        op.step_debug("lease.validate", "Validated signed lease token")
 
         node = await session.get(Node, node_id)
         if node is None or not node.identity_cert_pem or not node.identity_fingerprint:
@@ -793,7 +889,7 @@ async def apply_heartbeat(
                 node_id=node_id,
             )
             return None
-        op.step("identity.match", "Validated node identity fingerprint")
+        op.step_debug("identity.match", "Validated node identity fingerprint")
 
         now_epoch = int(time.time())
         if abs(now_epoch - signed_at) > settings.heartbeat_signature_max_skew_seconds:
@@ -819,7 +915,7 @@ async def apply_heartbeat(
                 last_signed_at=last_signed_at,
             )
             return None
-        op.step("signature.sequence", "Validated heartbeat signature monotonicity")
+        op.step_debug("signature.sequence", "Validated heartbeat signature monotonicity")
 
         message = heartbeat_signing_message(
             node_id=node_id,
@@ -839,7 +935,7 @@ async def apply_heartbeat(
                 node_id=node_id,
             )
             return None
-        op.step("signature.verify", "Verified heartbeat signature")
+        op.step_debug("signature.verify", "Verified heartbeat signature")
 
         now = _utcnow()
         lease_expires_at = now + timedelta(seconds=ttl_seconds)
@@ -852,14 +948,14 @@ async def apply_heartbeat(
         status = dict(node.status or {})
         status["last_heartbeat_signed_at"] = signed_at
         node.status = status
-        op.step(
+        op.step_debug(
             "status.apply",
             "Applied heartbeat status update",
             status_fields=len(status_patch),
         )
 
         await session.commit()
-        op.step("db.commit", "Committed heartbeat update")
+        op.step_debug("db.commit", "Committed heartbeat update")
         if _etcd_configured():
             try:
                 lease_payload = {
@@ -875,7 +971,7 @@ async def apply_heartbeat(
                     payload=lease_payload,
                     ttl_seconds=ttl_seconds,
                 )
-                op.step("etcd.lease_upsert", "Upserted node lease to etcd", ttl_seconds=ttl_seconds)
+                op.step_debug("etcd.lease_upsert", "Upserted node lease to etcd", ttl_seconds=ttl_seconds)
             except Exception as exc:  # noqa: BLE001
                 op.step_warning(
                     "etcd.lease_upsert",

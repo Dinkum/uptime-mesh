@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import get_db_session, get_writable_db_session
+from app.security import LoginRateLimiter
 from app.schemas.cluster import (
     ClusterPeerOut,
     ClusterBootstrapOut,
@@ -25,6 +26,31 @@ from app.schemas.cluster import (
 from app.services import cluster as cluster_service
 
 router = APIRouter(prefix="/cluster", tags=["cluster"])
+
+_JOIN_RATE_LIMIT_PER_MINUTE = 10
+_HEARTBEAT_RATE_LIMIT_PER_MINUTE = 60
+_HEARTBEAT_IP_RATE_LIMIT_PER_MINUTE = 120
+_JOIN_LIMITER = LoginRateLimiter(
+    max_failures=_JOIN_RATE_LIMIT_PER_MINUTE,
+    window_seconds=60,
+    lockout_seconds=60,
+)
+_HEARTBEAT_NODE_LIMITER = LoginRateLimiter(
+    max_failures=_HEARTBEAT_RATE_LIMIT_PER_MINUTE,
+    window_seconds=60,
+    lockout_seconds=60,
+)
+_HEARTBEAT_IP_LIMITER = LoginRateLimiter(
+    max_failures=_HEARTBEAT_IP_RATE_LIMIT_PER_MINUTE,
+    window_seconds=60,
+    lockout_seconds=60,
+)
+
+
+def _client_ip(request: Request) -> str:
+    if request.client and request.client.host:
+        return request.client.host
+    return "unknown"
 
 
 @router.post("/bootstrap", response_model=ClusterBootstrapOut)
@@ -63,8 +89,17 @@ async def create_join_token(
 @router.post("/join", response_model=NodeJoinOut)
 async def join_node(
     payload: NodeJoinRequest,
+    request: Request,
     session: AsyncSession = Depends(get_writable_db_session),
 ) -> NodeJoinOut:
+    client_ip = _client_ip(request)
+    allowed, retry_after = _JOIN_LIMITER.check(f"ip:{client_ip}")
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Join rate limit exceeded for this IP. Retry in {retry_after}s.",
+        )
+    _JOIN_LIMITER.record_failure(f"ip:{client_ip}")
     joined = await cluster_service.join_node(session, payload)
     if joined is None:
         raise HTTPException(status_code=401, detail="Invalid, expired, or already-used join token.")
@@ -74,8 +109,24 @@ async def join_node(
 @router.post("/heartbeat", response_model=HeartbeatOut)
 async def heartbeat(
     payload: HeartbeatRequest,
+    request: Request,
     session: AsyncSession = Depends(get_db_session),
 ) -> HeartbeatOut:
+    client_ip = _client_ip(request)
+    allowed_ip, retry_after_ip = _HEARTBEAT_IP_LIMITER.check(f"ip:{client_ip}")
+    if not allowed_ip:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Heartbeat rate limit exceeded for this IP. Retry in {retry_after_ip}s.",
+        )
+    allowed_node, retry_after_node = _HEARTBEAT_NODE_LIMITER.check(f"node:{payload.node_id}")
+    if not allowed_node:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Heartbeat rate limit exceeded for node ID. Retry in {retry_after_node}s.",
+        )
+    _HEARTBEAT_IP_LIMITER.record_failure(f"ip:{client_ip}")
+    _HEARTBEAT_NODE_LIMITER.record_failure(f"node:{payload.node_id}")
     lease = await cluster_service.apply_heartbeat(
         session,
         node_id=payload.node_id,
@@ -151,6 +202,7 @@ async def list_swim(
 async def active_content(
     node_id: str,
     lease_token: str,
+    known_hash: str | None = None,
     session: AsyncSession = Depends(get_db_session),
 ) -> ContentActiveOut:
     is_valid = await cluster_service.validate_node_lease_token(
@@ -161,4 +213,7 @@ async def active_content(
     if not is_valid:
         raise HTTPException(status_code=401, detail="Invalid node credentials.")
     payload = await cluster_service.get_active_content(session)
+    resolved_hash = str(payload.get("hash_sha256") or "").strip()
+    if known_hash and resolved_hash and known_hash.strip() == resolved_hash:
+        payload["body_base64"] = ""
     return ContentActiveOut.model_validate(payload)

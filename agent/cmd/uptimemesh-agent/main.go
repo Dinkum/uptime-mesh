@@ -33,54 +33,56 @@ import (
 )
 
 const (
-	agentVersion = "0.2.0"
+	agentVersion     = "0.2.1"
+	swimGossipFanout = 3
 )
 
 type Config struct {
-	EnvFile                   string
-	LogFile                   string
-	LogLevel                  string
-	APIServerURL              string
-	NodeID                    string
-	NodeName                  string
-	IdentityDir               string
-	HeartbeatIntervalSeconds  int
-	HeartbeatTTLSeconds       int
-	EnableWireGuard           bool
-	MeshCIDR                  string
-	PrimaryIface              string
-	SecondaryIface            string
-	PrimaryRouterIP           string
-	SecondaryRouterIP         string
-	PrimaryMetric             int
-	SecondaryMetric           int
-	FailoverThreshold         int
-	FailbackStableCount       int
-	FailbackEnabled           bool
-	CommandTimeoutSeconds     int
-	PingTimeoutSeconds        int
-	WGKeyDir                  string
-	WGLocalAddress            string
-	PrimaryListenPort         int
-	SecondaryListenPort       int
-	PeerPort                  int
-	PeerAllowedIPs            string
+	EnvFile                    string
+	LogFile                    string
+	LogLevel                   string
+	APIServerURL               string
+	NodeID                     string
+	NodeName                   string
+	IdentityDir                string
+	HeartbeatIntervalSeconds   int
+	HeartbeatTTLSeconds        int
+	EnableWireGuard            bool
+	MeshCIDR                   string
+	PrimaryIface               string
+	SecondaryIface             string
+	PrimaryRouterIP            string
+	SecondaryRouterIP          string
+	PrimaryMetric              int
+	SecondaryMetric            int
+	FailoverThreshold          int
+	FailbackStableCount        int
+	FailbackEnabled            bool
+	CommandTimeoutSeconds      int
+	PingTimeoutSeconds         int
+	WGKeyDir                   string
+	WGLocalAddress             string
+	PrimaryListenPort          int
+	SecondaryListenPort        int
+	PeerPort                   int
+	PeerAllowedIPs             string
 	PersistentKeepaliveSeconds int
-	PrimaryPeerPublicKey      string
-	SecondaryPeerPublicKey    string
-	PrimaryPeerEndpoint       string
-	SecondaryPeerEndpoint     string
-	EnableUnixSocketAPI       bool
-	UnixSocketPath            string
-	SWIMEnabled               bool
-	SWIMPort                  int
-	SWIMProbeTimeoutMs        int
-	SWIMSuspectThreshold      int
-	SWIMDeadThreshold         int
-	SWIMCooldownSeconds       int
-	InternalCDNDir            string
-	BackendListenPort         int
-	ProxyListenPort           int
+	PrimaryPeerPublicKey       string
+	SecondaryPeerPublicKey     string
+	PrimaryPeerEndpoint        string
+	SecondaryPeerEndpoint      string
+	EnableUnixSocketAPI        bool
+	UnixSocketPath             string
+	SWIMEnabled                bool
+	SWIMPort                   int
+	SWIMProbeTimeoutMs         int
+	SWIMIndirectProbeCount     int
+	SWIMSuspectThreshold       int
+	SWIMDeadThreshold          int
+	SWIMCooldownSeconds        int
+	InternalCDNDir             string
+	BackendListenPort          int
+	ProxyListenPort            int
 }
 
 type Logger struct {
@@ -91,10 +93,10 @@ type Logger struct {
 }
 
 type FailoverState struct {
-	ActiveIface       string
-	PrimaryFailures   int
-	PrimarySuccesses  int
-	SecondaryFailures int
+	ActiveIface        string
+	PrimaryFailures    int
+	PrimarySuccesses   int
+	SecondaryFailures  int
 	SecondarySuccesses int
 }
 
@@ -120,25 +122,30 @@ type Agent struct {
 	internalCDNHash    string
 	assignedRoles      []string
 	backendTargets     []string
+	lastBackendHash    string
+	lastProxyHash      string
 	lastLoadSample     *loadSnapshot
 	loadScores         map[string]float64
 	loadScoresComputed time.Time
 }
 
 type wgPeerIntent struct {
-	publicKey          string
-	endpoint           string
-	allowedIPs         string
+	publicKey           string
+	endpoint            string
+	allowedIPs          string
 	persistentKeepalive int
 }
 
 type swimMessage struct {
-	Type        string                 `json:"type"`
-	From        string                 `json:"from"`
-	Incarnation int64                  `json:"incarnation"`
-	State       string                 `json:"state"`
-	Flags       map[string]any         `json:"flags,omitempty"`
-	Nonce       string                 `json:"nonce,omitempty"`
+	Type        string                    `json:"type"`
+	From        string                    `json:"from"`
+	Incarnation int64                     `json:"incarnation"`
+	State       string                    `json:"state"`
+	Flags       map[string]any            `json:"flags,omitempty"`
+	Nonce       string                    `json:"nonce,omitempty"`
+	RelayBy     string                    `json:"relay_by,omitempty"`
+	TargetNode  string                    `json:"target_node_id,omitempty"`
+	TargetIP    string                    `json:"target_ip,omitempty"`
 	Peers       map[string]map[string]any `json:"peers,omitempty"`
 }
 
@@ -148,6 +155,7 @@ type SwimPeerState struct {
 	State         string
 	Incarnation   int64
 	LastSeen      time.Time
+	LastChanged   time.Time
 	Failures      int
 	Suspect       bool
 	CooldownUntil time.Time
@@ -213,7 +221,7 @@ func main() {
 		client: &http.Client{
 			Timeout: time.Duration(cfg.CommandTimeoutSeconds) * time.Second,
 		},
-		state: FailoverState{ActiveIface: cfg.PrimaryIface},
+		state:           FailoverState{ActiveIface: cfg.PrimaryIface},
 		lastStatusPatch: map[string]any{},
 		swimIncarnation: time.Now().UnixNano(),
 		swimState:       "healthy",
@@ -328,54 +336,55 @@ func loadConfig(envFile string) (Config, error) {
 	}
 	logFile := get("AGENT_LOG_FILE", "")
 	if strings.TrimSpace(logFile) == "" {
-		logFile = get("LOG_FILE", "data/agent.log")
+		logFile = get("LOG_FILE", "data/logs/agent.log")
 	}
 
 	cfg := Config{
-		EnvFile:                  envFile,
-		LogFile:                  logFile,
-		LogLevel:                 get("LOG_LEVEL", "INFO"),
-		APIServerURL:             strings.TrimSuffix(get("RUNTIME_API_BASE_URL", "http://127.0.0.1:8010"), "/"),
-		NodeID:                   get("RUNTIME_NODE_ID", ""),
-		NodeName:                 get("RUNTIME_NODE_NAME", ""),
-		IdentityDir:              get("RUNTIME_IDENTITY_DIR", "data/identities"),
-		HeartbeatIntervalSeconds: parseInt("RUNTIME_HEARTBEAT_INTERVAL_SECONDS", 15),
-		HeartbeatTTLSeconds:      parseInt("RUNTIME_HEARTBEAT_TTL_SECONDS", 45),
-		EnableWireGuard:          parseBool("RUNTIME_WG_CONFIGURE", true),
-		MeshCIDR:                 get("RUNTIME_MESH_CIDR", "10.42.0.0/16"),
-		PrimaryIface:             get("RUNTIME_WG_PRIMARY_IFACE", "wg-mesh0"),
-		SecondaryIface:           get("RUNTIME_WG_SECONDARY_IFACE", "wg-mesh1"),
-		PrimaryRouterIP:          get("RUNTIME_WG_PRIMARY_ROUTER_IP", ""),
-		SecondaryRouterIP:        get("RUNTIME_WG_SECONDARY_ROUTER_IP", ""),
-		PrimaryMetric:            parseInt("RUNTIME_ROUTE_PRIMARY_METRIC", 100),
-		SecondaryMetric:          parseInt("RUNTIME_ROUTE_SECONDARY_METRIC", 200),
-		FailoverThreshold:        parseInt("RUNTIME_FAILOVER_THRESHOLD", 3),
-		FailbackStableCount:      parseInt("RUNTIME_FAILBACK_STABLE_COUNT", 6),
-		FailbackEnabled:          parseBool("RUNTIME_FAILBACK_ENABLED", false),
-		CommandTimeoutSeconds:    parseInt("RUNTIME_COMMAND_TIMEOUT_SECONDS", 6),
-		PingTimeoutSeconds:       parseInt("RUNTIME_PING_TIMEOUT_SECONDS", 1),
-		WGKeyDir:                 get("RUNTIME_WG_KEY_DIR", "data/wireguard"),
-		WGLocalAddress:           get("RUNTIME_WG_LOCAL_ADDRESS", ""),
-		PrimaryListenPort:        parseInt("RUNTIME_WG_PRIMARY_LISTEN_PORT", 51820),
-		SecondaryListenPort:      parseInt("RUNTIME_WG_SECONDARY_LISTEN_PORT", 51821),
-		PeerPort:                 parseInt("RUNTIME_WG_PEER_PORT", 51820),
-		PeerAllowedIPs:           get("RUNTIME_WG_PEER_ALLOWED_IPS", ""),
+		EnvFile:                    envFile,
+		LogFile:                    logFile,
+		LogLevel:                   get("LOG_LEVEL", "INFO"),
+		APIServerURL:               strings.TrimSuffix(get("RUNTIME_API_BASE_URL", "http://127.0.0.1:8010"), "/"),
+		NodeID:                     get("RUNTIME_NODE_ID", ""),
+		NodeName:                   get("RUNTIME_NODE_NAME", ""),
+		IdentityDir:                get("RUNTIME_IDENTITY_DIR", "data/identities"),
+		HeartbeatIntervalSeconds:   parseInt("RUNTIME_HEARTBEAT_INTERVAL_SECONDS", 15),
+		HeartbeatTTLSeconds:        parseInt("RUNTIME_HEARTBEAT_TTL_SECONDS", 45),
+		EnableWireGuard:            parseBool("RUNTIME_WG_CONFIGURE", true),
+		MeshCIDR:                   get("RUNTIME_MESH_CIDR", "10.42.0.0/16"),
+		PrimaryIface:               get("RUNTIME_WG_PRIMARY_IFACE", "wg-mesh0"),
+		SecondaryIface:             get("RUNTIME_WG_SECONDARY_IFACE", "wg-mesh1"),
+		PrimaryRouterIP:            get("RUNTIME_WG_PRIMARY_ROUTER_IP", ""),
+		SecondaryRouterIP:          get("RUNTIME_WG_SECONDARY_ROUTER_IP", ""),
+		PrimaryMetric:              parseInt("RUNTIME_ROUTE_PRIMARY_METRIC", 100),
+		SecondaryMetric:            parseInt("RUNTIME_ROUTE_SECONDARY_METRIC", 200),
+		FailoverThreshold:          parseInt("RUNTIME_FAILOVER_THRESHOLD", 3),
+		FailbackStableCount:        parseInt("RUNTIME_FAILBACK_STABLE_COUNT", 6),
+		FailbackEnabled:            parseBool("RUNTIME_FAILBACK_ENABLED", false),
+		CommandTimeoutSeconds:      parseInt("RUNTIME_COMMAND_TIMEOUT_SECONDS", 6),
+		PingTimeoutSeconds:         parseInt("RUNTIME_PING_TIMEOUT_SECONDS", 1),
+		WGKeyDir:                   get("RUNTIME_WG_KEY_DIR", "data/wireguard"),
+		WGLocalAddress:             get("RUNTIME_WG_LOCAL_ADDRESS", ""),
+		PrimaryListenPort:          parseInt("RUNTIME_WG_PRIMARY_LISTEN_PORT", 51820),
+		SecondaryListenPort:        parseInt("RUNTIME_WG_SECONDARY_LISTEN_PORT", 51821),
+		PeerPort:                   parseInt("RUNTIME_WG_PEER_PORT", 51820),
+		PeerAllowedIPs:             get("RUNTIME_WG_PEER_ALLOWED_IPS", ""),
 		PersistentKeepaliveSeconds: parseInt("RUNTIME_WG_PERSISTENT_KEEPALIVE_SECONDS", 25),
-		PrimaryPeerPublicKey:     get("RUNTIME_WG_PRIMARY_PEER_PUBLIC_KEY", ""),
-		SecondaryPeerPublicKey:   get("RUNTIME_WG_SECONDARY_PEER_PUBLIC_KEY", ""),
-		PrimaryPeerEndpoint:      get("RUNTIME_WG_PRIMARY_PEER_ENDPOINT", ""),
-		SecondaryPeerEndpoint:    get("RUNTIME_WG_SECONDARY_PEER_ENDPOINT", ""),
-		EnableUnixSocketAPI:      parseBool("AGENT_ENABLE_UNIX_SOCKET", true),
-		UnixSocketPath:           get("AGENT_UNIX_SOCKET", "data/agent.sock"),
-		SWIMEnabled:              parseBool("RUNTIME_SWIM_ENABLE", true),
-		SWIMPort:                 parseInt("RUNTIME_SWIM_PORT", 7946),
-		SWIMProbeTimeoutMs:       parseInt("RUNTIME_SWIM_PROBE_TIMEOUT_MS", 500),
-		SWIMSuspectThreshold:     parseInt("RUNTIME_SWIM_SUSPECT_THRESHOLD", 2),
-		SWIMDeadThreshold:        parseInt("RUNTIME_SWIM_DEAD_THRESHOLD", 4),
-		SWIMCooldownSeconds:      parseInt("RUNTIME_SWIM_COOLDOWN_SECONDS", 30),
-		InternalCDNDir:           get("RUNTIME_INTERNAL_CDN_DIR", "data/internal-cdn"),
-		BackendListenPort:        parseInt("RUNTIME_BACKEND_LISTEN_PORT", 8081),
-		ProxyListenPort:          parseInt("RUNTIME_PROXY_LISTEN_PORT", 8080),
+		PrimaryPeerPublicKey:       get("RUNTIME_WG_PRIMARY_PEER_PUBLIC_KEY", ""),
+		SecondaryPeerPublicKey:     get("RUNTIME_WG_SECONDARY_PEER_PUBLIC_KEY", ""),
+		PrimaryPeerEndpoint:        get("RUNTIME_WG_PRIMARY_PEER_ENDPOINT", ""),
+		SecondaryPeerEndpoint:      get("RUNTIME_WG_SECONDARY_PEER_ENDPOINT", ""),
+		EnableUnixSocketAPI:        parseBool("AGENT_ENABLE_UNIX_SOCKET", true),
+		UnixSocketPath:             get("AGENT_UNIX_SOCKET", "data/agent.sock"),
+		SWIMEnabled:                parseBool("RUNTIME_SWIM_ENABLE", true),
+		SWIMPort:                   parseInt("RUNTIME_SWIM_PORT", 7946),
+		SWIMProbeTimeoutMs:         parseInt("RUNTIME_SWIM_PROBE_TIMEOUT_MS", 500),
+		SWIMIndirectProbeCount:     parseInt("RUNTIME_SWIM_INDIRECT_PROBE_COUNT", 3),
+		SWIMSuspectThreshold:       parseInt("RUNTIME_SWIM_SUSPECT_THRESHOLD", 2),
+		SWIMDeadThreshold:          parseInt("RUNTIME_SWIM_DEAD_THRESHOLD", 4),
+		SWIMCooldownSeconds:        parseInt("RUNTIME_SWIM_COOLDOWN_SECONDS", 30),
+		InternalCDNDir:             get("RUNTIME_INTERNAL_CDN_DIR", "data/internal-cdn"),
+		BackendListenPort:          parseInt("RUNTIME_BACKEND_LISTEN_PORT", 8081),
+		ProxyListenPort:            parseInt("RUNTIME_PROXY_LISTEN_PORT", 8080),
 	}
 
 	if cfg.NodeID == "" {
@@ -410,6 +419,9 @@ func loadConfig(envFile string) (Config, error) {
 	}
 	if cfg.SWIMProbeTimeoutMs < 50 {
 		cfg.SWIMProbeTimeoutMs = 500
+	}
+	if cfg.SWIMIndirectProbeCount < 0 {
+		cfg.SWIMIndirectProbeCount = 0
 	}
 	if cfg.SWIMSuspectThreshold < 1 {
 		cfg.SWIMSuspectThreshold = 2
@@ -457,7 +469,7 @@ func newLogger(level string, filePath string) (*Logger, error) {
 	lvl := parseLogLevel(level)
 	path := strings.TrimSpace(filePath)
 	if path == "" {
-		path = "data/app.log"
+		path = "data/logs/agent.log"
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
@@ -526,34 +538,34 @@ func (a *Agent) snapshotStatus() map[string]any {
 	}
 
 	return map[string]any{
-		"node_id":                a.cfg.NodeID,
-		"node_name":              a.cfg.NodeName,
-		"agent_version":          agentVersion,
-		"wireguard_enabled":      a.cfg.EnableWireGuard,
-		"active_iface":           a.state.ActiveIface,
-		"primary_failures":       a.state.PrimaryFailures,
-		"primary_successes":      a.state.PrimarySuccesses,
-		"secondary_failures":     a.state.SecondaryFailures,
-		"secondary_successes":    a.state.SecondarySuccesses,
-		"last_tick_at":           lastTickAt,
-		"last_tick_duration_ms":  a.lastTickDurationMs,
-		"last_tick_error":        a.lastTickError,
-		"last_heartbeat_at":      lastHeartbeatAt,
-		"last_heartbeat_error":   a.lastHeartbeatError,
-		"latest_status_patch":    statusPatch,
+		"node_id":                 a.cfg.NodeID,
+		"node_name":               a.cfg.NodeName,
+		"agent_version":           agentVersion,
+		"wireguard_enabled":       a.cfg.EnableWireGuard,
+		"active_iface":            a.state.ActiveIface,
+		"primary_failures":        a.state.PrimaryFailures,
+		"primary_successes":       a.state.PrimarySuccesses,
+		"secondary_failures":      a.state.SecondaryFailures,
+		"secondary_successes":     a.state.SecondarySuccesses,
+		"last_tick_at":            lastTickAt,
+		"last_tick_duration_ms":   a.lastTickDurationMs,
+		"last_tick_error":         a.lastTickError,
+		"last_heartbeat_at":       lastHeartbeatAt,
+		"last_heartbeat_error":    a.lastHeartbeatError,
+		"latest_status_patch":     statusPatch,
 		"unix_socket_api_enabled": a.cfg.EnableUnixSocketAPI,
-		"unix_socket_path":       a.cfg.UnixSocketPath,
-		"swim_enabled":           a.cfg.SWIMEnabled,
-		"swim_state":             a.swimState,
-		"swim_incarnation":       a.swimIncarnation,
-		"swim_peer_count":        swimPeerCount,
-		"internal_cdn_version":   a.internalCDNVersion,
-		"internal_cdn_hash":      a.internalCDNHash,
-		"assigned_roles":         roles,
-		"backend_targets":        backendTargets,
-		"backend_listen_port":    a.cfg.BackendListenPort,
-		"proxy_listen_port":      a.cfg.ProxyListenPort,
-		"load_scores":            loadScores,
+		"unix_socket_path":        a.cfg.UnixSocketPath,
+		"swim_enabled":            a.cfg.SWIMEnabled,
+		"swim_state":              a.swimState,
+		"swim_incarnation":        a.swimIncarnation,
+		"swim_peer_count":         swimPeerCount,
+		"internal_cdn_version":    a.internalCDNVersion,
+		"internal_cdn_hash":       a.internalCDNHash,
+		"assigned_roles":          roles,
+		"backend_targets":         backendTargets,
+		"backend_listen_port":     a.cfg.BackendListenPort,
+		"proxy_listen_port":       a.cfg.ProxyListenPort,
+		"load_scores":             loadScores,
 	}
 }
 
@@ -663,6 +675,57 @@ func (a *Agent) readLeaseToken() (string, error) {
 	return token, nil
 }
 
+func (a *Agent) readNodePrivateKey() (crypto.PrivateKey, error) {
+	keyPath := filepath.Join(a.cfg.IdentityDir, a.cfg.NodeID, "node.key")
+	keyRaw, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("read key: %w", err)
+	}
+	privateKey, err := parsePrivateKey(keyRaw)
+	if err != nil {
+		return nil, fmt.Errorf("parse key: %w", err)
+	}
+	return privateKey, nil
+}
+
+func (a *Agent) doGETWithRetry(ctx context.Context, targetURL string, attempts int) (*http.Response, error) {
+	if attempts < 1 {
+		attempts = 1
+	}
+	backoff := 150 * time.Millisecond
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := a.client.Do(req)
+		if err == nil {
+			if resp.StatusCode >= 500 && attempt < attempts {
+				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
+				_ = resp.Body.Close()
+				lastErr = fmt.Errorf("http %d", resp.StatusCode)
+			} else {
+				return resp, nil
+			}
+		} else {
+			lastErr = err
+		}
+		if attempt < attempts {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("request failed without explicit error")
+	}
+	return nil, lastErr
+}
+
 func (a *Agent) swimBindAddress() string {
 	local := strings.TrimSpace(a.cfg.WGLocalAddress)
 	if local == "" {
@@ -733,45 +796,109 @@ func (a *Agent) swimReadLoop(conn *net.UDPConn) {
 }
 
 func (a *Agent) handleSWIMMessage(remote *net.UDPAddr, msg swimMessage) {
-	if strings.TrimSpace(msg.From) != "" && msg.From != a.cfg.NodeID {
+	updatesFromRemote := msg.Type != "indirect-ack"
+	if strings.TrimSpace(msg.From) != "" && msg.From != a.cfg.NodeID && updatesFromRemote {
+		now := time.Now().UTC()
 		a.mu.Lock()
 		peer := a.swimPeers[msg.From]
 		if peer == nil {
 			peer = &SwimPeerState{
-				NodeID: msg.From,
-				State:  "healthy",
-				Flags:  map[string]any{},
+				NodeID:      msg.From,
+				State:       "healthy",
+				LastChanged: now,
+				Flags:       map[string]any{},
 			}
 			a.swimPeers[msg.From] = peer
 		}
-		peer.Incarnation = msg.Incarnation
-		peer.LastSeen = time.Now().UTC()
+		peer.LastSeen = now
 		if remote != nil {
 			peer.MeshIP = remote.IP.String()
 		}
-		if msg.State != "" {
-			peer.State = strings.ToLower(strings.TrimSpace(msg.State))
+		stateBefore := strings.ToLower(strings.TrimSpace(peer.State))
+		if msg.Incarnation > peer.Incarnation {
+			peer.Incarnation = msg.Incarnation
+			if msg.State != "" {
+				peer.State = strings.ToLower(strings.TrimSpace(msg.State))
+			}
+			if msg.Flags != nil {
+				peer.Flags = msg.Flags
+			}
+		} else if msg.Incarnation == peer.Incarnation {
+			if msg.State != "" {
+				peer.State = strings.ToLower(strings.TrimSpace(msg.State))
+			}
+			if msg.Flags != nil {
+				peer.Flags = msg.Flags
+			}
 		}
-		if msg.Flags != nil {
-			peer.Flags = msg.Flags
+		stateAfter := strings.ToLower(strings.TrimSpace(peer.State))
+		if stateAfter != "" && stateAfter != stateBefore {
+			peer.LastChanged = now
 		}
-		peer.Failures = 0
-		peer.Suspect = false
+		if msg.Type == "ack" {
+			peer.Failures = 0
+			peer.Suspect = false
+		}
 		a.mu.Unlock()
 	}
+	a.mergeSWIMGossip(msg.Peers)
 
 	switch msg.Type {
 	case "ping":
+		incarnation, state := a.swimLocalIdentity()
 		ack := swimMessage{
 			Type:        "ack",
 			From:        a.cfg.NodeID,
-			Incarnation: a.swimIncarnation,
-			State:       a.swimState,
+			Incarnation: incarnation,
+			State:       state,
 			Nonce:       msg.Nonce,
 			Flags:       a.swimLoadFlags(),
+			Peers:       a.gossipPeers(),
 		}
 		a.sendSWIMMessage(remote, ack)
+	case "ping-req":
+		if remote == nil {
+			return
+		}
+		relay := *remote
+		go func(relayAddr net.UDPAddr, relayMsg swimMessage) {
+			targetNodeID := strings.TrimSpace(relayMsg.TargetNode)
+			targetIP := strings.TrimSpace(relayMsg.TargetIP)
+			if targetNodeID == "" || targetIP == "" || strings.TrimSpace(relayMsg.Nonce) == "" {
+				return
+			}
+			ok := a.pingPeerSWIM(targetNodeID, targetIP)
+			if !ok {
+				return
+			}
+			incarnation, _ := a.swimLocalIdentity()
+			ack := swimMessage{
+				Type:        "indirect-ack",
+				From:        targetNodeID,
+				Incarnation: incarnation,
+				State:       "healthy",
+				Nonce:       relayMsg.Nonce,
+				RelayBy:     a.cfg.NodeID,
+				Flags:       a.swimLoadFlags(),
+				Peers:       a.gossipPeers(),
+			}
+			a.sendSWIMMessage(&relayAddr, ack)
+		}(relay, msg)
 	case "ack":
+		if strings.TrimSpace(msg.Nonce) == "" {
+			return
+		}
+		a.mu.Lock()
+		ch := a.swimPending[msg.Nonce]
+		delete(a.swimPending, msg.Nonce)
+		a.mu.Unlock()
+		if ch != nil {
+			select {
+			case ch <- msg:
+			default:
+			}
+		}
+	case "indirect-ack":
 		if strings.TrimSpace(msg.Nonce) == "" {
 			return
 		}
@@ -806,6 +933,155 @@ func (a *Agent) sendSWIMMessage(remote *net.UDPAddr, msg swimMessage) bool {
 	return err == nil
 }
 
+func (a *Agent) swimLocalIdentity() (int64, string) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.swimIncarnation, a.swimState
+}
+
+func parseInt64Like(value any) (int64, bool) {
+	switch v := value.(type) {
+	case int:
+		return int64(v), true
+	case int64:
+		return v, true
+	case float64:
+		return int64(v), true
+	case json.Number:
+		parsed, err := v.Int64()
+		if err == nil {
+			return parsed, true
+		}
+	case string:
+		parsed, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		if err == nil {
+			return parsed, true
+		}
+	}
+	return 0, false
+}
+
+func (a *Agent) gossipPeers() map[string]map[string]any {
+	type entry struct {
+		id          string
+		state       string
+		incarnation int64
+		meshIP      string
+		recency     time.Time
+	}
+
+	a.mu.RLock()
+	entries := make([]entry, 0, len(a.swimPeers))
+	for id, peer := range a.swimPeers {
+		if peer == nil || strings.TrimSpace(id) == "" || id == a.cfg.NodeID {
+			continue
+		}
+		state := strings.ToLower(strings.TrimSpace(peer.State))
+		if state == "" || state == "unknown" {
+			continue
+		}
+		recency := peer.LastChanged
+		if recency.IsZero() {
+			recency = peer.LastSeen
+		}
+		entries = append(entries, entry{
+			id:          id,
+			state:       state,
+			incarnation: peer.Incarnation,
+			meshIP:      strings.TrimSpace(peer.MeshIP),
+			recency:     recency,
+		})
+	}
+	a.mu.RUnlock()
+
+	sort.Slice(entries, func(i, j int) bool {
+		left := entries[i].recency
+		right := entries[j].recency
+		if left.Equal(right) {
+			return entries[i].id < entries[j].id
+		}
+		return left.After(right)
+	})
+
+	out := map[string]map[string]any{}
+	for i, item := range entries {
+		if i >= swimGossipFanout {
+			break
+		}
+		out[item.id] = map[string]any{
+			"state":       item.state,
+			"incarnation": item.incarnation,
+			"mesh_ip":     item.meshIP,
+		}
+	}
+	return out
+}
+
+func (a *Agent) mergeSWIMGossip(peers map[string]map[string]any) {
+	if len(peers) == 0 {
+		return
+	}
+	now := time.Now().UTC()
+	for nodeID, info := range peers {
+		nodeID = strings.TrimSpace(nodeID)
+		if nodeID == "" {
+			continue
+		}
+		incomingIncarnation, ok := parseInt64Like(info["incarnation"])
+		if !ok {
+			incomingIncarnation = 0
+		}
+		incomingState := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", info["state"])))
+		incomingIP := strings.TrimSpace(fmt.Sprintf("%v", info["mesh_ip"]))
+
+		if nodeID == a.cfg.NodeID {
+			if incomingState != "dead" && incomingState != "degraded" {
+				continue
+			}
+			a.mu.Lock()
+			if incomingIncarnation >= a.swimIncarnation {
+				a.swimIncarnation = incomingIncarnation + 1
+				a.swimState = "healthy"
+				a.log.Warn("agent.swim", "refute.self_state", "Refuted stale gossip about local node", map[string]any{
+					"incoming_state":       incomingState,
+					"incoming_incarnation": incomingIncarnation,
+					"new_incarnation":      a.swimIncarnation,
+				})
+			}
+			a.mu.Unlock()
+			continue
+		}
+
+		a.mu.Lock()
+		peer := a.swimPeers[nodeID]
+		if peer == nil {
+			peer = &SwimPeerState{
+				NodeID:      nodeID,
+				State:       "unknown",
+				Incarnation: -1,
+				Flags:       map[string]any{},
+			}
+			a.swimPeers[nodeID] = peer
+		}
+
+		if incomingIncarnation > peer.Incarnation {
+			stateBefore := strings.ToLower(strings.TrimSpace(peer.State))
+			peer.Incarnation = incomingIncarnation
+			if incomingState != "" {
+				peer.State = incomingState
+			}
+			if incomingIP != "" {
+				peer.MeshIP = incomingIP
+			}
+			stateAfter := strings.ToLower(strings.TrimSpace(peer.State))
+			if stateAfter != "" && stateAfter != stateBefore {
+				peer.LastChanged = now
+			}
+		}
+		a.mu.Unlock()
+	}
+}
+
 func (a *Agent) pingPeerSWIM(peerNodeID string, peerIP string) bool {
 	ip := strings.TrimSpace(peerIP)
 	if ip == "" {
@@ -816,6 +1092,7 @@ func (a *Agent) pingPeerSWIM(peerNodeID string, peerIP string) bool {
 		return false
 	}
 	nonce := fmt.Sprintf("%s-%d", a.cfg.NodeID, time.Now().UnixNano())
+	incarnation, state := a.swimLocalIdentity()
 	ch := make(chan swimMessage, 1)
 	a.mu.Lock()
 	a.swimPending[nonce] = ch
@@ -823,10 +1100,11 @@ func (a *Agent) pingPeerSWIM(peerNodeID string, peerIP string) bool {
 	ok := a.sendSWIMMessage(remote, swimMessage{
 		Type:        "ping",
 		From:        a.cfg.NodeID,
-		Incarnation: a.swimIncarnation,
-		State:       a.swimState,
+		Incarnation: incarnation,
+		State:       state,
 		Nonce:       nonce,
 		Flags:       a.swimLoadFlags(),
+		Peers:       a.gossipPeers(),
 	})
 	if !ok {
 		a.mu.Lock()
@@ -842,7 +1120,101 @@ func (a *Agent) pingPeerSWIM(peerNodeID string, peerIP string) bool {
 		a.mu.Unlock()
 		return false
 	case ack := <-ch:
-		return strings.TrimSpace(ack.From) == peerNodeID || strings.TrimSpace(ack.From) != ""
+		return strings.TrimSpace(ack.From) == peerNodeID
+	}
+}
+
+func (a *Agent) selectIndirectHelpers(
+	candidates []*SwimPeerState,
+	excludeNodeID string,
+	start int,
+	limit int,
+) []*SwimPeerState {
+	if len(candidates) == 0 || limit <= 0 {
+		return nil
+	}
+	if start < 0 {
+		start = 0
+	}
+	helpers := make([]*SwimPeerState, 0, limit)
+	for i := 0; i < len(candidates) && len(helpers) < limit; i++ {
+		idx := (start + i) % len(candidates)
+		peer := candidates[idx]
+		if peer == nil {
+			continue
+		}
+		if strings.TrimSpace(peer.NodeID) == "" || peer.NodeID == excludeNodeID {
+			continue
+		}
+		if strings.TrimSpace(peer.MeshIP) == "" {
+			continue
+		}
+		state := strings.ToLower(strings.TrimSpace(peer.State))
+		if state == "dead" {
+			continue
+		}
+		helpers = append(helpers, peer)
+	}
+	return helpers
+}
+
+func (a *Agent) indirectProbeSWIM(targetNodeID string, targetIP string, helpers []*SwimPeerState) bool {
+	targetNodeID = strings.TrimSpace(targetNodeID)
+	targetIP = strings.TrimSpace(targetIP)
+	if targetNodeID == "" || targetIP == "" || len(helpers) == 0 {
+		return false
+	}
+
+	nonce := fmt.Sprintf("%s-indirect-%d", a.cfg.NodeID, time.Now().UnixNano())
+	incarnation, state := a.swimLocalIdentity()
+	ch := make(chan swimMessage, 1)
+	a.mu.Lock()
+	a.swimPending[nonce] = ch
+	a.mu.Unlock()
+
+	sent := 0
+	for _, helper := range helpers {
+		if helper == nil {
+			continue
+		}
+		helperIP := strings.TrimSpace(helper.MeshIP)
+		if helperIP == "" {
+			continue
+		}
+		remote, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", helperIP, a.cfg.SWIMPort))
+		if err != nil {
+			continue
+		}
+		ok := a.sendSWIMMessage(remote, swimMessage{
+			Type:        "ping-req",
+			From:        a.cfg.NodeID,
+			Incarnation: incarnation,
+			State:       state,
+			Nonce:       nonce,
+			TargetNode:  targetNodeID,
+			TargetIP:    targetIP,
+			Flags:       a.swimLoadFlags(),
+		})
+		if ok {
+			sent++
+		}
+	}
+	if sent == 0 {
+		a.mu.Lock()
+		delete(a.swimPending, nonce)
+		a.mu.Unlock()
+		return false
+	}
+
+	timeout := time.Duration(a.cfg.SWIMProbeTimeoutMs*2) * time.Millisecond
+	select {
+	case <-time.After(timeout):
+		a.mu.Lock()
+		delete(a.swimPending, nonce)
+		a.mu.Unlock()
+		return false
+	case ack := <-ch:
+		return strings.TrimSpace(ack.From) == targetNodeID
 	}
 }
 
@@ -853,11 +1225,7 @@ func (a *Agent) fetchClusterPeers(ctx context.Context, leaseToken string) ([]map
 		url.QueryEscape(a.cfg.NodeID),
 		url.QueryEscape(leaseToken),
 	)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := a.client.Do(req)
+	resp, err := a.doGETWithRetry(ctx, u, 3)
 	if err != nil {
 		return nil, err
 	}
@@ -877,23 +1245,25 @@ func (a *Agent) fetchClusterPeers(ctx context.Context, leaseToken string) ([]map
 	return rows, nil
 }
 
-func (a *Agent) reconcileSWIM(ctx context.Context) map[string]any {
+func (a *Agent) reconcileSWIM(
+	ctx context.Context,
+	leaseToken string,
+	peersRaw []map[string]any,
+	peersErr error,
+) map[string]any {
 	patch := map[string]any{
 		"swim_enabled": true,
 	}
-	leaseToken, err := a.readLeaseToken()
-	if err != nil {
+	if strings.TrimSpace(leaseToken) == "" {
 		a.log.Warn("agent.swim", "lease.read_error", "Failed to read lease token for SWIM", map[string]any{
-			"error": err.Error(),
+			"error": "lease token is empty",
 		})
 		patch["swim_state"] = "degraded"
 		return patch
 	}
-
-	peersRaw, err := a.fetchClusterPeers(ctx, leaseToken)
-	if err != nil {
+	if peersErr != nil {
 		a.log.Warn("agent.swim", "peer.fetch_error", "Failed to fetch peers for SWIM", map[string]any{
-			"error": err.Error(),
+			"error": peersErr.Error(),
 		})
 		patch["swim_state"] = "degraded"
 		return patch
@@ -912,7 +1282,7 @@ func (a *Agent) reconcileSWIM(ctx context.Context) map[string]any {
 		if peer == nil {
 			peer = &SwimPeerState{
 				NodeID: nodeID,
-				State:  "degraded",
+				State:  "unknown",
 				Flags:  map[string]any{},
 			}
 			a.swimPeers[nodeID] = peer
@@ -925,14 +1295,44 @@ func (a *Agent) reconcileSWIM(ctx context.Context) map[string]any {
 	a.mu.Unlock()
 
 	probed := ""
+	indirectUsed := false
+	indirectSucceeded := false
+	indirectHelperCount := 0
 	if len(candidates) > 0 {
 		index := int(now.UnixNano() % int64(len(candidates)))
 		target := candidates[index]
 		probed = target.NodeID
 		ok := a.pingPeerSWIM(target.NodeID, target.MeshIP)
+		if !ok && a.cfg.SWIMIndirectProbeCount > 0 {
+			helpers := a.selectIndirectHelpers(
+				candidates,
+				target.NodeID,
+				index+1,
+				a.cfg.SWIMIndirectProbeCount,
+			)
+			indirectHelperCount = len(helpers)
+			if len(helpers) > 0 {
+				indirectUsed = true
+				if a.indirectProbeSWIM(target.NodeID, target.MeshIP, helpers) {
+					ok = true
+					indirectSucceeded = true
+					a.log.Info("agent.swim", "probe.indirect_ok", "Recovered peer via indirect probes", map[string]any{
+						"target_node_id": target.NodeID,
+						"helpers":        indirectHelperCount,
+					})
+				}
+			}
+		}
+		if indirectUsed && !indirectSucceeded {
+			a.log.Debug("agent.swim", "probe.indirect_miss", "Indirect probes did not recover target", map[string]any{
+				"target_node_id": target.NodeID,
+				"helpers":        indirectHelperCount,
+			})
+		}
 		a.mu.Lock()
 		peer := a.swimPeers[target.NodeID]
 		if peer != nil {
+			stateBefore := strings.ToLower(strings.TrimSpace(peer.State))
 			if ok {
 				peer.State = "healthy"
 				peer.Failures = 0
@@ -951,6 +1351,10 @@ func (a *Agent) reconcileSWIM(ctx context.Context) map[string]any {
 					peer.State = "degraded"
 				}
 			}
+			stateAfter := strings.ToLower(strings.TrimSpace(peer.State))
+			if stateAfter != "" && stateAfter != stateBefore {
+				peer.LastChanged = now
+			}
 		}
 		a.mu.Unlock()
 	}
@@ -959,15 +1363,22 @@ func (a *Agent) reconcileSWIM(ctx context.Context) map[string]any {
 	healthy := 0
 	degraded := 0
 	dead := 0
+	unknown := 0
 	a.mu.Lock()
 	for nodeID, peer := range a.swimPeers {
 		state := strings.ToLower(strings.TrimSpace(peer.State))
 		if state == "" {
 			state = "unknown"
 		}
+		// Do not emit control-plane discovered peers before the first direct/indirect probe result.
+		if state == "unknown" && peer.Failures == 0 && peer.LastSeen.IsZero() {
+			unknown++
+			continue
+		}
 		if state == "dead" && !peer.CooldownUntil.IsZero() && now.After(peer.CooldownUntil) {
 			state = "degraded"
 			peer.State = state
+			peer.LastChanged = now
 		}
 		peerStates[nodeID] = map[string]any{
 			"state":       state,
@@ -980,13 +1391,15 @@ func (a *Agent) reconcileSWIM(ctx context.Context) map[string]any {
 			healthy++
 		case "dead":
 			dead++
+		case "unknown":
+			unknown++
 		default:
 			degraded++
 		}
 	}
-	a.swimIncarnation++
 	localState := "healthy"
 	totalLoad := a.loadScores["total"]
+	previousLocalState := a.swimState
 	lastRoleRuntimeState := strings.TrimSpace(fmt.Sprintf("%v", a.lastStatusPatch["role_runtime_state"]))
 	lastCDNState := strings.TrimSpace(fmt.Sprintf("%v", a.lastStatusPatch["internal_cdn_state"]))
 	criticalError := strings.TrimSpace(a.lastHeartbeatError) != "" ||
@@ -996,6 +1409,9 @@ func (a *Agent) reconcileSWIM(ctx context.Context) map[string]any {
 	if criticalError || totalLoad >= 75 {
 		localState = "degraded"
 	}
+	if localState != previousLocalState {
+		a.swimIncarnation++
+	}
 	a.swimState = localState
 	localIncarnation := a.swimIncarnation
 	a.mu.Unlock()
@@ -1003,10 +1419,14 @@ func (a *Agent) reconcileSWIM(ctx context.Context) map[string]any {
 	patch["swim_state"] = localState
 	patch["swim_incarnation"] = localIncarnation
 	patch["swim_probe_target"] = probed
+	patch["swim_indirect_used"] = indirectUsed
+	patch["swim_indirect_success"] = indirectSucceeded
+	patch["swim_indirect_helper_count"] = indirectHelperCount
 	patch["swim_peer_count"] = len(peerStates)
 	patch["swim_healthy_peers"] = healthy
 	patch["swim_degraded_peers"] = degraded
 	patch["swim_dead_peers"] = dead
+	patch["swim_unknown_peers"] = unknown
 	patch["swim_peers"] = peerStates
 
 	a.reportSWIM(ctx, leaseToken, localIncarnation, localState, peerStates)
@@ -1034,50 +1454,71 @@ func (a *Agent) reportSWIM(
 		return
 	}
 	u := a.cfg.APIServerURL + "/cluster/swim/report"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
-	if err != nil {
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := a.client.Do(req)
-	if err != nil {
-		a.log.Warn("agent.swim", "report.error", "Failed to publish SWIM report", map[string]any{
-			"error": err.Error(),
-		})
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
+	backoff := 150 * time.Millisecond
+	for attempt := 1; attempt <= 3; attempt++ {
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
+		if reqErr != nil {
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, doErr := a.client.Do(req)
+		if doErr != nil {
+			if attempt < 3 {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(backoff):
+				}
+				backoff *= 2
+				continue
+			}
+			a.log.Warn("agent.swim", "report.error", "Failed to publish SWIM report", map[string]any{
+				"error": doErr.Error(),
+			})
+			return
+		}
 		bodyText, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		a.log.Warn("agent.swim", "report.error", "SWIM report rejected by API", map[string]any{
-			"status_code": resp.StatusCode,
-			"body":        strings.TrimSpace(string(bodyText)),
-		})
+		_ = resp.Body.Close()
+		if resp.StatusCode >= 500 && attempt < 3 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+			continue
+		}
+		if resp.StatusCode >= 300 {
+			a.log.Warn("agent.swim", "report.error", "SWIM report rejected by API", map[string]any{
+				"status_code": resp.StatusCode,
+				"body":        strings.TrimSpace(string(bodyText)),
+			})
+			return
+		}
 		return
 	}
 }
 
-func (a *Agent) syncInternalCDN(ctx context.Context) map[string]any {
+func (a *Agent) syncInternalCDN(ctx context.Context, leaseToken string) map[string]any {
 	patch := map[string]any{}
-	leaseToken, err := a.readLeaseToken()
-	if err != nil {
+	if strings.TrimSpace(leaseToken) == "" {
 		patch["internal_cdn_state"] = "degraded"
-		patch["internal_cdn_error"] = err.Error()
+		patch["internal_cdn_error"] = "lease token is empty"
 		return patch
 	}
+	a.mu.RLock()
+	knownHash := strings.TrimSpace(a.internalCDNHash)
+	a.mu.RUnlock()
 	u := fmt.Sprintf(
 		"%s/cluster/content/active?node_id=%s&lease_token=%s",
 		a.cfg.APIServerURL,
 		url.QueryEscape(a.cfg.NodeID),
 		url.QueryEscape(leaseToken),
 	)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		patch["internal_cdn_state"] = "degraded"
-		patch["internal_cdn_error"] = err.Error()
-		return patch
+	if knownHash != "" {
+		u += "&known_hash=" + url.QueryEscape(knownHash)
 	}
-	resp, err := a.client.Do(req)
+	resp, err := a.doGETWithRetry(ctx, u, 3)
 	if err != nil {
 		patch["internal_cdn_state"] = "degraded"
 		patch["internal_cdn_error"] = err.Error()
@@ -1105,6 +1546,28 @@ func (a *Agent) syncInternalCDN(ctx context.Context) map[string]any {
 	version := strings.TrimSpace(fmt.Sprintf("%v", payload["version"]))
 	hashSHA := strings.TrimSpace(fmt.Sprintf("%v", payload["hash_sha256"]))
 	bodyBase64 := strings.TrimSpace(fmt.Sprintf("%v", payload["body_base64"]))
+	sizeBytes, _ := payload["size_bytes"].(float64)
+	targetDir := filepath.Join(strings.TrimSpace(a.cfg.InternalCDNDir), "active")
+	if targetDir == "" {
+		targetDir = "data/internal-cdn/active"
+	}
+	indexPath := filepath.Join(targetDir, "index.html")
+	if hashSHA != "" && hashSHA == knownHash {
+		if _, statErr := os.Stat(indexPath); statErr == nil {
+			patch["internal_cdn_state"] = "healthy"
+			patch["internal_cdn_version"] = firstNonEmpty(version, a.internalCDNVersion)
+			patch["internal_cdn_hash"] = hashSHA
+			patch["internal_cdn_size_bytes"] = int(sizeBytes)
+			patch["internal_cdn_path"] = indexPath
+			patch["internal_cdn_unchanged"] = true
+			return patch
+		}
+	}
+	if bodyBase64 == "" {
+		patch["internal_cdn_state"] = "degraded"
+		patch["internal_cdn_error"] = "missing_content_payload"
+		return patch
+	}
 	raw, err := base64.StdEncoding.DecodeString(bodyBase64)
 	if err != nil {
 		patch["internal_cdn_state"] = "degraded"
@@ -1118,16 +1581,11 @@ func (a *Agent) syncInternalCDN(ctx context.Context) map[string]any {
 		patch["internal_cdn_error"] = "hash_mismatch"
 		return patch
 	}
-	targetDir := filepath.Join(strings.TrimSpace(a.cfg.InternalCDNDir), "active")
-	if targetDir == "" {
-		targetDir = "data/internal-cdn/active"
-	}
 	if err := os.MkdirAll(targetDir, 0o755); err != nil {
 		patch["internal_cdn_state"] = "degraded"
 		patch["internal_cdn_error"] = err.Error()
 		return patch
 	}
-	indexPath := filepath.Join(targetDir, "index.html")
 	if err := os.WriteFile(indexPath, raw, 0o644); err != nil {
 		patch["internal_cdn_state"] = "degraded"
 		patch["internal_cdn_error"] = err.Error()
@@ -1478,7 +1936,13 @@ func readNetworkCounters(iface string) (uint64, uint64, uint64, uint64, uint64, 
 		return rxBytes, txBytes, rxPackets, txPackets, rxErr + rxDrop, txErr + txDrop, name
 	}
 
-	fallback := ""
+	fallbackIface := ""
+	var fallbackRxBytes uint64
+	var fallbackTxBytes uint64
+	var fallbackRxPackets uint64
+	var fallbackTxPackets uint64
+	var fallbackRxDropErr uint64
+	var fallbackTxDropErr uint64
 	for _, line := range strings.Split(string(raw), "\n") {
 		if !strings.Contains(line, ":") {
 			continue
@@ -1490,23 +1954,20 @@ func readNetworkCounters(iface string) (uint64, uint64, uint64, uint64, uint64, 
 		if iface != "" && name == iface {
 			return rxBytes, txBytes, rxPackets, txPackets, rxDropErr, txDropErr, name
 		}
-		if fallback == "" {
-			fallback = name
+		if fallbackIface == "" {
+			fallbackIface = name
+			fallbackRxBytes = rxBytes
+			fallbackTxBytes = txBytes
+			fallbackRxPackets = rxPackets
+			fallbackTxPackets = txPackets
+			fallbackRxDropErr = rxDropErr
+			fallbackTxDropErr = txDropErr
 		}
 	}
-	if fallback == "" {
+	if fallbackIface == "" {
 		return 0, 0, 0, 0, 0, 0, ""
 	}
-	for _, line := range strings.Split(string(raw), "\n") {
-		if !strings.Contains(line, ":") {
-			continue
-		}
-		rxBytes, txBytes, rxPackets, txPackets, rxDropErr, txDropErr, name := parseLine(line)
-		if name == fallback {
-			return rxBytes, txBytes, rxPackets, txPackets, rxDropErr, txDropErr, name
-		}
-	}
-	return 0, 0, 0, 0, 0, 0, ""
+	return fallbackRxBytes, fallbackTxBytes, fallbackRxPackets, fallbackTxPackets, fallbackRxDropErr, fallbackTxDropErr, fallbackIface
 }
 
 func readInterfaceCapacityBps(iface string) float64 {
@@ -1603,15 +2064,15 @@ func (a *Agent) collectLoadSnapshot() *loadSnapshot {
 // computeLoadScores calculates normalized subsystem load scores (0..100) and total load.
 //
 // Design:
-// 1. For each subsystem we normalize each component to [0,1] with explicit good/bad thresholds.
-// 2. The subsystem score is:
-//      score = 100 * max(peak_component, weighted_average_components)
-//    This guarantees single-metric spikes elevate the subsystem score.
-// 3. TOTAL score uses the agreed formula:
-//      S = [cpu, ram, disk, net]
-//      mx = max(S)
-//      union = 100 * (1 - Π(1 - s/100))
-//      total = max(mx, 0.70*mx + 0.30*union)
+//  1. For each subsystem we normalize each component to [0,1] with explicit good/bad thresholds.
+//  2. The subsystem score is:
+//     score = 100 * max(peak_component, weighted_average_components)
+//     This guarantees single-metric spikes elevate the subsystem score.
+//  3. TOTAL score uses the agreed formula:
+//     S = [cpu, ram, disk, net]
+//     mx = max(S)
+//     union = 100 * (1 - Π(1 - s/100))
+//     total = max(mx, 0.70*mx + 0.30*union)
 func computeLoadScores(prev *loadSnapshot, curr *loadSnapshot) map[string]float64 {
 	if curr == nil {
 		return map[string]float64{
@@ -1763,7 +2224,7 @@ func (a *Agent) swimLoadFlags() map[string]any {
 }
 
 func (a *Agent) reconcileLoadScores() map[string]any {
-	cacheTTL := time.Duration(max(1, a.cfg.HeartbeatIntervalSeconds)) * time.Second
+	cacheTTL := time.Duration(maxInt(1, a.cfg.HeartbeatIntervalSeconds)) * time.Second
 	a.mu.RLock()
 	cachedAt := a.loadScoresComputed
 	cachedScores := map[string]float64{
@@ -1835,11 +2296,16 @@ func (a *Agent) reconcileLoadScores() map[string]any {
 	}
 }
 
-func (a *Agent) syncRoleAssignment(ctx context.Context) map[string]any {
+func (a *Agent) syncRoleAssignment(
+	ctx context.Context,
+	leaseToken string,
+	peersFetched bool,
+	peersRaw []map[string]any,
+	peersErr error,
+) map[string]any {
 	patch := map[string]any{}
-	leaseToken, err := a.readLeaseToken()
-	if err != nil {
-		patch["role_assignment_error"] = err.Error()
+	if strings.TrimSpace(leaseToken) == "" {
+		patch["role_assignment_error"] = "lease token is empty"
 		return patch
 	}
 	u := fmt.Sprintf(
@@ -1848,12 +2314,7 @@ func (a *Agent) syncRoleAssignment(ctx context.Context) map[string]any {
 		url.QueryEscape(a.cfg.NodeID),
 		url.QueryEscape(leaseToken),
 	)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		patch["role_assignment_error"] = err.Error()
-		return patch
-	}
-	resp, err := a.client.Do(req)
+	resp, err := a.doGETWithRetry(ctx, u, 3)
 	if err != nil {
 		patch["role_assignment_error"] = err.Error()
 		return patch
@@ -1902,7 +2363,9 @@ func (a *Agent) syncRoleAssignment(ctx context.Context) map[string]any {
 
 	peerByNodeID := map[string]string{}
 	if len(backendNodeIDs) > 0 {
-		peersRaw, peersErr := a.fetchClusterPeers(ctx, leaseToken)
+		if !peersFetched && peersErr == nil {
+			peersRaw, peersErr = a.fetchClusterPeers(ctx, leaseToken)
+		}
 		if peersErr != nil {
 			patch["backend_targets_error"] = peersErr.Error()
 		} else {
@@ -1980,6 +2443,8 @@ func (a *Agent) reconcileBackendRuntime(ctx context.Context, enabled bool) map[s
 	patch := map[string]any{
 		"backend_runtime_state": "not_assigned",
 	}
+	templateHash := ""
+	setRoleActuationStatus(patch, "backend_server", false, templateHash, 0, "not_assigned")
 	if !enabled {
 		return patch
 	}
@@ -1992,9 +2457,13 @@ func (a *Agent) reconcileBackendRuntime(ctx context.Context, enabled bool) map[s
 	if err := os.MkdirAll(contentRoot, 0o755); err != nil {
 		patch["backend_runtime_state"] = "degraded"
 		patch["backend_runtime_error"] = err.Error()
-		a.log.Warn("agent.roles", "backend.prepare_error", "Failed preparing backend content directory", map[string]any{
-			"path":  contentRoot,
-			"error": err.Error(),
+		setRoleActuationStatus(patch, "backend_server", false, templateHash, -1, err.Error())
+		a.log.Warn("agent.roles", "role.backend_server.apply", "Backend role apply failed", map[string]any{
+			"apply_ok":         false,
+			"template_hash":    templateHash,
+			"reload_exit_code": -1,
+			"error":            err.Error(),
+			"path":             contentRoot,
 		})
 		return patch
 	}
@@ -2011,12 +2480,32 @@ server {
     }
 }
 `, a.cfg.BackendListenPort, contentRoot)
+	templateHash = hashTemplate(config)
+	a.mu.RLock()
+	lastTemplateHash := strings.TrimSpace(a.lastBackendHash)
+	a.mu.RUnlock()
+	if templateHash != "" && templateHash == lastTemplateHash {
+		code, _, _ := a.runCommand(ctx, "backend.nginx_active", "systemctl", "is-active", "--quiet", "nginx")
+		if code == 0 {
+			setRoleActuationStatus(patch, "backend_server", true, templateHash, 0, "")
+			patch["backend_runtime_state"] = "healthy"
+			patch["backend_runtime_config_path"] = configPath
+			patch["backend_runtime_content_root"] = contentRoot
+			patch["backend_runtime_port"] = a.cfg.BackendListenPort
+			patch["backend_runtime_config_unchanged"] = true
+			return patch
+		}
+	}
 	if err := os.WriteFile(configPath, []byte(config), 0o644); err != nil {
 		patch["backend_runtime_state"] = "degraded"
 		patch["backend_runtime_error"] = err.Error()
-		a.log.Warn("agent.roles", "backend.config_write_error", "Failed writing backend NGINX config", map[string]any{
-			"path":  configPath,
-			"error": err.Error(),
+		setRoleActuationStatus(patch, "backend_server", false, templateHash, -1, err.Error())
+		a.log.Warn("agent.roles", "role.backend_server.apply", "Backend role apply failed", map[string]any{
+			"apply_ok":         false,
+			"template_hash":    templateHash,
+			"reload_exit_code": -1,
+			"error":            err.Error(),
+			"path":             configPath,
 		})
 		return patch
 	}
@@ -2025,9 +2514,20 @@ server {
 	if code != 0 {
 		patch["backend_runtime_state"] = "degraded"
 		patch["backend_runtime_error"] = firstNonEmpty(errText, out, fmt.Sprintf("exit_%d", code))
-		a.log.Warn("agent.roles", "backend.validate_error", "NGINX config validation failed", map[string]any{
-			"config_path": configPath,
-			"error":       patch["backend_runtime_error"],
+		setRoleActuationStatus(
+			patch,
+			"backend_server",
+			false,
+			templateHash,
+			code,
+			fmt.Sprintf("%v", patch["backend_runtime_error"]),
+		)
+		a.log.Warn("agent.roles", "role.backend_server.apply", "Backend role apply failed", map[string]any{
+			"apply_ok":         false,
+			"template_hash":    templateHash,
+			"reload_exit_code": code,
+			"error":            patch["backend_runtime_error"],
+			"config_path":      configPath,
 		})
 		return patch
 	}
@@ -2036,8 +2536,19 @@ server {
 	if code != 0 {
 		patch["backend_runtime_state"] = "degraded"
 		patch["backend_runtime_error"] = firstNonEmpty(errText, out, fmt.Sprintf("exit_%d", code))
-		a.log.Warn("agent.roles", "backend.enable_error", "Failed enabling backend nginx service", map[string]any{
-			"error": patch["backend_runtime_error"],
+		setRoleActuationStatus(
+			patch,
+			"backend_server",
+			false,
+			templateHash,
+			code,
+			fmt.Sprintf("%v", patch["backend_runtime_error"]),
+		)
+		a.log.Warn("agent.roles", "role.backend_server.apply", "Backend role apply failed", map[string]any{
+			"apply_ok":         false,
+			"template_hash":    templateHash,
+			"reload_exit_code": code,
+			"error":            patch["backend_runtime_error"],
 		})
 		return patch
 	}
@@ -2048,17 +2559,36 @@ server {
 		if code != 0 {
 			patch["backend_runtime_state"] = "degraded"
 			patch["backend_runtime_error"] = firstNonEmpty(errText, out, fmt.Sprintf("exit_%d", code))
-			a.log.Warn("agent.roles", "backend.reload_error", "Failed reloading backend nginx service", map[string]any{
-				"error": patch["backend_runtime_error"],
+			setRoleActuationStatus(
+				patch,
+				"backend_server",
+				false,
+				templateHash,
+				code,
+				fmt.Sprintf("%v", patch["backend_runtime_error"]),
+			)
+			a.log.Warn("agent.roles", "role.backend_server.apply", "Backend role apply failed", map[string]any{
+				"apply_ok":         false,
+				"template_hash":    templateHash,
+				"reload_exit_code": code,
+				"error":            patch["backend_runtime_error"],
 			})
 			return patch
 		}
 	}
 
-	a.log.Info("agent.roles", "backend.ready", "Backend runtime reconciled", map[string]any{
-		"config_path":  configPath,
-		"content_root": contentRoot,
-		"listen_port":  a.cfg.BackendListenPort,
+	setRoleActuationStatus(patch, "backend_server", true, templateHash, 0, "")
+	a.mu.Lock()
+	a.lastBackendHash = templateHash
+	a.mu.Unlock()
+	a.log.Info("agent.roles", "role.backend_server.apply", "Backend role apply succeeded", map[string]any{
+		"apply_ok":         true,
+		"template_hash":    templateHash,
+		"reload_exit_code": 0,
+		"error":            "",
+		"config_path":      configPath,
+		"content_root":     contentRoot,
+		"listen_port":      a.cfg.BackendListenPort,
 	})
 	patch["backend_runtime_state"] = "healthy"
 	patch["backend_runtime_config_path"] = configPath
@@ -2071,6 +2601,8 @@ func (a *Agent) reconcileProxyRuntime(ctx context.Context, enabled bool, upstrea
 	patch := map[string]any{
 		"proxy_runtime_state": "not_assigned",
 	}
+	templateHash := ""
+	setRoleActuationStatus(patch, "reverse_proxy", false, templateHash, 0, "not_assigned")
 	if !enabled {
 		return patch
 	}
@@ -2078,7 +2610,13 @@ func (a *Agent) reconcileProxyRuntime(ctx context.Context, enabled bool, upstrea
 	if len(upstreams) == 0 {
 		patch["proxy_runtime_state"] = "degraded"
 		patch["proxy_runtime_error"] = "no_backend_targets"
-		a.log.Warn("agent.roles", "proxy.targets_missing", "Reverse proxy has no backend targets", nil)
+		setRoleActuationStatus(patch, "reverse_proxy", false, templateHash, -1, "no_backend_targets")
+		a.log.Warn("agent.roles", "role.reverse_proxy.apply", "Reverse proxy role apply failed", map[string]any{
+			"apply_ok":         false,
+			"template_hash":    templateHash,
+			"reload_exit_code": -1,
+			"error":            "no_backend_targets",
+		})
 		return patch
 	}
 
@@ -2092,12 +2630,32 @@ func (a *Agent) reconcileProxyRuntime(ctx context.Context, enabled bool, upstrea
 	builder.WriteString("    reverse_proxy ")
 	builder.WriteString(strings.Join(upstreams, " "))
 	builder.WriteString("\n}\n")
+	templateHash = hashTemplate(builder.String())
+	a.mu.RLock()
+	lastTemplateHash := strings.TrimSpace(a.lastProxyHash)
+	a.mu.RUnlock()
+	if templateHash != "" && templateHash == lastTemplateHash {
+		code, _, _ := a.runCommand(ctx, "proxy.caddy_active", "systemctl", "is-active", "--quiet", "caddy")
+		if code == 0 {
+			setRoleActuationStatus(patch, "reverse_proxy", true, templateHash, 0, "")
+			patch["proxy_runtime_state"] = "healthy"
+			patch["proxy_runtime_config_path"] = configPath
+			patch["proxy_runtime_port"] = a.cfg.ProxyListenPort
+			patch["proxy_runtime_targets"] = upstreams
+			patch["proxy_runtime_config_unchanged"] = true
+			return patch
+		}
+	}
 	if err := os.WriteFile(configPath, []byte(builder.String()), 0o644); err != nil {
 		patch["proxy_runtime_state"] = "degraded"
 		patch["proxy_runtime_error"] = err.Error()
-		a.log.Warn("agent.roles", "proxy.config_write_error", "Failed writing Caddy config", map[string]any{
-			"path":  configPath,
-			"error": err.Error(),
+		setRoleActuationStatus(patch, "reverse_proxy", false, templateHash, -1, err.Error())
+		a.log.Warn("agent.roles", "role.reverse_proxy.apply", "Reverse proxy role apply failed", map[string]any{
+			"apply_ok":         false,
+			"template_hash":    templateHash,
+			"reload_exit_code": -1,
+			"error":            err.Error(),
+			"path":             configPath,
 		})
 		return patch
 	}
@@ -2106,9 +2664,20 @@ func (a *Agent) reconcileProxyRuntime(ctx context.Context, enabled bool, upstrea
 	if code != 0 {
 		patch["proxy_runtime_state"] = "degraded"
 		patch["proxy_runtime_error"] = firstNonEmpty(errText, out, fmt.Sprintf("exit_%d", code))
-		a.log.Warn("agent.roles", "proxy.validate_error", "Caddy config validation failed", map[string]any{
-			"config_path": configPath,
-			"error":       patch["proxy_runtime_error"],
+		setRoleActuationStatus(
+			patch,
+			"reverse_proxy",
+			false,
+			templateHash,
+			code,
+			fmt.Sprintf("%v", patch["proxy_runtime_error"]),
+		)
+		a.log.Warn("agent.roles", "role.reverse_proxy.apply", "Reverse proxy role apply failed", map[string]any{
+			"apply_ok":         false,
+			"template_hash":    templateHash,
+			"reload_exit_code": code,
+			"error":            patch["proxy_runtime_error"],
+			"config_path":      configPath,
 		})
 		return patch
 	}
@@ -2117,8 +2686,19 @@ func (a *Agent) reconcileProxyRuntime(ctx context.Context, enabled bool, upstrea
 	if code != 0 {
 		patch["proxy_runtime_state"] = "degraded"
 		patch["proxy_runtime_error"] = firstNonEmpty(errText, out, fmt.Sprintf("exit_%d", code))
-		a.log.Warn("agent.roles", "proxy.enable_error", "Failed enabling caddy service", map[string]any{
-			"error": patch["proxy_runtime_error"],
+		setRoleActuationStatus(
+			patch,
+			"reverse_proxy",
+			false,
+			templateHash,
+			code,
+			fmt.Sprintf("%v", patch["proxy_runtime_error"]),
+		)
+		a.log.Warn("agent.roles", "role.reverse_proxy.apply", "Reverse proxy role apply failed", map[string]any{
+			"apply_ok":         false,
+			"template_hash":    templateHash,
+			"reload_exit_code": code,
+			"error":            patch["proxy_runtime_error"],
 		})
 		return patch
 	}
@@ -2129,17 +2709,36 @@ func (a *Agent) reconcileProxyRuntime(ctx context.Context, enabled bool, upstrea
 		if code != 0 {
 			patch["proxy_runtime_state"] = "degraded"
 			patch["proxy_runtime_error"] = firstNonEmpty(errText, out, fmt.Sprintf("exit_%d", code))
-			a.log.Warn("agent.roles", "proxy.reload_error", "Failed reloading caddy service", map[string]any{
-				"error": patch["proxy_runtime_error"],
+			setRoleActuationStatus(
+				patch,
+				"reverse_proxy",
+				false,
+				templateHash,
+				code,
+				fmt.Sprintf("%v", patch["proxy_runtime_error"]),
+			)
+			a.log.Warn("agent.roles", "role.reverse_proxy.apply", "Reverse proxy role apply failed", map[string]any{
+				"apply_ok":         false,
+				"template_hash":    templateHash,
+				"reload_exit_code": code,
+				"error":            patch["proxy_runtime_error"],
 			})
 			return patch
 		}
 	}
 
-	a.log.Info("agent.roles", "proxy.ready", "Reverse proxy runtime reconciled", map[string]any{
-		"config_path": configPath,
-		"listen_port": a.cfg.ProxyListenPort,
-		"targets":     strings.Join(upstreams, ","),
+	setRoleActuationStatus(patch, "reverse_proxy", true, templateHash, 0, "")
+	a.mu.Lock()
+	a.lastProxyHash = templateHash
+	a.mu.Unlock()
+	a.log.Info("agent.roles", "role.reverse_proxy.apply", "Reverse proxy role apply succeeded", map[string]any{
+		"apply_ok":         true,
+		"template_hash":    templateHash,
+		"reload_exit_code": 0,
+		"error":            "",
+		"config_path":      configPath,
+		"listen_port":      a.cfg.ProxyListenPort,
+		"targets":          strings.Join(upstreams, ","),
 	})
 	patch["proxy_runtime_state"] = "healthy"
 	patch["proxy_runtime_config_path"] = configPath
@@ -2258,6 +2857,36 @@ func (a *Agent) tick(ctx context.Context) error {
 		"agent_version":         agentVersion,
 		"agent_loop_at":         time.Now().UTC().Format(time.RFC3339Nano),
 	}
+	leaseToken := ""
+	leaseErr := error(nil)
+	privateKey := crypto.PrivateKey(nil)
+	privateKeyErr := error(nil)
+	leaseToken, leaseErr = a.readLeaseToken()
+	if leaseErr != nil {
+		statusPatch["lease_token_error"] = leaseErr.Error()
+		a.log.Warn("agent.identity", "lease.read_error", "Failed to read node lease token", map[string]any{
+			"error": leaseErr.Error(),
+		})
+	}
+	privateKey, privateKeyErr = a.readNodePrivateKey()
+	if privateKeyErr != nil {
+		statusPatch["identity_key_error"] = privateKeyErr.Error()
+		a.log.Warn("agent.identity", "key.read_error", "Failed to read node private key", map[string]any{
+			"error": privateKeyErr.Error(),
+		})
+	}
+	peersRaw := []map[string]any{}
+	peersErr := error(nil)
+	peersFetched := false
+	if leaseErr == nil && a.cfg.SWIMEnabled {
+		peersFetched = true
+		peersRaw, peersErr = a.fetchClusterPeers(ctx, leaseToken)
+		if peersErr != nil {
+			a.log.Warn("agent.cluster", "peer.fetch_error", "Failed to fetch cluster peers for tick cache", map[string]any{
+				"error": peersErr.Error(),
+			})
+		}
+	}
 
 	loadPatch := a.reconcileLoadScores()
 	for k, v := range loadPatch {
@@ -2273,16 +2902,16 @@ func (a *Agent) tick(ctx context.Context) error {
 		a.log.Info("agent.wireguard", "reconcile.skip", "WireGuard reconcile disabled", nil)
 	}
 	if a.cfg.SWIMEnabled {
-		swimPatch := a.reconcileSWIM(ctx)
+		swimPatch := a.reconcileSWIM(ctx, leaseToken, peersRaw, peersErr)
 		for k, v := range swimPatch {
 			statusPatch[k] = v
 		}
 	}
-	rolePatch := a.syncRoleAssignment(ctx)
+	rolePatch := a.syncRoleAssignment(ctx, leaseToken, peersFetched, peersRaw, peersErr)
 	for k, v := range rolePatch {
 		statusPatch[k] = v
 	}
-	cdnPatch := a.syncInternalCDN(ctx)
+	cdnPatch := a.syncInternalCDN(ctx, leaseToken)
 	for k, v := range cdnPatch {
 		statusPatch[k] = v
 	}
@@ -2297,7 +2926,23 @@ func (a *Agent) tick(ctx context.Context) error {
 	}
 	a.mu.Unlock()
 
-	if err := a.sendHeartbeat(ctx, statusPatch); err != nil {
+	if leaseErr != nil {
+		a.mu.Lock()
+		a.lastTickAt = time.Now().UTC()
+		a.lastTickDurationMs = time.Since(start).Milliseconds()
+		a.lastTickError = leaseErr.Error()
+		a.mu.Unlock()
+		return leaseErr
+	}
+	if privateKeyErr != nil {
+		a.mu.Lock()
+		a.lastTickAt = time.Now().UTC()
+		a.lastTickDurationMs = time.Since(start).Milliseconds()
+		a.lastTickError = privateKeyErr.Error()
+		a.mu.Unlock()
+		return privateKeyErr
+	}
+	if err := a.sendHeartbeat(ctx, leaseToken, privateKey, statusPatch); err != nil {
 		a.mu.Lock()
 		a.lastTickAt = time.Now().UTC()
 		a.lastTickDurationMs = time.Since(start).Milliseconds()
@@ -2316,7 +2961,7 @@ func (a *Agent) tick(ctx context.Context) error {
 	a.mu.Unlock()
 
 	a.log.Info("agent.loop", "tick.complete", "Completed loop tick", map[string]any{
-		"duration_ms": time.Since(start).Milliseconds(),
+		"duration_ms":  time.Since(start).Milliseconds(),
 		"active_iface": activeIface,
 	})
 	return nil
@@ -2345,27 +2990,27 @@ func (a *Agent) reconcileWireGuard(ctx context.Context) map[string]any {
 		a.mu.Unlock()
 
 		a.log.Info("agent.wireguard", "reconcile.skip_unconfigured", "Skipped WireGuard reconcile (no peer public keys configured)", map[string]any{
-			"primary_iface":          a.cfg.PrimaryIface,
-			"secondary_iface":        a.cfg.SecondaryIface,
-			"primary_peer_endpoint":  primaryPeer.endpoint,
+			"primary_iface":           a.cfg.PrimaryIface,
+			"secondary_iface":         a.cfg.SecondaryIface,
+			"primary_peer_endpoint":   primaryPeer.endpoint,
 			"secondary_peer_endpoint": secondaryPeer.endpoint,
 		})
 		return map[string]any{
-			"wg_primary_tunnel":            "down",
-			"wg_secondary_tunnel":          "down",
-			"wg_primary_health":            false,
-			"wg_secondary_health":          false,
-			"wg_primary_router_reachable":  false,
+			"wg_primary_tunnel":             "down",
+			"wg_secondary_tunnel":           "down",
+			"wg_primary_health":             false,
+			"wg_secondary_health":           false,
+			"wg_primary_router_reachable":   false,
 			"wg_secondary_router_reachable": false,
-			"wg_active_route":              activeIface,
-			"wg_failover_state":            "unconfigured",
-			"wg_primary_public_key":        "",
-			"wg_secondary_public_key":      "",
-			"wg_public_key":                "",
-			"wg_primary_peer_endpoint":     primaryPeer.endpoint,
-			"wg_secondary_peer_endpoint":   secondaryPeer.endpoint,
-			"wg_primary_peer_configured":   false,
-			"wg_secondary_peer_configured": false,
+			"wg_active_route":               activeIface,
+			"wg_failover_state":             "unconfigured",
+			"wg_primary_public_key":         "",
+			"wg_secondary_public_key":       "",
+			"wg_public_key":                 "",
+			"wg_primary_peer_endpoint":      primaryPeer.endpoint,
+			"wg_secondary_peer_endpoint":    secondaryPeer.endpoint,
+			"wg_primary_peer_configured":    false,
+			"wg_secondary_peer_configured":  false,
 		}
 	}
 
@@ -2477,7 +3122,6 @@ func (a *Agent) reconcileWireGuard(ctx context.Context) map[string]any {
 	a.mu.Unlock()
 
 	if activeAfter != activeBefore && (primaryIfaceConfigured || secondaryIfaceConfigured) {
-		a.applyRouteMetrics(ctx, activeAfter)
 		switch failoverEvent {
 		case "failover.engage":
 			a.log.Warn("agent.wireguard", failoverEvent, "Switched active route to secondary", eventFields)
@@ -2497,32 +3141,32 @@ func (a *Agent) reconcileWireGuard(ctx context.Context) map[string]any {
 	}
 
 	patch := map[string]any{
-		"wg_primary_tunnel":            upDown(primaryUp),
-		"wg_secondary_tunnel":          upDown(secondaryUp),
-		"wg_primary_health":            primaryHealthy,
-		"wg_secondary_health":          secondaryHealthy,
-		"wg_primary_router_reachable":  primaryHealthy,
+		"wg_primary_tunnel":             upDown(primaryUp),
+		"wg_secondary_tunnel":           upDown(secondaryUp),
+		"wg_primary_health":             primaryHealthy,
+		"wg_secondary_health":           secondaryHealthy,
+		"wg_primary_router_reachable":   primaryHealthy,
 		"wg_secondary_router_reachable": secondaryHealthy,
-		"wg_active_route":              activeAfter,
-		"wg_failover_state":            failoverState,
-		"wg_primary_public_key":        primaryPublicKey,
-		"wg_secondary_public_key":      secondaryPublicKey,
-		"wg_public_key":                firstNonEmpty(primaryPublicKey, secondaryPublicKey),
-		"wg_primary_peer_endpoint":     primaryPeer.endpoint,
-		"wg_secondary_peer_endpoint":   secondaryPeer.endpoint,
-		"wg_primary_peer_configured":   primaryPeerConfigured,
-		"wg_secondary_peer_configured": secondaryPeerConfigured,
+		"wg_active_route":               activeAfter,
+		"wg_failover_state":             failoverState,
+		"wg_primary_public_key":         primaryPublicKey,
+		"wg_secondary_public_key":       secondaryPublicKey,
+		"wg_public_key":                 firstNonEmpty(primaryPublicKey, secondaryPublicKey),
+		"wg_primary_peer_endpoint":      primaryPeer.endpoint,
+		"wg_secondary_peer_endpoint":    secondaryPeer.endpoint,
+		"wg_primary_peer_configured":    primaryPeerConfigured,
+		"wg_secondary_peer_configured":  secondaryPeerConfigured,
 	}
 	a.log.Info("agent.wireguard", "reconcile.status", "Reconciled WireGuard status", map[string]any{
-		"primary_up":         primaryUp,
-		"secondary_up":       secondaryUp,
-		"primary_healthy":    primaryHealthy,
-		"secondary_healthy":  secondaryHealthy,
-		"active_iface":       activeAfter,
-		"failover_state":     failoverState,
-		"primary_failures":   primaryFailures,
-		"primary_successes":  primarySuccesses,
-		"secondary_failures": secondaryFailures,
+		"primary_up":          primaryUp,
+		"secondary_up":        secondaryUp,
+		"primary_healthy":     primaryHealthy,
+		"secondary_healthy":   secondaryHealthy,
+		"active_iface":        activeAfter,
+		"failover_state":      failoverState,
+		"primary_failures":    primaryFailures,
+		"primary_successes":   primarySuccesses,
+		"secondary_failures":  secondaryFailures,
 		"secondary_successes": secondarySuccesses,
 	})
 	return patch
@@ -2546,6 +3190,26 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func hashTemplate(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func setRoleActuationStatus(
+	patch map[string]any,
+	roleName string,
+	applyOK bool,
+	templateHash string,
+	reloadExitCode int,
+	errText string,
+) {
+	base := fmt.Sprintf("role.%s.", strings.TrimSpace(roleName))
+	patch[base+"apply_ok"] = applyOK
+	patch[base+"template_hash"] = strings.TrimSpace(templateHash)
+	patch[base+"reload_exit_code"] = reloadExitCode
+	patch[base+"error"] = strings.TrimSpace(errText)
 }
 
 func hasRole(roles []string, target string) bool {
@@ -2585,15 +3249,15 @@ func (a *Agent) peerIntents() (wgPeerIntent, wgPeerIntent) {
 		allowed = strings.TrimSpace(a.cfg.MeshCIDR)
 	}
 	primary := wgPeerIntent{
-		publicKey:          strings.TrimSpace(a.cfg.PrimaryPeerPublicKey),
-		endpoint:           strings.TrimSpace(a.cfg.PrimaryPeerEndpoint),
-		allowedIPs:         allowed,
+		publicKey:           strings.TrimSpace(a.cfg.PrimaryPeerPublicKey),
+		endpoint:            strings.TrimSpace(a.cfg.PrimaryPeerEndpoint),
+		allowedIPs:          allowed,
 		persistentKeepalive: a.cfg.PersistentKeepaliveSeconds,
 	}
 	secondary := wgPeerIntent{
-		publicKey:          strings.TrimSpace(a.cfg.SecondaryPeerPublicKey),
-		endpoint:           strings.TrimSpace(a.cfg.SecondaryPeerEndpoint),
-		allowedIPs:         allowed,
+		publicKey:           strings.TrimSpace(a.cfg.SecondaryPeerPublicKey),
+		endpoint:            strings.TrimSpace(a.cfg.SecondaryPeerEndpoint),
+		allowedIPs:          allowed,
 		persistentKeepalive: a.cfg.PersistentKeepaliveSeconds,
 	}
 	if primary.endpoint == "" && strings.TrimSpace(a.cfg.PrimaryRouterIP) != "" {
@@ -2628,9 +3292,6 @@ func (a *Agent) ensureWireGuardKey(ctx context.Context, iface string) (string, e
 	key := strings.TrimSpace(out) + "\n"
 	if writeErr := os.WriteFile(keyPath, []byte(key), 0o600); writeErr != nil {
 		return "", writeErr
-	}
-	if chmodErr := os.Chmod(keyPath, 0o600); chmodErr != nil {
-		return "", chmodErr
 	}
 	a.log.Info("agent.wireguard", "key.create", "Generated WireGuard private key", map[string]any{
 		"iface":    iface,
@@ -2774,7 +3435,7 @@ func (a *Agent) interfaceUp(ctx context.Context, iface string) bool {
 }
 
 func (a *Agent) pingRouter(ctx context.Context, iface, ip string) bool {
-	timeout := strconv.Itoa(max(1, a.cfg.PingTimeoutSeconds))
+	timeout := strconv.Itoa(maxInt(1, a.cfg.PingTimeoutSeconds))
 	code, _, _ := a.runCommand(ctx, "wireguard.router.ping", "ping", "-I", iface, "-c", "1", "-W", timeout, ip)
 	return code == 0
 }
@@ -2811,25 +3472,12 @@ func (a *Agent) runCommand(ctx context.Context, event string, name string, args 
 	return 0, out, errText
 }
 
-func (a *Agent) sendHeartbeat(ctx context.Context, statusPatch map[string]any) error {
-	keyPath := filepath.Join(a.cfg.IdentityDir, a.cfg.NodeID, "node.key")
-	leasePath := filepath.Join(a.cfg.IdentityDir, a.cfg.NodeID, "lease.token")
-
-	keyRaw, err := os.ReadFile(keyPath)
-	if err != nil {
-		a.mu.Lock()
-		a.lastHeartbeatError = err.Error()
-		a.mu.Unlock()
-		return fmt.Errorf("read key: %w", err)
-	}
-	leaseTokenRaw, err := os.ReadFile(leasePath)
-	if err != nil {
-		a.mu.Lock()
-		a.lastHeartbeatError = err.Error()
-		a.mu.Unlock()
-		return fmt.Errorf("read lease token: %w", err)
-	}
-	leaseToken := strings.TrimSpace(string(leaseTokenRaw))
+func (a *Agent) sendHeartbeat(
+	ctx context.Context,
+	leaseToken string,
+	privateKey crypto.PrivateKey,
+	statusPatch map[string]any,
+) error {
 	if leaseToken == "" {
 		a.mu.Lock()
 		a.lastHeartbeatError = "lease token is empty"
@@ -2837,87 +3485,107 @@ func (a *Agent) sendHeartbeat(ctx context.Context, statusPatch map[string]any) e
 		return errors.New("lease token is empty")
 	}
 
-	privateKey, err := parsePrivateKey(keyRaw)
-	if err != nil {
-		a.mu.Lock()
-		a.lastHeartbeatError = err.Error()
-		a.mu.Unlock()
-		return fmt.Errorf("parse key: %w", err)
-	}
-
-	signedAt := time.Now().Unix()
-	message, err := heartbeatSigningMessage(a.cfg.NodeID, leaseToken, signedAt, a.cfg.HeartbeatTTLSeconds, statusPatch)
-	if err != nil {
-		a.mu.Lock()
-		a.lastHeartbeatError = err.Error()
-		a.mu.Unlock()
-		return fmt.Errorf("build message: %w", err)
-	}
-	signature, err := signMessage(privateKey, message)
-	if err != nil {
-		a.mu.Lock()
-		a.lastHeartbeatError = err.Error()
-		a.mu.Unlock()
-		return fmt.Errorf("sign message: %w", err)
-	}
-
-	bodyMap := map[string]any{
-		"node_id":     a.cfg.NodeID,
-		"lease_token": leaseToken,
-		"ttl_seconds": a.cfg.HeartbeatTTLSeconds,
-		"status_patch": statusPatch,
-		"signed_at":   signedAt,
-		"signature":   signature,
-	}
-	body, err := json.Marshal(bodyMap)
-	if err != nil {
-		a.mu.Lock()
-		a.lastHeartbeatError = err.Error()
-		a.mu.Unlock()
-		return err
-	}
-
 	url := a.cfg.APIServerURL + "/cluster/heartbeat"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		a.mu.Lock()
-		a.lastHeartbeatError = err.Error()
-		a.mu.Unlock()
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
+	backoff := 150 * time.Millisecond
+	lastErr := error(nil)
+	for attempt := 1; attempt <= 3; attempt++ {
+		signedAt := time.Now().Unix()
+		message, err := heartbeatSigningMessage(a.cfg.NodeID, leaseToken, signedAt, a.cfg.HeartbeatTTLSeconds, statusPatch)
+		if err != nil {
+			a.mu.Lock()
+			a.lastHeartbeatError = err.Error()
+			a.mu.Unlock()
+			return fmt.Errorf("build message: %w", err)
+		}
+		signature, err := signMessage(privateKey, message)
+		if err != nil {
+			a.mu.Lock()
+			a.lastHeartbeatError = err.Error()
+			a.mu.Unlock()
+			return fmt.Errorf("sign message: %w", err)
+		}
 
-	start := time.Now()
-	resp, err := a.client.Do(req)
-	if err != nil {
-		a.mu.Lock()
-		a.lastHeartbeatError = err.Error()
-		a.mu.Unlock()
-		return err
-	}
-	defer resp.Body.Close()
+		bodyMap := map[string]any{
+			"node_id":      a.cfg.NodeID,
+			"lease_token":  leaseToken,
+			"ttl_seconds":  a.cfg.HeartbeatTTLSeconds,
+			"status_patch": statusPatch,
+			"signed_at":    signedAt,
+			"signature":    signature,
+		}
+		body, err := json.Marshal(bodyMap)
+		if err != nil {
+			a.mu.Lock()
+			a.lastHeartbeatError = err.Error()
+			a.mu.Unlock()
+			return err
+		}
 
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-	latencyMs := time.Since(start).Milliseconds()
-	if resp.StatusCode >= 300 {
-		a.mu.Lock()
-		a.lastHeartbeatError = fmt.Sprintf("heartbeat http %d", resp.StatusCode)
-		a.mu.Unlock()
-		return fmt.Errorf("heartbeat http %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
-	}
-	a.mu.Lock()
-	a.lastHeartbeatAt = time.Now().UTC()
-	a.lastHeartbeatError = ""
-	a.mu.Unlock()
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+		if err != nil {
+			a.mu.Lock()
+			a.lastHeartbeatError = err.Error()
+			a.mu.Unlock()
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
 
-	a.log.Info("agent.heartbeat", "publish.ok", "Published signed heartbeat", map[string]any{
-		"node_id":     a.cfg.NodeID,
-		"status_code": resp.StatusCode,
-		"latency_ms":  latencyMs,
-		"active_route": statusPatch["wg_active_route"],
-		"failover_state": statusPatch["wg_failover_state"],
-	})
-	return nil
+		start := time.Now()
+		resp, err := a.client.Do(req)
+		if err != nil {
+			lastErr = err
+			if attempt < 3 {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(backoff):
+				}
+				backoff *= 2
+				continue
+			}
+			a.mu.Lock()
+			a.lastHeartbeatError = err.Error()
+			a.mu.Unlock()
+			return err
+		}
+
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		_ = resp.Body.Close()
+		latencyMs := time.Since(start).Milliseconds()
+		if resp.StatusCode >= 500 && attempt < 3 {
+			lastErr = fmt.Errorf("heartbeat http %d", resp.StatusCode)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+			continue
+		}
+		if resp.StatusCode >= 300 {
+			a.mu.Lock()
+			a.lastHeartbeatError = fmt.Sprintf("heartbeat http %d", resp.StatusCode)
+			a.mu.Unlock()
+			return fmt.Errorf("heartbeat http %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+		}
+		a.mu.Lock()
+		a.lastHeartbeatAt = time.Now().UTC()
+		a.lastHeartbeatError = ""
+		a.mu.Unlock()
+
+		a.log.Info("agent.heartbeat", "publish.ok", "Published signed heartbeat", map[string]any{
+			"node_id":        a.cfg.NodeID,
+			"status_code":    resp.StatusCode,
+			"latency_ms":     latencyMs,
+			"active_route":   statusPatch["wg_active_route"],
+			"failover_state": statusPatch["wg_failover_state"],
+		})
+		return nil
+	}
+	if lastErr != nil {
+		return lastErr
+	}
+	return errors.New("heartbeat publish failed")
 }
 
 func parsePrivateKey(keyPEM []byte) (crypto.PrivateKey, error) {
@@ -2987,7 +3655,7 @@ func upDown(value bool) string {
 	return "down"
 }
 
-func max(a, b int) int {
+func maxInt(a, b int) int {
 	if a > b {
 		return a
 	}

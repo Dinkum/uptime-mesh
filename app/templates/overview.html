@@ -2,12 +2,12 @@
 
 {% block content %}
   <section class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-5">
-    <div class="mesh-card rounded-2xl p-6">
+    <a class="mesh-card rounded-2xl p-6 block hover:border-cyan-300/70 transition" href="{{ ui_prefix }}/nodes">
       <p class="text-sm text-slate-500">Nodes Online</p>
       <p class="text-3xl font-semibold">{{ node_online_count }}/{{ node_count }}</p>
       <p class="text-xs text-slate-400">Current cluster availability</p>
-    </div>
-    <div class="mesh-card rounded-2xl p-6">
+    </a>
+    <a class="mesh-card rounded-2xl p-6 block hover:border-cyan-300/70 transition" href="{{ ui_prefix }}/nodes?view=map">
       <p class="text-sm text-slate-500">Network Uptime (24h)</p>
       <p class="text-3xl font-semibold">
         {% if uptime_pct_24h is not none %}
@@ -17,17 +17,17 @@
         {% endif %}
       </p>
       <p class="text-xs text-slate-400">Estimated from lease + heartbeat recency</p>
-    </div>
-    <div class="mesh-card rounded-2xl p-6">
+    </a>
+    <a class="mesh-card rounded-2xl p-6 block hover:border-cyan-300/70 transition" href="{{ ui_prefix }}/events">
       <p class="text-sm text-slate-500">Events (24h)</p>
       <p class="text-3xl font-semibold">{{ event_count_24h }}</p>
       <p class="text-xs text-slate-400">{{ warning_event_count_24h }} warning/error entries</p>
-    </div>
-    <div class="mesh-card rounded-2xl p-6">
+    </a>
+    <a class="mesh-card rounded-2xl p-6 block hover:border-cyan-300/70 transition" href="{{ ui_prefix }}/settings">
       <p class="text-sm text-slate-500">Version</p>
       <p class="text-3xl font-semibold">{{ app_version }}</p>
       <p class="text-xs text-slate-400">Agent {{ agent_version }}</p>
-    </div>
+    </a>
   </section>
 
   <section class="grid grid-cols-1 md:grid-cols-3 gap-5 mt-6">

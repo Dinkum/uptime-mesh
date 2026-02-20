@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,20 +12,16 @@ from app.models.endpoint import Endpoint
 from app.models.replica import Replica
 from app.models.service import Service
 from app.schemas.discovery import DiscoveryEndpointOut, DiscoveryServiceOut
+from app.utils import sanitize_label
 
 _logger = get_logger("services.discovery")
-_DNS_LABEL_RE = re.compile(r"[^a-z0-9-]")
 
 
 def sanitize_dns_label(raw: str, fallback: str = "item") -> str:
-    value = raw.strip().lower()
-    value = value.replace("_", "-").replace(" ", "-")
-    value = _DNS_LABEL_RE.sub("-", value)
-    value = value.strip("-")
-    value = re.sub(r"-{2,}", "-", value)
+    value = sanitize_label(raw, max_len=63)
     if not value:
-        value = fallback
-    return value[:63]
+        value = sanitize_label(fallback, max_len=63)
+    return value or "item"
 
 
 def _normalize_domain(domain: str) -> str:
@@ -122,6 +117,89 @@ async def list_discovery_services(
             endpoints=sum(len(item.endpoints) for item in results),
         )
         return results
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+async def list_endpoint_registry(
+    session: AsyncSession,
+    *,
+    stale_after_seconds: int = 90,
+) -> list[dict[str, object]]:
+    threshold = max(30, stale_after_seconds)
+    now = datetime.now(timezone.utc)
+    async with _logger.operation(
+        "discovery.endpoints.list",
+        "Listing endpoint registry (all health states)",
+        stale_after_seconds=threshold,
+    ) as op:
+        query = (
+            select(
+                Endpoint.id.label("endpoint_id"),
+                Endpoint.replica_id.label("replica_id"),
+                Endpoint.address.label("address"),
+                Endpoint.port.label("port"),
+                Endpoint.healthy.label("healthy"),
+                Endpoint.last_checked_at.label("last_checked_at"),
+                Endpoint.created_at.label("created_at"),
+                Endpoint.updated_at.label("updated_at"),
+                Replica.node_id.label("node_id"),
+                Service.id.label("service_id"),
+                Service.name.label("service_name"),
+            )
+            .join(Replica, Replica.id == Endpoint.replica_id)
+            .join(Service, Service.id == Replica.service_id)
+            .order_by(Service.name.asc(), Endpoint.id.asc())
+        )
+        rows = (await session.execute(query)).all()
+        op.step("db.select", "Fetched endpoint rows", rows=len(rows))
+
+        payload: list[dict[str, object]] = []
+        for row in rows:
+            last_checked_at = _as_utc(row.last_checked_at)
+            updated_at = _as_utc(row.updated_at)
+            created_at = _as_utc(row.created_at)
+            observed_at = last_checked_at or updated_at or created_at
+            age_seconds = int(max((now - observed_at).total_seconds(), 0)) if observed_at else None
+
+            if observed_at and age_seconds is not None and age_seconds > threshold:
+                health_state = "stale"
+            elif bool(row.healthy):
+                health_state = "healthy"
+            else:
+                health_state = "unhealthy"
+
+            payload.append(
+                {
+                    "endpoint_id": str(row.endpoint_id),
+                    "service_id": str(row.service_id),
+                    "service_name": str(row.service_name),
+                    "replica_id": str(row.replica_id),
+                    "node_id": str(row.node_id),
+                    "address": str(row.address),
+                    "port": int(row.port),
+                    "healthy": bool(row.healthy),
+                    "health_state": health_state,
+                    "last_checked_at": last_checked_at,
+                    "age_seconds": age_seconds,
+                }
+            )
+
+        op.step(
+            "records.build",
+            "Built endpoint registry payload",
+            endpoints=len(payload),
+            healthy=sum(1 for item in payload if item["health_state"] == "healthy"),
+            unhealthy=sum(1 for item in payload if item["health_state"] == "unhealthy"),
+            stale=sum(1 for item in payload if item["health_state"] == "stale"),
+        )
+        return payload
 
 
 async def render_zone_file(

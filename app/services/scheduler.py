@@ -2,19 +2,26 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
 from typing import Dict, List, Optional
 from uuid import uuid4
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.logger import get_logger
 from app.models.node import Node
 from app.models.replica import Replica
 from app.schemas.replicas import ReplicaCreate, ReplicaUpdate
 from app.schemas.scheduler import SchedulerActionOut, SchedulerBulkResultOut, SchedulerResultOut
+from app.services import cluster_settings as cluster_settings_service
 from app.services import events as event_service
 from app.services import nodes as node_service
 from app.services import replicas as replica_service
 from app.services import services as service_service
+
+_logger = get_logger("services.scheduler")
+_SCHEDULER_PLAN_CACHE_KEY = "scheduler_plan_cache_json"
+_SCHEDULER_PLAN_CACHE_GENERATED_AT_KEY = "scheduler_plan_cache_generated_at"
 
 
 @dataclass(frozen=True)
@@ -137,6 +144,70 @@ def _delete_rank(replica: Replica, counts: Dict[str, int]) -> tuple[int, int, da
     unhealthy_score = 1 if status.get("healthy") is False else 0
     updated_at = replica.updated_at
     return (counts.get(replica.node_id, 0), unhealthy_score, updated_at)
+
+
+def _empty_plan() -> SchedulerBulkResultOut:
+    return SchedulerBulkResultOut(
+        dry_run=True,
+        generated_at=datetime.now(timezone.utc),
+        results=[],
+    )
+
+
+async def cache_plan(
+    session: AsyncSession,
+    plan: SchedulerBulkResultOut,
+) -> None:
+    payload = json.dumps(plan.model_dump(mode="json"), separators=(",", ":"))
+    updates = {
+        _SCHEDULER_PLAN_CACHE_KEY: payload,
+        _SCHEDULER_PLAN_CACHE_GENERATED_AT_KEY: plan.generated_at.isoformat(),
+    }
+    await cluster_settings_service.upsert_settings(
+        session,
+        updates,
+        sync_file=False,
+    )
+
+
+async def refresh_cached_plan(
+    session: AsyncSession,
+    *,
+    limit: int = 200,
+) -> SchedulerBulkResultOut:
+    plan = await reconcile_all_services(session, dry_run=True, limit=limit)
+    await cache_plan(session, plan)
+    return plan
+
+
+async def get_cached_plan(session: AsyncSession) -> SchedulerBulkResultOut:
+    setting = await cluster_settings_service.get_setting(session, _SCHEDULER_PLAN_CACHE_KEY)
+    if setting is None or not setting.value.strip():
+        _logger.warning(
+            "scheduler.cache.miss",
+            "Scheduler plan cache not available; returning empty cached plan",
+        )
+        return _empty_plan()
+    try:
+        parsed = json.loads(setting.value)
+    except json.JSONDecodeError as exc:
+        _logger.warning(
+            "scheduler.cache.parse_error",
+            "Failed to parse cached scheduler plan JSON; returning empty plan",
+            error=str(exc),
+        )
+        return _empty_plan()
+    try:
+        plan = SchedulerBulkResultOut.model_validate(parsed)
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning(
+            "scheduler.cache.validate_error",
+            "Cached scheduler plan failed schema validation; returning empty plan",
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+        return _empty_plan()
+    return plan
 
 
 async def reconcile_service(

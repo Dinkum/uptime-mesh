@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.logger import get_logger
@@ -16,9 +17,10 @@ async def list_events(
     limit: int = 200,
     category: Optional[str] = None,
 ) -> List[Event]:
-    query = select(Event).order_by(Event.created_at.desc()).limit(limit)
+    query = select(Event).order_by(Event.created_at.desc())
     if category:
         query = query.where(Event.category == category)
+    query = query.limit(limit)
     result = await session.execute(query)
     return list(result.scalars().all())
 
@@ -53,3 +55,51 @@ async def record_event(
         level=level,
     )
     return event
+
+
+async def prune_old_events(
+    session: AsyncSession,
+    *,
+    retention_days: int,
+    batch_size: int = 5000,
+    max_batches: int = 20,
+) -> int:
+    if retention_days <= 0:
+        return 0
+    capped_batch = max(100, min(batch_size, 100000))
+    capped_batches = max(1, min(max_batches, 200))
+    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+
+    total_deleted = 0
+    for _ in range(capped_batches):
+        id_rows = await session.execute(
+            select(Event.id)
+            .where(Event.created_at < cutoff)
+            .order_by(Event.created_at.asc())
+            .limit(capped_batch)
+        )
+        ids = [str(row[0]) for row in id_rows.all() if row and row[0]]
+        if not ids:
+            break
+
+        result = await session.execute(
+            delete(Event).where(Event.id.in_(ids)).execution_options(synchronize_session=False)
+        )
+        deleted = int(result.rowcount or 0)
+        if deleted <= 0:
+            deleted = len(ids)
+        total_deleted += deleted
+        await session.commit()
+
+        if len(ids) < capped_batch:
+            break
+
+    if total_deleted > 0:
+        _logger.info(
+            "events.prune",
+            "Pruned old events by retention policy",
+            retention_days=retention_days,
+            deleted=total_deleted,
+            cutoff=cutoff.isoformat(),
+        )
+    return total_deleted

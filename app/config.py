@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     database_url: str = Field(default="")
 
     log_level: str = Field(default="INFO")
-    log_file: str = Field(default="data/app.log")
+    log_file: str = Field(default="data/logs/app.log")
     managed_config_path: str = Field(default="config.yaml")
     log_db_queries: bool = Field(default=True)
     log_db_query_params: bool = Field(default=False)
@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     etcd_snapshot_schedule_enabled: bool = Field(default=True)
     etcd_snapshot_interval_seconds: int = Field(default=86400, ge=60, le=604800)
     etcd_snapshot_schedule_requested_by: str = Field(default="runtime.snapshot_scheduler")
+    events_retention_days: int = Field(default=30, ge=1, le=3650)
+    runtime_events_prune_enable: bool = Field(default=True)
+    runtime_events_prune_interval_seconds: int = Field(default=3600, ge=60, le=86400)
+    runtime_events_prune_batch_size: int = Field(default=5000, ge=100, le=100000)
     support_bundle_dir: str = Field(default="data/support-bundles")
     lxd_enabled: bool = Field(default=True)
     lxd_command: str = Field(default="lxc")
@@ -128,6 +132,9 @@ class Settings(BaseSettings):
     runtime_monitoring_reload_command: str = Field(
         default="systemctl reload prometheus || systemctl restart prometheus"
     )
+    runtime_scheduler_plan_cache_enable: bool = Field(default=True)
+    runtime_scheduler_plan_cache_interval_seconds: int = Field(default=30, ge=5, le=3600)
+    runtime_scheduler_plan_cache_service_limit: int = Field(default=200, ge=1, le=5000)
 
     model_config = SettingsConfigDict(
         env_file=".env",

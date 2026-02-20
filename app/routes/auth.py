@@ -13,16 +13,15 @@ from app.dependencies import get_db_session
 from app.logger import get_logger
 from app.security import (
     SESSION_COOKIE_NAME,
-    LoginRateLimiter,
     create_session_token,
     sanitize_next_path,
 )
 from app.services import auth as auth_service
+from app.services import rate_limits as rate_limit_service
 
 router = APIRouter(prefix="/auth", include_in_schema=False)
 templates = Jinja2Templates(directory="app/templates")
 settings = get_settings()
-limiter = LoginRateLimiter(max_failures=5, window_seconds=60, lockout_seconds=300)
 _logger = get_logger("auth.login")
 
 
@@ -53,6 +52,11 @@ def _client_ip(request: Request) -> str:
     return "unknown"
 
 
+_LOGIN_MAX_FAILURES = 5
+_LOGIN_WINDOW_SECONDS = 60
+_LOGIN_LOCKOUT_SECONDS = 300
+
+
 @router.get("/login")
 async def login_page(request: Request, next: str = "/ui") -> Any:
     next_path = sanitize_next_path(next)
@@ -80,7 +84,6 @@ async def login_submit(
     client_ip = _client_ip(request)
     normalized_username = username.strip().casefold()
     ip_key = f"ip:{client_ip}"
-    user_key = f"user:{normalized_username}"
 
     async with _logger.operation(
         "login.submit",
@@ -88,8 +91,13 @@ async def login_submit(
         username=normalized_username,
         client_ip=client_ip,
     ) as op:
-        for key in (ip_key, user_key):
-            allowed, retry_after = limiter.check(key)
+        for key in (ip_key,):
+            allowed, retry_after = await rate_limit_service.check_login_lockout(
+                session,
+                scope="login",
+                subject=key,
+                window_seconds=_LOGIN_WINDOW_SECONDS,
+            )
             op.step(
                 "rate_limit.check",
                 "Checked login rate limit",
@@ -119,8 +127,14 @@ async def login_submit(
             password=password,
         )
         if not is_valid:
-            limiter.record_failure(ip_key)
-            limiter.record_failure(user_key)
+            await rate_limit_service.record_login_failure(
+                session,
+                scope="login",
+                subject=ip_key,
+                max_failures=_LOGIN_MAX_FAILURES,
+                window_seconds=_LOGIN_WINDOW_SECONDS,
+                lockout_seconds=_LOGIN_LOCKOUT_SECONDS,
+            )
             _logger.warning(
                 "login.failed",
                 "Rejected invalid login credentials",
@@ -134,8 +148,7 @@ async def login_submit(
                 status_code=status.HTTP_401_UNAUTHORIZED,
             )
 
-        limiter.record_success(ip_key)
-        limiter.record_success(user_key)
+        await rate_limit_service.clear_login_lockout(session, scope="login", subject=ip_key)
         op.step("rate_limit.reset", "Reset login rate limiter for successful auth")
 
         token = create_session_token(
@@ -181,7 +194,6 @@ async def token_login(
     username = payload.username.strip()
     client_ip = _client_ip(request)
     ip_key = f"ip:{client_ip}"
-    user_key = f"user:{username.casefold()}"
     normalized_username = username.casefold()
 
     async with _logger.operation(
@@ -190,8 +202,13 @@ async def token_login(
         username=normalized_username,
         client_ip=client_ip,
     ) as op:
-        for key in (ip_key, user_key):
-            allowed, retry_after = limiter.check(key)
+        for key in (ip_key,):
+            allowed, retry_after = await rate_limit_service.check_login_lockout(
+                session,
+                scope="login",
+                subject=key,
+                window_seconds=_LOGIN_WINDOW_SECONDS,
+            )
             op.step(
                 "rate_limit.check",
                 "Checked login rate limit",
@@ -219,8 +236,14 @@ async def token_login(
             password=payload.password,
         )
         if not is_valid:
-            limiter.record_failure(ip_key)
-            limiter.record_failure(user_key)
+            await rate_limit_service.record_login_failure(
+                session,
+                scope="login",
+                subject=ip_key,
+                max_failures=_LOGIN_MAX_FAILURES,
+                window_seconds=_LOGIN_WINDOW_SECONDS,
+                lockout_seconds=_LOGIN_LOCKOUT_SECONDS,
+            )
             _logger.warning(
                 "login.failed",
                 "Rejected invalid token login credentials",
@@ -231,8 +254,7 @@ async def token_login(
                 status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid username or password."
             )
 
-        limiter.record_success(ip_key)
-        limiter.record_success(user_key)
+        await rate_limit_service.clear_login_lockout(session, scope="login", subject=ip_key)
         op.step("rate_limit.reset", "Reset login rate limiter for successful auth")
 
         token = create_session_token(

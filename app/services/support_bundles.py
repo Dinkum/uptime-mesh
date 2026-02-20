@@ -22,6 +22,7 @@ from app.models.router_assignment import RouterAssignment
 from app.models.service import Service
 from app.models.support_bundle import SupportBundle
 from app.schemas.support_bundles import SupportBundleCreate
+from app.services import cluster_settings as cluster_settings_service
 from app.services import etcd as etcd_service
 from app.services.events import record_event
 
@@ -217,7 +218,9 @@ def _sanitize_cluster_settings_rows(rows: list[dict[str, object]]) -> list[dict[
     for row in rows:
         key = str(row.get("key", ""))
         clean = dict(row)
-        if key and _looks_sensitive(key):
+        if key in cluster_settings_service.SENSITIVE_CLUSTER_SETTINGS or (
+            key and _looks_sensitive(key)
+        ):
             clean["value"] = "<redacted>"
         sanitized.append(clean)
     return sanitized
@@ -324,7 +327,7 @@ async def _generate_support_bundle(session: AsyncSession, bundle_id: str) -> str
 
         log_tail = _read_log_tail(_settings.log_file)
         (work_dir / "app.log.tail").write_text(log_tail, encoding="utf-8")
-        agent_log_tail = _read_log_tail(getattr(_settings, "agent_log_file", "data/agent.log"))
+        agent_log_tail = _read_log_tail(getattr(_settings, "agent_log_file", "data/logs/agent.log"))
         (work_dir / "agent.log.tail").write_text(agent_log_tail, encoding="utf-8")
         (work_dir / "restore_playbook.md").write_text(_render_restore_playbook(), encoding="utf-8")
 

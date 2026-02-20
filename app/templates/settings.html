@@ -40,96 +40,262 @@
     }
   </style>
 
-  <section class="grid gap-6 lg:grid-cols-2">
-    <article class="card settings-card">
-      <div class="card-body">
-        <h2 class="card-title">Authentication</h2>
-        <p class="text-sm text-slate-500">Rotate the admin password used for UI and API access.</p>
+  <div class="flex flex-wrap gap-3 mb-6">
+    <a class="btn btn-sm {% if settings_section == 'auth' %}btn-primary{% else %}btn-outline{% endif %}" href="{{ ui_prefix }}/settings?section=auth">Auth & Preferences</a>
+    <a class="btn btn-sm {% if settings_section == 'support' %}btn-primary{% else %}btn-outline{% endif %}" href="{{ ui_prefix }}/settings?section=support">Support & Snapshots</a>
+  </div>
+
+  {% if settings_section == "support" %}
+    <section class="grid grid-cols-1 md:grid-cols-2 gap-6">
+      <article class="settings-card rounded-2xl p-6">
+        <div class="flex items-center justify-between gap-3">
+          <div>
+            <h2 class="text-lg font-semibold">etcd Snapshots</h2>
+            <p class="text-sm text-slate-500">Run snapshots now and track restore readiness.</p>
+          </div>
+          <button class="btn btn-sm btn-outline" id="snapshot-btn">Request Snapshot</button>
+        </div>
+        <div class="mt-4 space-y-2 text-sm" id="snapshot-list">
+          {% for snapshot in snapshots %}
+            <div class="rounded-xl border border-slate-700/40 p-3">
+              <div class="flex justify-between items-center gap-3">
+                <div class="flex flex-col min-w-0">
+                  <span class="mono truncate">{{ snapshot.id }}</span>
+                  {% if snapshot.location %}
+                    <span class="text-xs text-slate-500 truncate">{{ snapshot.location }}</span>
+                  {% endif %}
+                </div>
+                <div class="flex items-center gap-2 shrink-0">
+                  <span class="badge badge-outline">{{ snapshot.status }}</span>
+                  {% if snapshot.status == "completed" %}
+                    <button class="btn btn-xs btn-outline snapshot-restore-btn" data-snapshot-id="{{ snapshot.id }}">Restore</button>
+                    {% if snapshot.location %}
+                      <a class="btn btn-xs btn-outline" href="/etcd/snapshots/{{ snapshot.id }}/download">Download</a>
+                    {% endif %}
+                  {% endif %}
+                </div>
+              </div>
+              {% if snapshot.error %}
+                <p class="text-xs text-rose-300 break-all mt-2">{{ snapshot.error }}</p>
+              {% endif %}
+            </div>
+          {% else %}
+            <p class="text-slate-400">No snapshots yet.</p>
+          {% endfor %}
+        </div>
+      </article>
+
+      <article class="settings-card rounded-2xl p-6">
+        <div class="flex items-center justify-between gap-3">
+          <div>
+            <h2 class="text-lg font-semibold">Support Bundles</h2>
+            <p class="text-sm text-slate-500">Collect redacted diagnostics for troubleshooting.</p>
+          </div>
+          <button class="btn btn-sm btn-outline" id="bundle-btn">Request Bundle</button>
+        </div>
+        <div class="mt-4 space-y-2 text-sm" id="bundle-list">
+          {% for bundle in bundles %}
+            <div class="rounded-xl border border-slate-700/40 p-3">
+              <div class="flex justify-between items-center gap-3">
+                <span class="mono truncate">{{ bundle.id }}</span>
+                <div class="flex items-center gap-2 shrink-0">
+                  <span class="badge badge-outline">{{ bundle.status }}</span>
+                  {% if bundle.status == "completed" and bundle.path %}
+                    <a class="btn btn-xs btn-outline" href="/support-bundles/{{ bundle.id }}/download">Download</a>
+                  {% endif %}
+                </div>
+              </div>
+              {% if bundle.error %}
+                <p class="text-xs text-rose-300 break-all mt-2">{{ bundle.error }}</p>
+              {% endif %}
+            </div>
+          {% else %}
+            <p class="text-slate-400">No bundles yet.</p>
+          {% endfor %}
+        </div>
+      </article>
+    </section>
+
+    <script>
+      const snapshotBtn = document.getElementById("snapshot-btn");
+      const bundleBtn = document.getElementById("bundle-btn");
+
+      function addRow(containerId, id, status, extras) {
+        const container = document.getElementById(containerId);
+        if (!container) return;
+
+        const row = document.createElement("div");
+        row.className = "rounded-xl border border-slate-700/40 p-3";
+
+        if (containerId === "snapshot-list") {
+          const restoreButton = status === "completed"
+            ? `<button class="btn btn-xs btn-outline snapshot-restore-btn" data-snapshot-id="${id}">Restore</button>`
+            : "";
+          const download = extras && extras.download
+            ? `<a class="btn btn-xs btn-outline" href="${extras.download}">Download</a>`
+            : "";
+          const error = extras && extras.error
+            ? `<p class="text-xs text-rose-300 break-all mt-2">${extras.error}</p>`
+            : "";
+          row.innerHTML = `
+            <div class="flex justify-between items-center gap-3">
+              <div class="flex flex-col min-w-0">
+                <span class="mono truncate">${id}</span>
+              </div>
+              <div class="flex items-center gap-2 shrink-0">
+                <span class="badge badge-outline">${status}</span>
+                ${restoreButton}
+                ${download}
+              </div>
+            </div>
+            ${error}
+          `;
+        } else {
+          const download = extras && extras.download
+            ? `<a class="btn btn-xs btn-outline" href="${extras.download}">Download</a>`
+            : "";
+          const error = extras && extras.error
+            ? `<p class="text-xs text-rose-300 break-all mt-2">${extras.error}</p>`
+            : "";
+          row.innerHTML = `
+            <div class="flex justify-between items-center gap-3">
+              <span class="mono truncate">${id}</span>
+              <div class="flex items-center gap-2 shrink-0">
+                <span class="badge badge-outline">${status}</span>
+                ${download}
+              </div>
+            </div>
+            ${error}
+          `;
+        }
+
+        container.prepend(row);
+      }
+
+      async function restoreSnapshot(snapshotId) {
+        const response = await fetch(`/etcd/snapshots/${snapshotId}/restore`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({})
+        });
+        if (response.ok) {
+          const data = await response.json();
+          const download = data.location ? `/etcd/snapshots/${data.id}/download` : "";
+          addRow("snapshot-list", data.id, data.status, { download, error: data.error || "" });
+        }
+      }
+
+      if (snapshotBtn) {
+        snapshotBtn.addEventListener("click", async () => {
+          const id = crypto.randomUUID();
+          const response = await fetch("/etcd/snapshots", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ id })
+          });
+          if (response.ok) {
+            const data = await response.json();
+            const download = data.location ? `/etcd/snapshots/${data.id}/download` : "";
+            addRow("snapshot-list", data.id, data.status, { download, error: data.error || "" });
+          }
+        });
+      }
+
+      if (bundleBtn) {
+        bundleBtn.addEventListener("click", async () => {
+          const id = crypto.randomUUID();
+          const response = await fetch("/support-bundles", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ id })
+          });
+          if (response.ok) {
+            const data = await response.json();
+            const download = data.path ? `/support-bundles/${data.id}/download` : "";
+            addRow("bundle-list", data.id, data.status, { download, error: data.error || "" });
+          }
+        });
+      }
+
+      document.addEventListener("click", async (event) => {
+        const target = event.target;
+        if (!(target instanceof HTMLElement)) {
+          return;
+        }
+        if (!target.classList.contains("snapshot-restore-btn")) {
+          return;
+        }
+        const snapshotId = target.getAttribute("data-snapshot-id");
+        if (!snapshotId) {
+          return;
+        }
+        await restoreSnapshot(snapshotId);
+      });
+    </script>
+  {% else %}
+    <section class="grid gap-6 lg:grid-cols-2">
+      <article class="settings-card rounded-2xl p-6">
+        <h2 class="text-lg font-semibold">Authentication</h2>
+        <p class="text-sm text-slate-500">Rotate the admin password used for UI access.</p>
         <div class="mt-3">
           <span class="text-xs uppercase tracking-widest text-slate-500">Current Username</span>
           <p class="mono text-sm mt-1">{{ username }}</p>
         </div>
-      </div>
-    </article>
+      </article>
 
-    <article class="card settings-card">
-      <div class="card-body">
-        <h2 class="card-title">Change Password</h2>
+      <article class="settings-card rounded-2xl p-6">
+        <h2 class="text-lg font-semibold">Change Password</h2>
 
         {% if password_success %}
-          <div class="alert alert-success text-sm mt-2">
+          <div class="alert alert-success text-sm mt-3">
             <span>{{ password_success }}</span>
           </div>
         {% endif %}
 
         {% if password_error %}
-          <div class="alert alert-error text-sm mt-2">
+          <div class="alert alert-error text-sm mt-3">
             <span>{{ password_error }}</span>
           </div>
         {% endif %}
 
-        <form method="post" action="{{ ui_prefix }}/settings/password" class="space-y-3 mt-3">
+        <form method="post" action="{{ ui_prefix }}/settings/password" class="space-y-3 mt-4">
           <label class="block">
             <span class="settings-label">Current Password</span>
-            <input
-              class="settings-input"
-              type="password"
-              name="current_password"
-              required
-              autocomplete="current-password"
-            />
+            <input class="settings-input" type="password" name="current_password" required autocomplete="current-password" />
           </label>
 
           <label class="block">
             <span class="settings-label">New Password</span>
-            <input
-              class="settings-input"
-              type="password"
-              name="new_password"
-              minlength="8"
-              required
-              autocomplete="new-password"
-            />
+            <input class="settings-input" type="password" name="new_password" minlength="8" required autocomplete="new-password" />
             <p class="settings-help">Minimum 8 characters.</p>
           </label>
 
           <label class="block">
             <span class="settings-label">Confirm New Password</span>
-            <input
-              class="settings-input"
-              type="password"
-              name="confirm_password"
-              minlength="8"
-              required
-              autocomplete="new-password"
-            />
+            <input class="settings-input" type="password" name="confirm_password" minlength="8" required autocomplete="new-password" />
           </label>
 
           <button class="btn btn-primary w-full mt-2" type="submit">Update Password</button>
         </form>
-      </div>
-    </article>
+      </article>
 
-    <article class="card settings-card">
-      <div class="card-body">
-        <h2 class="card-title">Repository</h2>
-        <p class="text-sm text-slate-500">
-          Source URL used by installer/update scripts when reading managed config.
-        </p>
+      <article class="settings-card rounded-2xl p-6 lg:col-span-2">
+        <h2 class="text-lg font-semibold">Repository</h2>
+        <p class="text-sm text-slate-500">Source URL used by install and update scripts.</p>
 
         {% if repo_success %}
-          <div class="alert alert-success text-sm mt-2">
+          <div class="alert alert-success text-sm mt-3">
             <span>{{ repo_success }}</span>
           </div>
         {% endif %}
 
         {% if repo_error %}
-          <div class="alert alert-error text-sm mt-2">
+          <div class="alert alert-error text-sm mt-3">
             <span>{{ repo_error }}</span>
           </div>
         {% endif %}
 
-        <form method="post" action="{{ ui_prefix }}/settings/repo" class="space-y-3 mt-3">
+        <form method="post" action="{{ ui_prefix }}/settings/repo" class="space-y-3 mt-4">
           <label class="block">
             <span class="settings-label">GitHub Repository URL</span>
             <input
@@ -140,11 +306,11 @@
               value="{{ github_repo_url }}"
               placeholder="https://github.com/Dinkum/uptime-mesh"
             />
-            <p class="settings-help">Used by install/update flows as the source repository.</p>
+            <p class="settings-help">Default is https://github.com/Dinkum/uptime-mesh</p>
           </label>
-          <button class="btn btn-primary w-full mt-2" type="submit">Update Repository URL</button>
+          <button class="btn btn-primary" type="submit">Update Repository URL</button>
         </form>
-      </div>
-    </article>
-  </section>
+      </article>
+    </section>
+  {% endif %}
 {% endblock %}

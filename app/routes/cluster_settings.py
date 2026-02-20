@@ -10,7 +10,7 @@ from app.schemas.cluster_settings import ClusterSettingOut, ClusterSettingUpsert
 from app.services import cluster_settings as cluster_settings_service
 
 router = APIRouter(prefix="/cluster-settings", tags=["cluster-settings"])
-_SENSITIVE_CLUSTER_SETTINGS = {"auth_secret_key", "cluster_signing_key"}
+_SENSITIVE_CLUSTER_SETTINGS = cluster_settings_service.SENSITIVE_CLUSTER_SETTINGS
 
 
 @router.get("", response_model=List[ClusterSettingOut])

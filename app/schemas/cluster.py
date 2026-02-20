@@ -48,8 +48,6 @@ class NodeJoinOut(BaseModel):
     identity_fingerprint: str
     node_cert_pem: str
     ca_cert_pem: str
-    auth_secret_key: str
-    cluster_signing_key: str
 
 
 class HeartbeatRequest(BaseModel):

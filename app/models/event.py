@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-from sqlalchemy import JSON, String
+from sqlalchemy import JSON, Index, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin
@@ -10,6 +10,7 @@ from app.models.base import Base, TimestampMixin
 
 class Event(TimestampMixin, Base):
     __tablename__ = "events"
+    __table_args__ = (Index("ix_events_created_at", "created_at"),)
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     category: Mapped[str] = mapped_column(String(64), index=True)

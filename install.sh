@@ -4,10 +4,20 @@ set -euo pipefail
 DEFAULT_REPO_URL="https://github.com/Dinkum/uptime-mesh"
 REPO_URL="${UPTIMEMESH_REPO_URL:-${DEFAULT_REPO_URL}}"
 REPO_REF="${UPTIMEMESH_REPO_REF:-main}"
+DEFAULT_VERSION_URL="${UPTIMEMESH_VERSION_URL:-https://raw.githubusercontent.com/Dinkum/uptime-mesh/main/version.json}"
+UPDATE_CHANNEL="${UPTIMEMESH_CHANNEL:-stable}"
 INSTALL_DIR="${UPTIMEMESH_INSTALL_DIR:-/opt/uptime-mesh}"
 CONFIG_PATH="${UPTIMEMESH_CONFIG_PATH:-${INSTALL_DIR}/config.yaml}"
 INSTALL_LOG=""
 LOG_READY=0
+EARLY_FORCE_INSTALL=0
+
+for _arg in "$@"; do
+  if [[ "${_arg}" == "--force" ]]; then
+    EARLY_FORCE_INSTALL=1
+    break
+  fi
+done
 
 say() {
   echo "(*) $*"
@@ -26,8 +36,8 @@ init_install_log() {
   if [[ "$LOG_READY" -eq 1 ]]; then
     return 0
   fi
-  mkdir -p "${APP_DIR}/data"
-  INSTALL_LOG="${UPTIMEMESH_INSTALL_LOG:-${APP_DIR}/data/install.log}"
+  mkdir -p "${APP_DIR}/data/logs"
+  INSTALL_LOG="${UPTIMEMESH_INSTALL_LOG:-${APP_DIR}/data/logs/install.log}"
   touch "${INSTALL_LOG}"
   chmod 600 "${INSTALL_LOG}" || true
   exec > >(tee -a "${INSTALL_LOG}") 2>&1
@@ -82,6 +92,44 @@ apt_install_optional() {
   fi
 }
 
+install_required_lxd() {
+  local installed=0
+  if run_quiet_command "Install required package set: lxd" apt-get install -y lxd; then
+    installed=1
+  elif command -v snap >/dev/null 2>&1; then
+    if run_quiet_command "Install required package set: lxd (snap)" snap install lxd --classic; then
+      installed=1
+    fi
+  fi
+  if [[ "${installed}" -ne 1 ]]; then
+    fail "failed to install required dependency: lxd (checked apt and snap)"
+  fi
+}
+
+install_required_etcd() {
+  if run_quiet_command "Install required package set: etcd" apt-get install -y etcd; then
+    return 0
+  fi
+  if run_quiet_command \
+    "Install required package set: etcd-server + etcd-client" \
+    apt-get install -y etcd-server etcd-client; then
+    return 0
+  fi
+  fail "failed to install required dependency: etcd (checked etcd and etcd-server+etcd-client)"
+}
+
+ensure_required_runtime_binaries() {
+  if ! command -v etcd >/dev/null 2>&1; then
+    fail "required binary missing: etcd (install cannot continue)"
+  fi
+  if ! command -v lxd >/dev/null 2>&1; then
+    fail "required binary missing: lxd (install cannot continue)"
+  fi
+  if ! command -v lxc >/dev/null 2>&1; then
+    fail "required binary missing: lxc (install cannot continue)"
+  fi
+}
+
 unit_exists() {
   local unit="$1"
   systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -qx "${unit}"
@@ -101,6 +149,155 @@ require_cmd() {
     echo "missing required command: $1" >&2
     exit 1
   fi
+}
+
+require_file() {
+  local path="$1"
+  if [[ ! -f "${path}" ]]; then
+    fail "required file missing: ${path}"
+  fi
+}
+
+copy_file_or_fail() {
+  local src="$1"
+  local dst="$2"
+  require_file "${src}"
+  cp "${src}" "${dst}" || fail "failed to copy file: ${src} -> ${dst}"
+}
+
+resolve_sqlite_db_path() {
+  local env_file="${APP_DIR}/.env"
+  local db_url=""
+  local raw_path=""
+  if [[ ! -f "${env_file}" ]]; then
+    return 1
+  fi
+  db_url="$(sed -n -E 's/^DATABASE_URL=(.*)$/\1/p' "${env_file}" | tail -n 1)"
+  case "${db_url}" in
+    sqlite+aiosqlite:///*)
+      raw_path="${db_url#sqlite+aiosqlite:///}"
+      ;;
+    sqlite:///*)
+      raw_path="${db_url#sqlite:///}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  if [[ -z "${raw_path}" ]]; then
+    return 1
+  fi
+  if [[ "${raw_path}" == /* ]]; then
+    printf '%s' "${raw_path}"
+    return 0
+  fi
+  printf '%s' "${APP_DIR}/${raw_path#./}"
+}
+
+run_migrations_with_rollback() {
+  local db_path=""
+  local backup_path=""
+  local backup_created=0
+
+  say "Applying database migrations"
+  db_path="$(resolve_sqlite_db_path || true)"
+  if [[ -n "${db_path}" && -f "${db_path}" ]]; then
+    install -d "${APP_DIR}/data/install-backups"
+    backup_path="${APP_DIR}/data/install-backups/app.db.pre-migrate.$(date -u +%Y%m%dT%H%M%SZ).bak"
+    cp "${db_path}" "${backup_path}" || fail "failed to snapshot database before migration"
+    backup_created=1
+    say "Created migration backup | path: ${backup_path}"
+  fi
+
+  if run_quiet_command "Run Alembic migrations" .venv/bin/alembic upgrade head; then
+    return 0
+  fi
+
+  if [[ "${backup_created}" -eq 1 ]]; then
+    cp "${backup_path}" "${db_path}" || fail "migration failed and restore from snapshot also failed"
+    warn "Restored database from snapshot after migration failure | snapshot: ${backup_path}"
+  fi
+  fail "database migrations failed"
+}
+
+is_tcp_port_in_use() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -H -ltn "sport = :${port}" 2>/dev/null | grep -q .
+    return $?
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1
+    return $?
+  fi
+  return 2
+}
+
+is_udp_port_in_use() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -H -lun "sport = :${port}" 2>/dev/null | grep -q .
+    return $?
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iUDP:"${port}" >/dev/null 2>&1
+    return $?
+  fi
+  return 2
+}
+
+run_preflight_checks() {
+  local state=""
+  local free_kb=""
+  local required_kb=0
+  local rc=0
+  local port=""
+  local tcp_ports=("${PORT}" "80" "443" "2379" "2380")
+  local udp_ports=("51820" "51821" "7946")
+
+  say "Running preflight checks"
+  require_cmd systemctl
+  if [[ "$(ps -p 1 -o comm= 2>/dev/null | tr -d '[:space:]')" != "systemd" ]]; then
+    fail "systemd is not PID 1; installer requires a systemd host"
+  fi
+  state="$(systemctl is-system-running 2>/dev/null || true)"
+  case "${state}" in
+    running|degraded|starting) ;;
+    *)
+      fail "systemd is not ready (state: ${state:-unknown})"
+      ;;
+  esac
+
+  if command -v df >/dev/null 2>&1; then
+    free_kb="$(df -Pk "${APP_DIR}" | awk 'NR==2 {print $4}')"
+    if [[ -n "${free_kb}" ]]; then
+      required_kb=$((MIN_DISK_MB * 1024))
+      if (( free_kb < required_kb )); then
+        fail "insufficient disk space: need at least ${MIN_DISK_MB}MB free"
+      fi
+    fi
+  fi
+
+  for port in "${tcp_ports[@]}"; do
+    rc=0
+    is_tcp_port_in_use "${port}" || rc=$?
+    if [[ "${rc}" -eq 0 ]]; then
+      fail "required TCP port is already in use: ${port}"
+    fi
+    if [[ "${rc}" -eq 2 ]]; then
+      warn "port check skipped for TCP ${port} (ss/lsof unavailable)"
+    fi
+  done
+  for port in "${udp_ports[@]}"; do
+    rc=0
+    is_udp_port_in_use "${port}" || rc=$?
+    if [[ "${rc}" -eq 0 ]]; then
+      fail "required UDP port is already in use: ${port}"
+    fi
+    if [[ "${rc}" -eq 2 ]]; then
+      warn "port check skipped for UDP ${port} (ss/lsof unavailable)"
+    fi
+  done
 }
 
 as_root() {
@@ -129,28 +326,169 @@ repo_url_from_config() {
   return 1
 }
 
+download_url_retry() {
+  local src="$1"
+  local dst="$2"
+  local attempt=1
+  while (( attempt <= 4 )); do
+    if command -v curl >/dev/null 2>&1; then
+      if curl -fsSL --connect-timeout 10 --max-time 180 "${src}" -o "${dst}"; then
+        return 0
+      fi
+    elif command -v wget >/dev/null 2>&1; then
+      if wget -qO "${dst}" "${src}"; then
+        return 0
+      fi
+    else
+      return 1
+    fi
+    sleep "${attempt}"
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
+sha256_file() {
+  local f="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "${f}" | awk '{print $1}'
+    return 0
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "${f}" | awk '{print $1}'
+    return 0
+  fi
+  if command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "${f}" | awk '{print $NF}'
+    return 0
+  fi
+  return 1
+}
+
+repo_slug_from_url() {
+  local url="$1"
+  python3 - "${url}" <<'PY'
+import sys
+from urllib.parse import urlparse
+
+raw = (sys.argv[1] or "").strip()
+fallback = "Dinkum/uptime-mesh"
+if not raw:
+    print(fallback)
+    raise SystemExit(0)
+
+path = ""
+if raw.startswith("git@") and ":" in raw:
+    path = raw.split(":", 1)[1]
+else:
+    parsed = urlparse(raw)
+    path = parsed.path.lstrip("/")
+
+path = path.strip("/").removesuffix(".git")
+parts = [p for p in path.split("/") if p]
+if len(parts) >= 2:
+    print(f"{parts[0]}/{parts[1]}")
+else:
+    print(fallback)
+PY
+}
+
+fetch_release_into_install_dir() {
+  local tmp_dir
+  local manifest_path
+  local release_path
+  local tarball_path
+  local unpack_dir
+  local src_root
+  local install_tmp
+  local slug
+  local release_api
+  local latest_tag
+  local tarball_url
+  local source_sha
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/uptimemesh-install.XXXXXX")"
+  manifest_path="${tmp_dir}/version.json"
+  release_path="${tmp_dir}/release.json"
+  tarball_path="${tmp_dir}/source.tar.gz"
+  unpack_dir="${tmp_dir}/unpack"
+  install_tmp="${INSTALL_DIR}.new"
+  mkdir -p "${unpack_dir}"
+
+  download_url_retry "${DEFAULT_VERSION_URL}" "${manifest_path}" || fail "failed to fetch version.json"
+  slug="$(repo_slug_from_url "${REPO_URL}")"
+  release_api="https://api.github.com/repos/${slug}/releases/latest"
+  download_url_retry "${release_api}" "${release_path}" || fail "failed to fetch latest release metadata"
+
+  eval "$(
+  python3 - "${manifest_path}" "${release_path}" "${UPDATE_CHANNEL}" <<'PY'
+import json
+import shlex
+import sys
+
+manifest_path, release_path, channel = sys.argv[1:4]
+manifest = json.load(open(manifest_path, "r", encoding="utf-8"))
+release = json.load(open(release_path, "r", encoding="utf-8"))
+channels = manifest.get("channels", {}) if isinstance(manifest, dict) else {}
+cfg = channels.get(channel, {}) if isinstance(channels, dict) else {}
+source = cfg.get("source", {}) if isinstance(cfg, dict) else {}
+tag_name = str(release.get("tag_name", "")).strip()
+tarball_url = str(release.get("tarball_url", "")).strip()
+source_sha = str(source.get("sha256", "")).strip()
+print(f"LATEST_TAG={shlex.quote(tag_name)}")
+print(f"TARBALL_URL={shlex.quote(tarball_url)}")
+print(f"SOURCE_SHA={shlex.quote(source_sha)}")
+PY
+  )"
+
+  latest_tag="${LATEST_TAG:-}"
+  tarball_url="${TARBALL_URL:-}"
+  source_sha="${SOURCE_SHA:-}"
+  [[ -n "${latest_tag}" ]] || fail "release metadata missing tag_name"
+  [[ -n "${tarball_url}" ]] || fail "release metadata missing tarball_url"
+  [[ -n "${source_sha}" ]] || fail "manifest missing source.sha256 for channel ${UPDATE_CHANNEL}"
+
+  download_url_retry "${tarball_url}" "${tarball_path}" || fail "failed to download release tarball"
+  local tar_sha
+  tar_sha="$(sha256_file "${tarball_path}" || true)"
+  [[ -n "${tar_sha}" ]] || fail "failed to compute source tarball sha256"
+  [[ "${tar_sha}" == "${source_sha}" ]] || fail "source tarball checksum mismatch"
+
+  tar -xzf "${tarball_path}" -C "${unpack_dir}" || fail "failed to extract source tarball"
+  src_root="$(find "${unpack_dir}" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+  [[ -n "${src_root}" ]] || fail "extracted tarball did not contain source directory"
+
+  rm -rf "${install_tmp}"
+  cp -a "${src_root}" "${install_tmp}"
+  if [[ -d "${INSTALL_DIR}" ]]; then
+    rm -rf "${INSTALL_DIR}"
+  fi
+  mv "${install_tmp}" "${INSTALL_DIR}"
+  printf '%s\n' "${latest_tag#v}" > "${INSTALL_DIR}/VERSION"
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_DIR="${SCRIPT_DIR}"
 
-# Remote mode (e.g. curl | bash): clone/update repo, then run root install script there.
+# Remote mode (e.g. curl | bash): fetch latest release source into install dir, then run install there.
 if [[ ! -d "${APP_DIR}/app" || ! -f "${APP_DIR}/pyproject.toml" ]]; then
-  require_cmd git
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    fail "remote install mode must run as root (example: curl ... | sudo bash)"
+  fi
+  require_cmd python3
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    fail "curl or wget is required for remote install mode"
+  fi
   as_root mkdir -p "$(dirname "${INSTALL_DIR}")"
   if config_repo_url="$(repo_url_from_config "${CONFIG_PATH}")"; then
     REPO_URL="${config_repo_url}"
   fi
-  if as_root test -d "${INSTALL_DIR}/.git"; then
-    as_root git -C "${INSTALL_DIR}" fetch --tags origin
-    as_root git -C "${INSTALL_DIR}" checkout "${REPO_REF}"
-    as_root git -C "${INSTALL_DIR}" pull --ff-only origin "${REPO_REF}"
-  else
-    as_root git clone --branch "${REPO_REF}" --depth 1 "${REPO_URL}" "${INSTALL_DIR}"
+  if as_root test -f "${INSTALL_DIR}/VERSION" && [[ "${EARLY_FORCE_INSTALL}" -ne 1 ]]; then
+    fail "detected existing installation at ${INSTALL_DIR} (use --force to reinstall)"
   fi
+  fetch_release_into_install_dir
 
-  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-    exec "${INSTALL_DIR}/install.sh" "$@"
-  fi
-  exec sudo "${INSTALL_DIR}/install.sh" "$@"
+  exec "${INSTALL_DIR}/install.sh" "$@"
 fi
 
 init_install_log
@@ -178,6 +516,8 @@ Options:
   --etcd-peer-url <url>      etcd peer URL for node membership (default: derived from node endpoint host:2380)
   --token <join-token>       Join token for enrollment (required for join mode)
   --port <port>              Local API port (default: 8010)
+  --force                    Reinstall over an existing node install
+  --detect-public-ip         Use external IP discovery (ipify) for advertised endpoint defaults
   --install-deps             Force apt dependency install (auto-enabled by default)
   --wizard                   Interactive setup wizard
   -h, --help                 Show help
@@ -209,6 +549,9 @@ PORT="8010"
 INSTALL_DEPS=0
 INSTALL_MONITORING=1
 WIZARD=0
+DETECT_PUBLIC_IP=0
+MIN_DISK_MB="${UPTIMEMESH_MIN_DISK_MB:-2048}"
+FORCE_INSTALL=0
 INITIAL_ADMIN_USERNAME=""
 INITIAL_ADMIN_PASSWORD=""
 INITIAL_ADMIN_GENERATED=0
@@ -285,17 +628,34 @@ prompt_yes_no() {
   done
 }
 
+detect_local_ip() {
+  local ip=""
+  if command -v ip >/dev/null 2>&1; then
+    ip="$(ip route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')"
+  fi
+  if [[ -z "${ip}" ]] && command -v hostname >/dev/null 2>&1; then
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  fi
+  printf '%s' "${ip}"
+}
+
 detect_public_ip() {
+  if [[ "${DETECT_PUBLIC_IP}" -ne 1 ]]; then
+    return 0
+  fi
   if command -v curl >/dev/null 2>&1; then
     curl -fsS --max-time 4 https://api.ipify.org || true
   fi
 }
 
 default_api_endpoint() {
-  local public_ip=""
-  public_ip="$(detect_public_ip)"
-  if [[ -n "$public_ip" ]]; then
-    printf 'http://%s:%s' "$public_ip" "$PORT"
+  local detected_ip=""
+  detected_ip="$(detect_local_ip)"
+  if [[ -z "${detected_ip}" && "${DETECT_PUBLIC_IP}" -eq 1 ]]; then
+    detected_ip="$(detect_public_ip)"
+  fi
+  if [[ -n "${detected_ip}" ]]; then
+    printf 'http://%s:%s' "${detected_ip}" "$PORT"
   else
     printf 'http://127.0.0.1:%s' "$PORT"
   fi
@@ -533,65 +893,6 @@ ensure_self_signed_tls_proxy() {
   fail "Unable to configure HTTPS proxy with self-signed certificate (nginx/caddy unavailable)"
 }
 
-apply_cluster_secrets_from_join_json() {
-  local join_json="$1"
-  local extracted=""
-  local auth_secret_key=""
-  local cluster_signing_key=""
-  local updated="0"
-
-  extracted="$(printf '%s' "$join_json" | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("auth_secret_key","")); print(data.get("cluster_signing_key",""))' 2>/dev/null || true)"
-  auth_secret_key="$(printf '%s\n' "$extracted" | sed -n '1p')"
-  cluster_signing_key="$(printf '%s\n' "$extracted" | sed -n '2p')"
-
-  if [[ -z "$auth_secret_key" || -z "$cluster_signing_key" ]]; then
-    echo "warning: cluster secrets missing from join response; keeping local values."
-    return 0
-  fi
-
-  updated="$(python3 - <<PY
-import pathlib
-
-env_path = pathlib.Path(".env")
-if env_path.exists():
-    lines = env_path.read_text(encoding="utf-8").splitlines()
-else:
-    lines = []
-
-kv = {}
-for line in lines:
-    if "=" in line and not line.lstrip().startswith("#"):
-        key, value = line.split("=", 1)
-        kv[key.strip()] = value.strip()
-
-changed = False
-if kv.get("AUTH_SECRET_KEY", "") != "${auth_secret_key}":
-    kv["AUTH_SECRET_KEY"] = "${auth_secret_key}"
-    changed = True
-if kv.get("CLUSTER_SIGNING_KEY", "") != "${cluster_signing_key}":
-    kv["CLUSTER_SIGNING_KEY"] = "${cluster_signing_key}"
-    changed = True
-
-if changed:
-    ordered = sorted(kv.items(), key=lambda item: item[0])
-    env_path.write_text("".join(f"{k}={v}\n" for k, v in ordered), encoding="utf-8")
-print("1" if changed else "0")
-PY
-)"
-
-  if [[ "$updated" == "1" ]]; then
-    echo "Applied cluster-internal signing secrets from enrollment response."
-    systemctl restart uptime-mesh.service
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-      if curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
-        break
-      fi
-      sleep 1
-    done
-    curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null
-  fi
-}
-
 run_wizard() {
   local reply=""
   local endpoint_default=""
@@ -725,8 +1026,9 @@ print_install_summary() {
 | api_service       : ${api_status}
 | agent_service     : ${agent_status}
 | install_log       : ${INSTALL_LOG}
-| app_log           : ${APP_DIR}/data/app.log
-| agent_log         : ${APP_DIR}/data/agent.log
+| update_log        : ${APP_DIR}/data/logs/update.log
+| app_log           : ${APP_DIR}/data/logs/app.log
+| agent_log         : ${APP_DIR}/data/logs/agent.log
 | agent_socket      : ${APP_DIR}/data/agent.sock
 +--------------------------------------------------------------+
 EOF
@@ -755,6 +1057,10 @@ while [[ $# -gt 0 ]]; do
       JOIN_PORT="$2"; shift 2 ;;
     --port)
       PORT="$2"; shift 2 ;;
+    --force)
+      FORCE_INSTALL=1; shift ;;
+    --detect-public-ip)
+      DETECT_PUBLIC_IP=1; shift ;;
     --install-deps)
       INSTALL_DEPS=1; shift ;;
     --wizard)
@@ -834,19 +1140,23 @@ if [[ -n "$JOIN_TARGET" && -z "$JOIN_TOKEN" ]]; then
   exit 1
 fi
 
+if [[ -f "${APP_DIR}/VERSION" && -f "${APP_DIR}/.env" && "$FORCE_INSTALL" -ne 1 ]]; then
+  fail "installation already initialized in ${APP_DIR} (use --force to reinstall)"
+fi
+
+run_preflight_checks
+
 if [[ "$INSTALL_DEPS" -eq 1 ]]; then
   say "Installing system dependencies (quiet mode, details in install.log)"
   export DEBIAN_FRONTEND=noninteractive
   apt_quiet_retry "Refresh apt package index" apt-get update -y || fail "apt update failed"
   apt_quiet_retry \
     "Install required base packages" \
-    apt-get install -y python3 python3-venv python3-pip curl ca-certificates git golang-go iproute2 iputils-ping openssl \
+    apt-get install -y python3 python3-venv python3-pip curl ca-certificates git golang-go iproute2 iputils-ping openssl wireguard-tools \
     || fail "required base package install failed"
 
-  apt_install_optional lxd
-  if ! run_quiet_command "Install optional package set: etcd" apt-get install -y etcd; then
-    run_quiet_command "Install optional package set: etcd-server + etcd-client" apt-get install -y etcd-server etcd-client || true
-  fi
+  install_required_lxd
+  install_required_etcd
   apt_install_optional nginx
   apt_install_optional caddy
   run_quiet_command \
@@ -855,8 +1165,10 @@ if [[ "$INSTALL_DEPS" -eq 1 ]]; then
     || warn "monitoring stack packages were not fully installed"
 fi
 
+ensure_required_runtime_binaries
+
 ETCD_AVAILABLE=0
-if command -v etcdctl >/dev/null 2>&1 || command -v etcd >/dev/null 2>&1; then
+if command -v etcd >/dev/null 2>&1; then
   ETCD_AVAILABLE=1
 fi
 
@@ -874,8 +1186,11 @@ fi
 run_quiet_command "Upgrade pip" .venv/bin/pip install --upgrade pip || fail "pip upgrade failed"
 run_quiet_command "Install Python app dependencies" .venv/bin/pip install -e . || fail "python dependency install failed"
 mkdir -p data
+mkdir -p data/logs
 
 require_cmd go
+export GOFLAGS="${GOFLAGS:--mod=mod}"
+export GOPROXY="${GOPROXY:-https://proxy.golang.org,direct}"
 mkdir -p bin
 say "Building Go agent binary"
 run_quiet_command \
@@ -908,9 +1223,11 @@ def setv(key: str, value: str) -> None:
     kv[key] = value
 
 setv("DATABASE_URL", "sqlite+aiosqlite:///./data/app.db")
+setv("APP_ENV", "prod")
 setv("LOG_LEVEL", kv.get("LOG_LEVEL", "INFO") or "INFO")
-setv("LOG_FILE", "./data/app.log")
-setv("AGENT_LOG_FILE", kv.get("AGENT_LOG_FILE", "./data/agent.log") or "./data/agent.log")
+setv("LOG_FILE", "./data/logs/app.log")
+setv("AUTH_COOKIE_SECURE", "true")
+setv("AGENT_LOG_FILE", kv.get("AGENT_LOG_FILE", "./data/logs/agent.log") or "./data/logs/agent.log")
 setv("AGENT_ENABLE_UNIX_SOCKET", kv.get("AGENT_ENABLE_UNIX_SOCKET", "true") or "true")
 setv("AGENT_UNIX_SOCKET", kv.get("AGENT_UNIX_SOCKET", "./data/agent.sock") or "./data/agent.sock")
 setv("MANAGED_CONFIG_PATH", kv.get("MANAGED_CONFIG_PATH", "config.yaml") or "config.yaml")
@@ -1088,11 +1405,12 @@ if (not kv.get("CLUSTER_SIGNING_KEY")) or kv["CLUSTER_SIGNING_KEY"].startswith("
     setv("CLUSTER_SIGNING_KEY", secrets.token_hex(32))
 
 ordered = sorted(kv.items(), key=lambda x: x[0])
-env_path.write_text("".join(f"{k}={v}\n" for k, v in ordered), encoding="utf-8")
+tmp_env_path = env_path.with_name(f"{env_path.name}.tmp")
+tmp_env_path.write_text("".join(f"{k}={v}\n" for k, v in ordered), encoding="utf-8")
+tmp_env_path.replace(env_path)
 PY
 
-say "Applying database migrations"
-run_quiet_command "Run Alembic migrations" .venv/bin/alembic upgrade head || fail "database migrations failed"
+run_migrations_with_rollback
 
 say "Syncing monitoring configuration files"
 install -d /etc/uptime-mesh/monitoring/grafana/provisioning/dashboards
@@ -1100,21 +1418,21 @@ install -d /etc/uptime-mesh/monitoring/grafana/provisioning/datasources
 install -d /etc/uptime-mesh/monitoring/grafana/dashboards
 install -d /etc/prometheus
 install -d /etc/alertmanager
-cp "${APP_DIR}/ops/monitoring/prometheus.yml" /etc/uptime-mesh/monitoring/prometheus.yml
-cp "${APP_DIR}/ops/monitoring/alert_rules.yml" /etc/uptime-mesh/monitoring/alert_rules.yml
-cp "${APP_DIR}/ops/monitoring/alertmanager.yml" /etc/uptime-mesh/monitoring/alertmanager.yml
-cp "${APP_DIR}/ops/monitoring/grafana/provisioning/dashboards/uptimemesh.yml" /etc/uptime-mesh/monitoring/grafana/provisioning/dashboards/uptimemesh.yml
-cp "${APP_DIR}/ops/monitoring/grafana/provisioning/datasources/uptimemesh.yml" /etc/uptime-mesh/monitoring/grafana/provisioning/datasources/uptimemesh.yml
-cp "${APP_DIR}/ops/monitoring/grafana/dashboards/uptimemesh-overview.json" /etc/uptime-mesh/monitoring/grafana/dashboards/uptimemesh-overview.json
-cp "${APP_DIR}/ops/monitoring/prometheus.yml" /etc/prometheus/prometheus.yml || true
-cp "${APP_DIR}/ops/monitoring/alertmanager.yml" /etc/alertmanager/alertmanager.yml || true
+copy_file_or_fail "${APP_DIR}/ops/monitoring/prometheus.yml" /etc/uptime-mesh/monitoring/prometheus.yml
+copy_file_or_fail "${APP_DIR}/ops/monitoring/alert_rules.yml" /etc/uptime-mesh/monitoring/alert_rules.yml
+copy_file_or_fail "${APP_DIR}/ops/monitoring/alertmanager.yml" /etc/uptime-mesh/monitoring/alertmanager.yml
+copy_file_or_fail "${APP_DIR}/ops/monitoring/grafana/provisioning/dashboards/uptimemesh.yml" /etc/uptime-mesh/monitoring/grafana/provisioning/dashboards/uptimemesh.yml
+copy_file_or_fail "${APP_DIR}/ops/monitoring/grafana/provisioning/datasources/uptimemesh.yml" /etc/uptime-mesh/monitoring/grafana/provisioning/datasources/uptimemesh.yml
+copy_file_or_fail "${APP_DIR}/ops/monitoring/grafana/dashboards/uptimemesh-overview.json" /etc/uptime-mesh/monitoring/grafana/dashboards/uptimemesh-overview.json
+copy_file_or_fail "${APP_DIR}/ops/monitoring/prometheus.yml" /etc/prometheus/prometheus.yml
+copy_file_or_fail "${APP_DIR}/ops/monitoring/alertmanager.yml" /etc/alertmanager/alertmanager.yml
 if [[ -d /etc/grafana/provisioning ]]; then
   install -d /etc/grafana/provisioning/dashboards
   install -d /etc/grafana/provisioning/datasources
   install -d /var/lib/grafana/dashboards
-  cp "${APP_DIR}/ops/monitoring/grafana/provisioning/dashboards/uptimemesh.yml" /etc/grafana/provisioning/dashboards/uptimemesh.yml || true
-  cp "${APP_DIR}/ops/monitoring/grafana/provisioning/datasources/uptimemesh.yml" /etc/grafana/provisioning/datasources/uptimemesh.yml || true
-  cp "${APP_DIR}/ops/monitoring/grafana/dashboards/uptimemesh-overview.json" /var/lib/grafana/dashboards/uptimemesh-overview.json || true
+  copy_file_or_fail "${APP_DIR}/ops/monitoring/grafana/provisioning/dashboards/uptimemesh.yml" /etc/grafana/provisioning/dashboards/uptimemesh.yml
+  copy_file_or_fail "${APP_DIR}/ops/monitoring/grafana/provisioning/datasources/uptimemesh.yml" /etc/grafana/provisioning/datasources/uptimemesh.yml
+  copy_file_or_fail "${APP_DIR}/ops/monitoring/grafana/dashboards/uptimemesh-overview.json" /var/lib/grafana/dashboards/uptimemesh-overview.json
 fi
 
 say "Installing systemd units"
@@ -1123,15 +1441,17 @@ cat > /etc/systemd/system/uptime-mesh.service <<SYSTEMD
 Description=UptimeMesh API
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
 WorkingDirectory=${APP_DIR}
 ExecStart=${APP_DIR}/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port ${PORT}
 Restart=always
-RestartSec=2
+RestartSec=5
 Environment=PYTHONUNBUFFERED=1
-Environment=LOG_FILE=./data/app.log
+Environment=LOG_FILE=./data/logs/app.log
 
 [Install]
 WantedBy=multi-user.target
@@ -1142,16 +1462,18 @@ cat > /etc/systemd/system/uptime-mesh-agent.service <<SYSTEMD
 Description=UptimeMesh Go Agent
 After=network-online.target uptime-mesh.service
 Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
 WorkingDirectory=${APP_DIR}
 ExecStart=${APP_DIR}/bin/uptimemesh-agent --env-file ${APP_DIR}/.env
 Restart=always
-RestartSec=2
+RestartSec=5
 Environment=PYTHONUNBUFFERED=1
-Environment=LOG_FILE=./data/agent.log
-Environment=AGENT_LOG_FILE=./data/agent.log
+Environment=LOG_FILE=./data/logs/agent.log
+Environment=AGENT_LOG_FILE=./data/logs/agent.log
 Environment=AGENT_ENABLE_UNIX_SOCKET=true
 Environment=AGENT_UNIX_SOCKET=./data/agent.sock
 
@@ -1170,8 +1492,8 @@ Type=oneshot
 WorkingDirectory=${APP_DIR}
 ExecStart=${APP_DIR}/.venv/bin/python ${APP_DIR}/ops/watchdog.py --api-url http://127.0.0.1:${PORT}/health --api-service uptime-mesh.service --agent-service uptime-mesh-agent.service
 Environment=PYTHONUNBUFFERED=1
-Environment=LOG_FILE=./data/app.log
-Environment=AGENT_LOG_FILE=./data/agent.log
+Environment=LOG_FILE=./data/logs/app.log
+Environment=AGENT_LOG_FILE=./data/logs/agent.log
 SYSTEMD
 
 cat > /etc/systemd/system/uptime-mesh-watchdog.timer <<SYSTEMD
@@ -1189,6 +1511,34 @@ Persistent=true
 WantedBy=timers.target
 SYSTEMD
 
+cat > /etc/systemd/system/uptime-mesh-update.service <<SYSTEMD
+[Unit]
+Description=UptimeMesh bootstrap/update dispatcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=${APP_DIR}
+ExecStart=${APP_DIR}/ops/bootstrap.sh --install-dir ${APP_DIR} --version-url ${DEFAULT_VERSION_URL} --channel ${UPDATE_CHANNEL}
+Environment=UPDATE_LOG=${APP_DIR}/data/logs/update.log
+SYSTEMD
+
+cat > /etc/systemd/system/uptime-mesh-update.timer <<SYSTEMD
+[Unit]
+Description=Run UptimeMesh bootstrap/update hourly
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+Unit=uptime-mesh-update.service
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+SYSTEMD
+
 systemctl daemon-reload
 
 enable_service_if_exists etcd.service
@@ -1199,8 +1549,12 @@ systemctl enable uptime-mesh.service
 systemctl restart uptime-mesh.service || systemctl start uptime-mesh.service
 ensure_self_signed_tls_proxy
 systemctl enable --now uptime-mesh-watchdog.timer
+systemctl enable --now uptime-mesh-update.timer
 if ! systemctl start uptime-mesh-watchdog.service >/dev/null 2>&1; then
   warn "watchdog initial run failed; timer will retry automatically"
+fi
+if ! systemctl start uptime-mesh-update.service >/dev/null 2>&1; then
+  warn "update bootstrap initial run failed; timer will retry automatically"
 fi
 enable_service_if_exists prometheus.service
 enable_service_if_exists prometheus-node-exporter.service
@@ -1215,54 +1569,28 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
 done
 curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null
 
-if [[ "$BOOTSTRAP" -eq 1 ]]; then
-  bootstrap_prep_json="$(INSTALL_ADMIN_USERNAME="${INSTALL_ADMIN_USERNAME}" ${APP_DIR}/.venv/bin/python - <<'PY'
-import datetime as dt
+python3 - <<'PY'
 import json
-import os
-import secrets
-import sqlite3
-import string
+from pathlib import Path
 
-from app.security import hash_password
-
-conn = sqlite3.connect("data/app.db")
-cur = conn.cursor()
-
-def get_value(key: str) -> str:
-    row = cur.execute("SELECT value FROM cluster_settings WHERE key = ?", (key,)).fetchone()
-    return row[0] if row else ""
-
-bootstrapped = get_value("cluster_bootstrapped").strip().lower() == "true"
-
-if bootstrapped:
-    print(json.dumps({"action": "already_bootstrapped"}))
-    raise SystemExit(0)
-
-alphabet = string.ascii_letters + string.digits + "-_"
-username = os.environ.get("INSTALL_ADMIN_USERNAME", "").strip() or "admin"
-password = "".join(secrets.choice(alphabet) for _ in range(28))
-password_hash = hash_password(password)
-updated_at = dt.datetime.now(dt.timezone.utc).isoformat()
-
-for key, value in (
-    ("auth_username", username),
-    ("auth_password_hash", password_hash),
-    ("auth_password_updated_at", updated_at),
-):
-    cur.execute(
-        """
-        INSERT INTO cluster_settings (key, value)
-        VALUES (?, ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-        """,
-        (key, value),
-    )
-
-conn.commit()
-print(json.dumps({"action": "generated", "username": username, "password": password}))
+version_file = Path("version.json")
+target = Path("VERSION")
+resolved = ""
+if version_file.exists():
+    try:
+        doc = json.loads(version_file.read_text(encoding="utf-8"))
+        channels = doc.get("channels", {}) if isinstance(doc, dict) else {}
+        stable = channels.get("stable", {}) if isinstance(channels, dict) else {}
+        resolved = str(stable.get("version") or doc.get("version") or "").strip()
+    except Exception:
+        resolved = ""
+if not resolved:
+    resolved = "unknown"
+target.write_text(f"{resolved}\n", encoding="utf-8")
 PY
-)"
+
+if [[ "$BOOTSTRAP" -eq 1 ]]; then
+  bootstrap_prep_json="$(${APP_DIR}/.venv/bin/uptimemesh prepare-bootstrap-admin --username "${INSTALL_ADMIN_USERNAME}")"
   bootstrap_action="$(printf '%s' "$bootstrap_prep_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("action",""))')"
   if [[ "$bootstrap_action" == "generated" ]]; then
     INITIAL_ADMIN_USERNAME="$(printf '%s' "$bootstrap_prep_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("username",""))')"
@@ -1281,8 +1609,7 @@ PY
     if [[ -n "$ETCD_PEER_URL" ]]; then
       join_cmd+=(--etcd-peer-url "${ETCD_PEER_URL}")
     fi
-    join_json="$("${join_cmd[@]}")"
-    apply_cluster_secrets_from_join_json "$join_json"
+    "${join_cmd[@]}" >/dev/null
     INITIAL_ADMIN_GENERATED=1
     echo "Bootstrap complete."
   else
@@ -1301,8 +1628,7 @@ elif [[ -n "$JOIN_TOKEN" ]]; then
   if [[ -n "$ETCD_PEER_URL" ]]; then
     join_cmd+=(--etcd-peer-url "${ETCD_PEER_URL}")
   fi
-  join_json="$("${join_cmd[@]}")"
-  apply_cluster_secrets_from_join_json "$join_json"
+  "${join_cmd[@]}" >/dev/null
   echo "Join complete."
 else
   echo "Install complete (service running)."

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Any, List, Optional
 from uuid import uuid4
 
 from sqlalchemy import select
@@ -63,6 +63,177 @@ def _extract_pinned_placement(spec: dict[str, object]) -> tuple[list[dict[str, o
             }
         )
     return items, strict
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:  # noqa: BLE001
+        return default
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return _as_utc(value)
+    if not isinstance(value, str):
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    try:
+        normalized = raw.replace("Z", "+00:00")
+        return _as_utc(datetime.fromisoformat(normalized))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _format_timestamp(value: datetime | None) -> str:
+    timestamp = _as_utc(value)
+    if timestamp is None:
+        return "-"
+    return timestamp.strftime("%Y-%m-%d %H:%M:%SZ")
+
+
+def _format_duration(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, rem_seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {rem_seconds}s"
+    hours, rem_minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h {rem_minutes}m"
+    days, rem_hours = divmod(hours, 24)
+    return f"{days}d {rem_hours}h"
+
+
+def _format_age(now: datetime, value: datetime | None) -> str:
+    timestamp = _as_utc(value)
+    if timestamp is None:
+        return "-"
+    seconds = max(int((now - timestamp).total_seconds()), 0)
+    return f"{_format_duration(seconds)} ago"
+
+
+def build_rollout_rows(
+    services: list[Service],
+    replicas: list[Replica],
+    *,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    now_utc = _as_utc(now) or datetime.now(timezone.utc)
+    replicas_by_service: dict[str, list[Replica]] = {}
+    for replica in replicas:
+        replicas_by_service.setdefault(str(replica.service_id), []).append(replica)
+
+    rows: list[dict[str, Any]] = []
+    for service in sorted(services, key=lambda item: str(getattr(item, "name", "")).lower()):
+        service_id = str(service.id)
+        generation = int(service.generation or 0)
+        service_spec = service.spec if isinstance(service.spec, dict) else {}
+        rollout_requested_at = _parse_iso_datetime(service_spec.get("rollout_requested_at"))
+        service_replicas = replicas_by_service.get(service_id, [])
+
+        total = len(service_replicas)
+        up_to_date = 0
+        outdated = 0
+        pending = 0
+        in_progress = 0
+        failed = 0
+        oldest_pending_at: datetime | None = None
+
+        for replica in service_replicas:
+            status = replica.status if isinstance(replica.status, dict) else {}
+            applied_generation = _safe_int(status.get("applied_generation", "0"), default=0)
+            update_state = str(status.get("update_state", "")).strip().lower()
+            replica_updated_at = _as_utc(getattr(replica, "updated_at", None))
+
+            if generation > 0 and applied_generation >= generation:
+                up_to_date += 1
+            else:
+                outdated += 1
+
+            if update_state in {"pending", "queued"}:
+                pending += 1
+                if replica_updated_at and (
+                    oldest_pending_at is None or replica_updated_at < oldest_pending_at
+                ):
+                    oldest_pending_at = replica_updated_at
+            elif update_state in {"in_progress", "updating", "restarting", "rolling"}:
+                in_progress += 1
+            elif update_state in {"failed", "error", "stalled"}:
+                failed += 1
+
+        progress_pct = round((up_to_date / total) * 100.0, 1) if total > 0 else 0.0
+        pending_age_seconds = (
+            int(max((now_utc - oldest_pending_at).total_seconds(), 0)) if oldest_pending_at else None
+        )
+        rollout_age_seconds = (
+            int(max((now_utc - rollout_requested_at).total_seconds(), 0))
+            if rollout_requested_at
+            else None
+        )
+        stalled = False
+        if outdated > 0:
+            if pending_age_seconds is not None and pending_age_seconds >= 900:
+                stalled = True
+            elif (
+                pending == 0
+                and in_progress == 0
+                and rollout_age_seconds is not None
+                and rollout_age_seconds >= 900
+            ):
+                stalled = True
+
+        if total == 0:
+            state_key = "no_replicas"
+            state_text = "No Replicas"
+        elif outdated == 0:
+            state_key = "complete"
+            state_text = "Complete"
+        elif failed > 0:
+            state_key = "error"
+            state_text = "Error"
+        elif stalled:
+            state_key = "stalled"
+            state_text = "Stalled"
+        elif pending > 0 or in_progress > 0:
+            state_key = "rolling"
+            state_text = "Rolling"
+        else:
+            state_key = "outdated"
+            state_text = "Outdated"
+
+        rows.append(
+            {
+                "service_id": service_id,
+                "service_name": str(service.name),
+                "description": service.description or "",
+                "generation": generation,
+                "total": total,
+                "up_to_date": up_to_date,
+                "outdated": outdated,
+                "pending": pending,
+                "in_progress": in_progress,
+                "failed": failed,
+                "progress_pct": progress_pct,
+                "state_key": state_key,
+                "state_text": state_text,
+                "stalled": stalled,
+                "rollout_requested_at": _format_timestamp(rollout_requested_at),
+                "rollout_requested_age": _format_age(now_utc, rollout_requested_at),
+                "oldest_pending_age": _format_age(now_utc, oldest_pending_at),
+            }
+        )
+    return rows
 
 
 async def list_services(session: AsyncSession, limit: int = 100) -> List[Service]:

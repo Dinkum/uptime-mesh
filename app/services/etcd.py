@@ -52,6 +52,16 @@ class EtcdMemberAddResult:
     peer_urls: list[str]
 
 
+@dataclass(frozen=True)
+class _LeaseCacheEntry:
+    lease_id: str
+    ttl_seconds: int
+
+
+_LEASE_CACHE: dict[str, _LeaseCacheEntry] = {}
+_LEASE_CACHE_LOCK = asyncio.Lock()
+
+
 def _parse_endpoints(raw: str) -> list[str]:
     parts = [item.strip().rstrip("/") for item in raw.split(",") if item.strip()]
     return parts
@@ -344,9 +354,46 @@ async def grant_lease(*, ttl_seconds: int) -> str:
     raise EtcdError("lease.grant", f"unable to parse lease id from output: {out}")
 
 
+async def keepalive_lease(*, lease_id: str) -> None:
+    clean_lease_id = lease_id.strip()
+    if not clean_lease_id:
+        raise EtcdError("lease.keepalive", "lease_id is required")
+    await _run_checked(
+        args=("lease", "keep-alive", clean_lease_id, "--once", "-w", "json"),
+        action="lease.keepalive",
+        timeout_seconds=15,
+    )
+
+
 async def put_json_with_lease(*, key: str, payload: dict[str, object], ttl_seconds: int) -> str:
+    cache_key = _prefix_key(key)
+    payload_json = json.dumps(payload, separators=(",", ":"))
+    cached_entry: _LeaseCacheEntry | None
+
+    async with _LEASE_CACHE_LOCK:
+        cached_entry = _LEASE_CACHE.get(cache_key)
+
+    if cached_entry is not None and cached_entry.ttl_seconds == ttl_seconds:
+        try:
+            await keepalive_lease(lease_id=cached_entry.lease_id)
+            await put_value(key=key, value=payload_json, lease_id=cached_entry.lease_id)
+            return cached_entry.lease_id
+        except EtcdError as exc:
+            _logger.warning(
+                "lease.reuse_failed",
+                "Cached lease reuse failed; issuing new lease",
+                key=cache_key,
+                lease_id=cached_entry.lease_id,
+                ttl_seconds=ttl_seconds,
+                error=str(exc),
+            )
+            async with _LEASE_CACHE_LOCK:
+                _LEASE_CACHE.pop(cache_key, None)
+
     lease_id = await grant_lease(ttl_seconds=ttl_seconds)
-    await put_value(key=key, value=json.dumps(payload, separators=(",", ":")), lease_id=lease_id)
+    await put_value(key=key, value=payload_json, lease_id=lease_id)
+    async with _LEASE_CACHE_LOCK:
+        _LEASE_CACHE[cache_key] = _LeaseCacheEntry(lease_id=lease_id, ttl_seconds=ttl_seconds)
     return lease_id
 
 

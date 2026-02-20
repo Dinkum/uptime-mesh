@@ -7,7 +7,7 @@ def seed_cluster_settings(connection: Connection) -> None:
     statements = [
         ("mesh_domain", "mesh.local", True),
         ("mesh_cidr", "10.42.0.0/16", True),
-        ("etcd_status", "ok", True),
+        ("etcd_status", "ok", False),
         ("etcd_last_sync_at", "", True),
         ("auth_username", "", False),
         ("auth_password_hash", "", False),

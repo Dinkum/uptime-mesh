@@ -1,6 +1,56 @@
 {% extends "layout.html" %}
 
 {% block content %}
+  <div class="mesh-card bg-white rounded-2xl p-6 mb-6">
+    <h2 class="text-lg font-semibold">Rolling Update Progress By Service</h2>
+    <div class="overflow-x-auto mt-4">
+      <table class="table w-full align-middle">
+        <thead>
+          <tr>
+            <th>Service</th>
+            <th>Progress</th>
+            <th>State</th>
+            <th>Pending Oldest</th>
+            <th>Counts</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in rollout_rows %}
+            <tr>
+              <td>
+                <p class="font-semibold">{{ row.service_name }}</p>
+                <p class="mono text-[11px] text-slate-500">{{ row.service_id }}</p>
+              </td>
+              <td>
+                <p class="mono text-xs">{{ row.progress_pct }}%</p>
+                <progress class="progress progress-info w-40" value="{{ row.progress_pct }}" max="100"></progress>
+              </td>
+              <td>
+                {% if row.state_key == "complete" %}
+                  <span class="badge badge-success badge-outline">{{ row.state_text }}</span>
+                {% elif row.state_key == "rolling" %}
+                  <span class="badge badge-info badge-outline">{{ row.state_text }}</span>
+                {% elif row.state_key in ["stalled", "outdated"] %}
+                  <span class="badge badge-warning badge-outline">{{ row.state_text }}</span>
+                {% elif row.state_key == "error" %}
+                  <span class="badge badge-error badge-outline">{{ row.state_text }}</span>
+                {% else %}
+                  <span class="badge badge-outline">{{ row.state_text }}</span>
+                {% endif %}
+              </td>
+              <td class="mono text-xs">{{ row.oldest_pending_age }}</td>
+              <td class="mono text-xs">up {{ row.up_to_date }}/{{ row.total }} · pending {{ row.pending }} · active {{ row.in_progress }} · failed {{ row.failed }}</td>
+            </tr>
+          {% else %}
+            <tr>
+              <td colspan="5" class="text-center text-slate-400">No service rollout data yet.</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
   <div class="mesh-card bg-white rounded-2xl p-6">
     <h2 class="text-lg font-semibold">Replicas</h2>
     <div class="overflow-x-auto mt-4">
@@ -11,18 +61,35 @@
             <th>Service</th>
             <th>Node</th>
             <th>Desired</th>
-            <th>Status</th>
+            <th>Update State</th>
+            <th>Generation</th>
+            <th>Updated</th>
             <th>Actions</th>
           </tr>
         </thead>
         <tbody>
-          {% for replica in replicas %}
+          {% for replica in replica_rows %}
             <tr>
               <td class="mono">{{ replica.id }}</td>
-              <td class="mono">{{ replica.service_id }}</td>
+              <td>
+                <p class="font-medium">{{ replica.service_name }}</p>
+                <p class="mono text-[11px] text-slate-500">{{ replica.service_id }}</p>
+              </td>
               <td class="mono">{{ replica.node_id }}</td>
               <td>{{ replica.desired_state }}</td>
-              <td class="mono text-xs">{{ replica.status }}</td>
+              <td>
+                {% if replica.update_state in ["complete", "healthy", "ok"] %}
+                  <span class="badge badge-success badge-outline">{{ replica.update_state }}</span>
+                {% elif replica.update_state in ["pending", "queued", "in_progress", "updating", "rolling", "restarting"] %}
+                  <span class="badge badge-info badge-outline">{{ replica.update_state }}</span>
+                {% elif replica.update_state in ["failed", "error", "stalled"] %}
+                  <span class="badge badge-error badge-outline">{{ replica.update_state }}</span>
+                {% else %}
+                  <span class="badge badge-outline">{{ replica.update_state }}</span>
+                {% endif %}
+              </td>
+              <td class="mono text-xs">{{ replica.applied_generation }} / {{ replica.target_generation }}</td>
+              <td class="mono text-xs">{{ replica.updated_at }}</td>
               <td>
                 <div class="flex gap-2">
                   <button class="btn btn-xs btn-outline" onclick="replicaAction('{{ replica.id }}', 'restart')">Restart</button>
@@ -33,7 +100,7 @@
             </tr>
           {% else %}
             <tr>
-              <td colspan="6" class="text-center text-slate-400">No replicas defined yet.</td>
+              <td colspan="8" class="text-center text-slate-400">No replicas defined yet.</td>
             </tr>
           {% endfor %}
         </tbody>
