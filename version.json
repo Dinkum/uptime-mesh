@@ -18,7 +18,7 @@
       },
       "source": {
         "url": "https://api.github.com/repos/Dinkum/uptime-mesh/tarball/v0.0.4",
-        "sha256": "3d1de08d7fc616790ea40a520acda7afe6d420ceeae96e189d327b9044375a16"
+        "sha256": "0480b6adc5fe008a7f51ef0705d80f0e796f7e90d6c7fd7c5d8146a8e120fe1d"
       },
       "agent": {
         "name": "uptimemesh-agent",
