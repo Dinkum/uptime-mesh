@@ -29,6 +29,7 @@ from app.routes import (
     monitoring,
     nodes,
     replicas,
+    roles,
     router_assignments,
     scheduler,
     services,
@@ -118,6 +119,10 @@ async def auth_guard(
         "/auth/logout",
         "/cluster/join",
         "/cluster/heartbeat",
+        "/cluster/peers",
+        "/cluster/swim/report",
+        "/cluster/content/active",
+        "/roles/placement",
         "/favicon.ico",
     }
     token = request.cookies.get(SESSION_COOKIE_NAME)
@@ -212,6 +217,7 @@ app.include_router(discovery.router)
 app.include_router(gateway.router)
 app.include_router(monitoring.router)
 app.include_router(router_assignments.router)
+app.include_router(roles.router)
 app.include_router(scheduler.router)
 app.include_router(events.router)
 app.include_router(snapshots.router)

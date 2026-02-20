@@ -1,0 +1,61 @@
+{% extends "layout.html" %}
+
+{% block content %}
+  <section class="mesh-card rounded-2xl p-6">
+    <div class="flex flex-wrap items-center justify-between gap-3">
+      <h2 class="text-lg font-semibold">Role Placement</h2>
+      <p class="text-xs text-slate-500">Generated {{ generated_at or "n/a" }}</p>
+    </div>
+    {% if warnings %}
+      <div class="mt-4 space-y-2">
+        {% for warning in warnings %}
+          <div class="alert alert-warning text-sm">
+            <span>{{ warning }}</span>
+          </div>
+        {% endfor %}
+      </div>
+    {% endif %}
+    <div class="overflow-x-auto mt-4">
+      <table class="table w-full">
+        <thead>
+          <tr>
+            <th>Role</th>
+            <th>Kind</th>
+            <th>Priority</th>
+            <th>Ratio</th>
+            <th>Desired</th>
+            <th>Assigned</th>
+            <th>Deficit</th>
+            <th>Holders</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for role in role_rows %}
+            <tr>
+              <td>
+                <a class="mono hover:underline" href="{{ ui_prefix }}/roles/{{ role.name }}">{{ role.name }}</a>
+              </td>
+              <td class="mono">{{ role.kind }}</td>
+              <td class="mono">{{ role.priority }}</td>
+              <td class="mono">{{ role.ratio }}</td>
+              <td class="mono">{{ role.desired }}</td>
+              <td class="mono">{{ role.assigned }}</td>
+              <td class="mono">{{ role.deficit }}</td>
+              <td class="mono text-xs">
+                {% if role.holders %}
+                  {{ role.holders | join(", ") }}
+                {% else %}
+                  -
+                {% endif %}
+              </td>
+            </tr>
+          {% else %}
+            <tr>
+              <td colspan="8" class="text-slate-500">No role definitions found.</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}

@@ -1,0 +1,58 @@
+{% extends "layout.html" %}
+
+{% block content %}
+  <div class="flex items-center gap-2 mb-5">
+    <a class="btn btn-sm btn-outline" href="{{ ui_prefix }}/roles">Back to Roles</a>
+  </div>
+
+  <section class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+    <article class="mesh-card rounded-2xl p-5">
+      <p class="text-xs text-slate-500">Desired</p>
+      <p class="text-3xl font-semibold">{{ placement.desired or 0 }}</p>
+    </article>
+    <article class="mesh-card rounded-2xl p-5">
+      <p class="text-xs text-slate-500">Assigned</p>
+      <p class="text-3xl font-semibold">{{ placement.assigned or 0 }}</p>
+    </article>
+    <article class="mesh-card rounded-2xl p-5">
+      <p class="text-xs text-slate-500">Deficit</p>
+      <p class="text-3xl font-semibold">{{ placement.deficit or 0 }}</p>
+    </article>
+  </section>
+
+  <section class="grid grid-cols-1 xl:grid-cols-2 gap-5">
+    <article class="mesh-card rounded-2xl p-6">
+      <h2 class="text-lg font-semibold mb-4">Role Spec</h2>
+      <div class="space-y-2 text-sm">
+        <div class="flex justify-between"><span class="text-slate-500">Kind</span><span class="mono">{{ spec.kind }}</span></div>
+        <div class="flex justify-between"><span class="text-slate-500">Priority</span><span class="mono">{{ spec.priority }}</span></div>
+        <div class="flex justify-between"><span class="text-slate-500">Ratio</span><span class="mono">{{ spec.ratio }}</span></div>
+        <div class="flex justify-between"><span class="text-slate-500">Min Replicas</span><span class="mono">{{ spec.min_replicas }}</span></div>
+        <div class="flex justify-between"><span class="text-slate-500">Max Replicas</span><span class="mono">{{ spec.max_replicas }}</span></div>
+        <div class="flex justify-between"><span class="text-slate-500">Cooldown</span><span class="mono">{{ spec.cooldown_seconds }}s</span></div>
+        <div class="flex justify-between"><span class="text-slate-500">Slot Count</span><span class="mono">{{ spec.slot_count }}</span></div>
+        <div class="flex justify-between"><span class="text-slate-500">Runtime Template</span><span class="mono">{{ spec.runtime_template or "-" }}</span></div>
+      </div>
+    </article>
+
+    <article class="mesh-card rounded-2xl p-6">
+      <h2 class="text-lg font-semibold mb-4">Holder Nodes</h2>
+      <div class="space-y-3">
+        {% for node in holder_nodes %}
+          <a href="{{ ui_prefix }}/nodes/{{ node.id }}" class="block rounded-xl border border-slate-700/40 px-4 py-3 hover:border-cyan-300/60">
+            <div class="flex items-center justify-between">
+              <p class="mono">{{ node.id }}</p>
+              <p class="text-xs text-slate-500">{{ node.roles_text }}</p>
+            </div>
+            <p class="text-xs text-slate-500 mt-1">
+              load {% if node.load_total is not none %}{{ "%.1f"|format(node.load_total) }}{% else %}--{% endif %}
+              · swim {{ node.swim_state }}
+            </p>
+          </a>
+        {% else %}
+          <p class="text-slate-500">No holder nodes assigned.</p>
+        {% endfor %}
+      </div>
+    </article>
+  </section>
+{% endblock %}

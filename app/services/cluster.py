@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import base64
 import json
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import List, Optional, Tuple
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -44,10 +46,89 @@ BOOTSTRAPPED_KEY = "cluster_bootstrapped"
 BOOTSTRAP_AT_KEY = "cluster_bootstrapped_at"
 AUTH_SECRET_KEY_SETTING = "auth_secret_key"
 CLUSTER_SIGNING_KEY_SETTING = "cluster_signing_key"
+SWIM_MEMBERSHIP_KEY = "swim_membership_json"
+CONTENT_VERSION_KEY = "internal_cdn_active_version"
+CONTENT_HASH_KEY = "internal_cdn_active_hash_sha256"
+CONTENT_SIZE_KEY = "internal_cdn_active_size_bytes"
+CONTENT_BODY_KEY = "internal_cdn_active_body_base64"
+CONTENT_SEEDED_AT_KEY = "internal_cdn_seeded_at"
+
+_ROLE_ALIASES = {
+    "worker": "general",
+    "gateway": "general",
+    "node": "general",
+    "general": "general",
+    "backend_server": "backend_server",
+    "reverse_proxy": "reverse_proxy",
+}
+
+_DEFAULT_CONTENT_HTML = """<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hello World</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        background: radial-gradient(circle at 12% 12%, rgba(56, 189, 248, 0.35), transparent 40%),
+          radial-gradient(circle at 88% 16%, rgba(74, 222, 128, 0.28), transparent 34%),
+          linear-gradient(165deg, #020617 0%, #0b1220 48%, #111827 100%);
+        font-family: "Space Grotesk", system-ui, sans-serif;
+      }
+      h1 {
+        margin: 0;
+        padding: 1.5rem 2.2rem;
+        border: 1px solid rgba(148, 163, 184, 0.35);
+        border-radius: 1rem;
+        background: rgba(15, 23, 42, 0.78);
+        color: #f8fafc;
+        font-size: clamp(2.2rem, 8vw, 4rem);
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.18), 0 0 36px rgba(56, 189, 248, 0.22);
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Hello World</h1>
+  </body>
+</html>
+"""
 
 
 def _hash_secret(secret: str) -> str:
     return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+
+def _content_sha256(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _canonical_role(value: str) -> str:
+    clean = str(value).strip().lower()
+    if clean in _ROLE_ALIASES:
+        return _ROLE_ALIASES[clean]
+    return "general"
+
+
+def _parse_json_map(value: str) -> dict[str, object]:
+    raw = value.strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if isinstance(parsed, dict):
+        return parsed
+    return {}
 
 
 def _utcnow() -> datetime:
@@ -96,7 +177,12 @@ def _resolve_etcd_peer_url(payload: NodeJoinRequest) -> str:
 
 def _is_worker_node(node: Node) -> bool:
     roles = node.roles if isinstance(node.roles, list) else []
-    return any(str(role).strip().lower() == "worker" for role in roles)
+    normalized = {str(role).strip().lower() for role in roles if str(role).strip()}
+    if not normalized:
+        return False
+    if normalized == {"gateway"}:
+        return False
+    return bool(normalized & {"worker", "general", "backend_server", "reverse_proxy"})
 
 
 def _desired_router_pair(node_id: str, worker_ids: list[str]) -> tuple[str, str]:
@@ -115,14 +201,14 @@ async def _reconcile_router_assignments(
 ) -> tuple[int, int]:
     async with _logger.operation(
         "router_assignment.reconcile",
-        "Reconciling router assignments for worker nodes",
+        "Reconciling router assignments for eligible nodes",
         changed_node_id=changed_node_id,
     ) as op:
         node_rows = await session.execute(select(Node))
         nodes = list(node_rows.scalars().all())
         worker_ids = sorted(node.id for node in nodes if _is_worker_node(node))
         if not worker_ids:
-            op.step("worker.none", "No worker nodes found; skipping router assignment reconcile")
+            op.step("nodes.none", "No eligible nodes found; skipping router assignment reconcile")
             return 0, 0
 
         assignment_rows = await session.execute(select(RouterAssignment))
@@ -269,6 +355,36 @@ async def _resolve_cluster_secrets(
     return auth_secret_key, cluster_signing_key, bool(updates)
 
 
+async def _ensure_default_content_registry(session: AsyncSession) -> None:
+    settings_map = await cluster_settings.get_settings_map(session)
+    has_existing = bool(settings_map.get(CONTENT_HASH_KEY, "").strip()) and bool(
+        settings_map.get(CONTENT_BODY_KEY, "").strip()
+    )
+    if has_existing:
+        return
+
+    content_root = Path("data/content/default")
+    content_root.mkdir(parents=True, exist_ok=True)
+    index_path = content_root / "index.html"
+    if not index_path.exists():
+        index_path.write_text(_DEFAULT_CONTENT_HTML, encoding="utf-8")
+    raw = index_path.read_bytes()
+    payload = {
+        CONTENT_VERSION_KEY: "bootstrap-v1",
+        CONTENT_HASH_KEY: _content_sha256(raw),
+        CONTENT_SIZE_KEY: str(len(raw)),
+        CONTENT_BODY_KEY: base64.b64encode(raw).decode("ascii"),
+        CONTENT_SEEDED_AT_KEY: _utcnow().isoformat(),
+    }
+    await cluster_settings.upsert_settings(session, payload, sync_file=False)
+    _logger.info(
+        "content.seed",
+        "Seeded default internal CDN content",
+        version=payload[CONTENT_VERSION_KEY],
+        size_bytes=payload[CONTENT_SIZE_KEY],
+    )
+
+
 async def create_join_token(
     session: AsyncSession,
     *,
@@ -276,10 +392,11 @@ async def create_join_token(
     ttl_seconds: int,
     issued_by: Optional[str],
 ) -> JoinTokenOut:
+    canonical_role = _canonical_role(role)
     async with _logger.operation(
         "join_token.create",
         "Creating cluster join token",
-        role=role,
+        role=canonical_role,
         ttl_seconds=ttl_seconds,
         issued_by=issued_by or "unknown",
     ) as op:
@@ -288,7 +405,7 @@ async def create_join_token(
         token = JoinToken(
             id=f"jt-{uuid4().hex[:16]}",
             token_hash=_hash_secret(raw_token),
-            role=role,
+            role=canonical_role,
             issued_by=issued_by,
             expires_at=expires_at,
         )
@@ -300,12 +417,12 @@ async def create_join_token(
             category="cluster",
             name="join_token.create",
             level="INFO",
-            fields={"role": role, "token_id": token.id, "expires_at": expires_at.isoformat()},
+            fields={"role": canonical_role, "token_id": token.id, "expires_at": expires_at.isoformat()},
         )
         op.step("event.record", "Recorded join token event", token_id=token.id)
         await session.commit()
         op.step("db.commit", "Committed join token transaction", token_id=token.id)
-        return JoinTokenOut(id=token.id, role=role, token=raw_token, expires_at=expires_at)
+        return JoinTokenOut(id=token.id, role=canonical_role, token=raw_token, expires_at=expires_at)
 
 
 async def bootstrap_cluster(
@@ -330,6 +447,20 @@ async def bootstrap_cluster(
             "Resolved cluster-internal signing secrets",
             persisted_missing_keys=secrets_persisted,
         )
+        await _ensure_default_content_registry(session)
+        op.step("content.seed", "Ensured default internal CDN content registry")
+        try:
+            from app.services import roles as role_service
+
+            await role_service.get_role_specs(session)
+            op.step("roles.seed", "Ensured default role specs")
+        except Exception as exc:  # noqa: BLE001
+            op.step_warning(
+                "roles.seed",
+                "Failed to ensure default role specs",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
 
         is_bootstrapped_setting = await cluster_settings.get_setting(session, BOOTSTRAPPED_KEY)
         already_bootstrapped = (
@@ -343,7 +474,7 @@ async def bootstrap_cluster(
 
         worker = await create_join_token(
             session,
-            role="worker",
+            role="general",
             ttl_seconds=payload.worker_token_ttl_seconds,
             issued_by=requested_by,
         )
@@ -365,14 +496,13 @@ async def bootstrap_cluster(
 
 
 async def _get_join_token_for_use(
-    session: AsyncSession, token: str, *, expected_role: str
+    session: AsyncSession,
+    token: str,
 ) -> Optional[JoinToken]:
     token_hash = _hash_secret(token)
     result = await session.execute(select(JoinToken).where(JoinToken.token_hash == token_hash))
     join_token = result.scalar_one_or_none()
     if join_token is None:
-        return None
-    if join_token.role != expected_role:
         return None
     now = _utcnow()
     if join_token.used_at is not None:
@@ -385,11 +515,12 @@ async def _get_join_token_for_use(
 
 
 async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional[NodeJoinOut]:
+    canonical_role = _canonical_role(payload.role)
     async with _logger.operation(
         "node.join",
         "Processing node join request",
         node_id=payload.node_id,
-        role=payload.role,
+        role=canonical_role,
         node_name=payload.name,
     ) as op:
         auth_secret_key, cluster_signing_key, secrets_persisted = await _resolve_cluster_secrets(
@@ -404,14 +535,13 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
         join_token = await _get_join_token_for_use(
             session,
             payload.token,
-            expected_role=payload.role,
         )
         if join_token is None:
             _logger.warning(
                 "node.join.reject",
                 "Rejected node join with invalid token",
                 node_id=payload.node_id,
-                role=payload.role,
+                role=canonical_role,
             )
             return None
         op.step("token.validate", "Validated join token", token_id=join_token.id)
@@ -428,7 +558,7 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
                 "node.join.reject",
                 "Rejected node join due to invalid CSR",
                 node_id=payload.node_id,
-                role=payload.role,
+                role=canonical_role,
             )
             return None
         op.step(
@@ -456,13 +586,13 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
 
         status = dict(payload.status)
         status["enrolled_at"] = now.isoformat()
-        status["node_role"] = payload.role
+        status["node_role"] = canonical_role
 
         if node is None:
             node = Node(
                 id=payload.node_id,
                 name=payload.name,
-                roles=[payload.role],
+                roles=[canonical_role],
                 labels=payload.labels,
                 mesh_ip=payload.mesh_ip,
                 status=status,
@@ -478,7 +608,7 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
             event_name = "node.join"
         else:
             node.name = payload.name
-            node.roles = [payload.role]
+            node.roles = [canonical_role]
             node.labels = payload.labels
             node.mesh_ip = payload.mesh_ip
             node.api_endpoint = payload.api_endpoint
@@ -501,7 +631,7 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
             fields={
                 "node_id": payload.node_id,
                 "name": payload.name,
-                "role": payload.role,
+                "role": canonical_role,
                 "token_id": join_token.id,
             },
         )
@@ -516,8 +646,8 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
                         {
                             "node_id": payload.node_id,
                             "name": payload.name,
-                            "role": payload.role,
-                            "roles": [payload.role],
+                            "role": canonical_role,
+                            "roles": [canonical_role],
                             "labels": payload.labels,
                             "mesh_ip": payload.mesh_ip,
                             "api_endpoint": payload.api_endpoint,
@@ -536,7 +666,7 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
                     error_type=type(exc).__name__,
                     error=str(exc),
                 )
-        if payload.role == "worker" and _etcd_configured():
+        if canonical_role in {"general", "backend_server", "reverse_proxy"} and _etcd_configured():
             peer_url = _resolve_etcd_peer_url(payload)
             if peer_url:
                 try:
@@ -586,14 +716,14 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
                     "Skipped etcd member add due to missing peer URL",
                     node_id=payload.node_id,
                 )
-        if payload.role == "worker":
+        if canonical_role in {"general", "backend_server", "reverse_proxy"}:
             created_assignments, updated_assignments = await _reconcile_router_assignments(
                 session,
                 changed_node_id=payload.node_id,
             )
             op.step(
                 "router_assignment.reconcile",
-                "Reconciled router assignments after worker join",
+                "Reconciled router assignments after node join",
                 created=created_assignments,
                 updated=updated_assignments,
             )
@@ -826,3 +956,167 @@ async def list_node_leases(session: AsyncSession, *, limit: int = 500) -> List[N
     rows.sort(key=lambda item: (order.get(item.lease_state, 9), item.name))
     _logger.debug("lease.list", "Listed node leases", limit=limit, count=len(rows))
     return rows
+
+
+async def validate_node_lease_token(
+    session: AsyncSession,
+    *,
+    node_id: str,
+    lease_token: str,
+) -> bool:
+    if not node_id or not lease_token:
+        return False
+    _, cluster_signing_key, _ = await _resolve_cluster_secrets(session, persist_if_missing=False)
+    claims = decode_lease_token(lease_token, cluster_signing_key)
+    if claims is None:
+        return False
+    if claims.get("n") != node_id:
+        return False
+    node = await session.get(Node, node_id)
+    if node is None or not node.identity_fingerprint:
+        return False
+    return claims.get("fp") == node.identity_fingerprint
+
+
+async def list_cluster_peers(
+    session: AsyncSession,
+    *,
+    node_id: str,
+    lease_token: str,
+) -> list[dict[str, str]]:
+    if not await validate_node_lease_token(session, node_id=node_id, lease_token=lease_token):
+        return []
+    rows = await session.execute(select(Node))
+    nodes = list(rows.scalars().all())
+    peers: list[dict[str, str]] = []
+    for node in nodes:
+        mesh_ip = str(node.mesh_ip or "").strip()
+        if not mesh_ip:
+            continue
+        peers.append(
+            {
+                "node_id": node.id,
+                "name": node.name,
+                "mesh_ip": mesh_ip,
+                "api_endpoint": str(node.api_endpoint or "").strip(),
+            }
+        )
+    peers.sort(key=lambda item: item["node_id"])
+    _logger.debug("peer.list", "Listed cluster peers for node", node_id=node_id, peers=len(peers))
+    return peers
+
+
+async def record_swim_report(
+    session: AsyncSession,
+    *,
+    node_id: str,
+    lease_token: str,
+    incarnation: int,
+    state: str,
+    flags: dict[str, object],
+    peers: dict[str, dict[str, object]],
+) -> tuple[bool, str]:
+    if not await validate_node_lease_token(session, node_id=node_id, lease_token=lease_token):
+        return False, ""
+
+    now = _utcnow().isoformat()
+    settings_map = await cluster_settings.get_settings_map(session)
+    membership_map = _parse_json_map(settings_map.get(SWIM_MEMBERSHIP_KEY, ""))
+    if not isinstance(membership_map, dict):
+        membership_map = {}
+    membership_map[node_id] = {
+        "node_id": node_id,
+        "state": str(state or "healthy").strip().lower(),
+        "incarnation": int(incarnation),
+        "updated_at": now,
+        "flags": flags or {},
+        "peers": peers or {},
+    }
+    await cluster_settings.upsert_settings(
+        session,
+        {SWIM_MEMBERSHIP_KEY: json.dumps(membership_map, separators=(",", ":"))},
+        sync_file=False,
+    )
+
+    node = await session.get(Node, node_id)
+    if node is not None:
+        status = dict(node.status or {})
+        status["swim_state"] = str(state or "healthy").strip().lower()
+        status["swim_incarnation"] = int(incarnation)
+        status["swim_updated_at"] = now
+        status["swim_peers_observed"] = len(peers or {})
+        node.status = status
+        await session.commit()
+
+    if _etcd_configured():
+        try:
+            await etcd_service.put_value(
+                key=f"swim/{node_id}",
+                value=json.dumps(membership_map[node_id], separators=(",", ":")),
+            )
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning(
+                "swim.etcd_upsert",
+                "Failed to upsert SWIM member state into etcd",
+                node_id=node_id,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+
+    _logger.info(
+        "swim.report",
+        "Recorded SWIM report",
+        node_id=node_id,
+        state=str(state or "healthy").strip().lower(),
+        peers=len(peers or {}),
+    )
+    try:
+        from app.services import roles as role_service
+
+        await role_service.reconcile_placement(session, persist=True)
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning(
+            "swim.placement_reconcile",
+            "Failed to reconcile role placement after SWIM report",
+            node_id=node_id,
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+    return True, now
+
+
+async def list_swim_members(session: AsyncSession) -> dict[str, dict[str, object]]:
+    settings_map = await cluster_settings.get_settings_map(session)
+    membership_map = _parse_json_map(settings_map.get(SWIM_MEMBERSHIP_KEY, ""))
+    out: dict[str, dict[str, object]] = {}
+    for key, raw in membership_map.items():
+        if not isinstance(key, str) or not isinstance(raw, dict):
+            continue
+        out[key] = {
+            "node_id": key,
+            "state": str(raw.get("state") or "unknown"),
+            "incarnation": int(raw.get("incarnation") or 0),
+            "updated_at": str(raw.get("updated_at") or ""),
+            "flags": raw.get("flags") if isinstance(raw.get("flags"), dict) else {},
+            "peers": raw.get("peers") if isinstance(raw.get("peers"), dict) else {},
+        }
+    return out
+
+
+async def get_active_content(session: AsyncSession) -> dict[str, object]:
+    await _ensure_default_content_registry(session)
+    settings_map = await cluster_settings.get_settings_map(session)
+    version = settings_map.get(CONTENT_VERSION_KEY, "bootstrap-v1")
+    hash_sha = settings_map.get(CONTENT_HASH_KEY, "")
+    size_raw = settings_map.get(CONTENT_SIZE_KEY, "0")
+    body_base64 = settings_map.get(CONTENT_BODY_KEY, "")
+    try:
+        size_bytes = int(size_raw)
+    except ValueError:
+        size_bytes = 0
+    return {
+        "version": version,
+        "hash_sha256": hash_sha,
+        "size_bytes": max(size_bytes, 0),
+        "body_base64": body_base64,
+    }

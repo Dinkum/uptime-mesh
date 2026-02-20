@@ -1,8 +1,47 @@
 {% extends "layout.html" %}
 
 {% block content %}
+  <style>
+    .settings-card {
+      border: 1px solid rgba(148, 163, 184, 0.24);
+      background: linear-gradient(180deg, rgba(15, 23, 42, 0.92), rgba(15, 23, 42, 0.82));
+      box-shadow: 0 22px 48px rgba(2, 6, 23, 0.55);
+      backdrop-filter: blur(7px);
+    }
+    .settings-label {
+      display: block;
+      margin-bottom: 0.35rem;
+      font-size: 0.84rem;
+      color: #cbd5e1;
+      font-weight: 600;
+    }
+    .settings-input {
+      width: 100%;
+      min-width: 0;
+      border-radius: 0.75rem;
+      border: 1px solid rgba(100, 116, 139, 0.75);
+      background: rgba(2, 6, 23, 0.75);
+      color: #f8fafc;
+      padding: 0.72rem 0.9rem;
+      line-height: 1.35;
+    }
+    .settings-input::placeholder {
+      color: #94a3b8;
+    }
+    .settings-input:focus {
+      outline: none;
+      border-color: rgba(56, 189, 248, 0.95);
+      box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.2);
+    }
+    .settings-help {
+      color: #94a3b8;
+      font-size: 0.8rem;
+      margin-top: 0.35rem;
+    }
+  </style>
+
   <section class="grid gap-6 lg:grid-cols-2">
-    <article class="card bg-white mesh-card">
+    <article class="card settings-card">
       <div class="card-body">
         <h2 class="card-title">Authentication</h2>
         <p class="text-sm text-slate-500">Rotate the admin password used for UI and API access.</p>
@@ -13,7 +52,7 @@
       </div>
     </article>
 
-    <article class="card bg-white mesh-card">
+    <article class="card settings-card">
       <div class="card-body">
         <h2 class="card-title">Change Password</h2>
 
@@ -30,10 +69,10 @@
         {% endif %}
 
         <form method="post" action="{{ ui_prefix }}/settings/password" class="space-y-3 mt-3">
-          <label class="form-control">
-            <span class="label-text text-sm">Current Password</span>
+          <label class="block">
+            <span class="settings-label">Current Password</span>
             <input
-              class="input input-bordered"
+              class="settings-input"
               type="password"
               name="current_password"
               required
@@ -41,22 +80,23 @@
             />
           </label>
 
-          <label class="form-control">
-            <span class="label-text text-sm">New Password</span>
+          <label class="block">
+            <span class="settings-label">New Password</span>
             <input
-              class="input input-bordered"
+              class="settings-input"
               type="password"
               name="new_password"
               minlength="8"
               required
               autocomplete="new-password"
             />
+            <p class="settings-help">Minimum 8 characters.</p>
           </label>
 
-          <label class="form-control">
-            <span class="label-text text-sm">Confirm New Password</span>
+          <label class="block">
+            <span class="settings-label">Confirm New Password</span>
             <input
-              class="input input-bordered"
+              class="settings-input"
               type="password"
               name="confirm_password"
               minlength="8"
@@ -70,7 +110,7 @@
       </div>
     </article>
 
-    <article class="card bg-white mesh-card">
+    <article class="card settings-card">
       <div class="card-body">
         <h2 class="card-title">Repository</h2>
         <p class="text-sm text-slate-500">
@@ -90,16 +130,17 @@
         {% endif %}
 
         <form method="post" action="{{ ui_prefix }}/settings/repo" class="space-y-3 mt-3">
-          <label class="form-control">
-            <span class="label-text text-sm">GitHub Repository URL</span>
+          <label class="block">
+            <span class="settings-label">GitHub Repository URL</span>
             <input
-              class="input input-bordered"
+              class="settings-input mono"
               type="url"
               name="github_repo_url"
               required
               value="{{ github_repo_url }}"
               placeholder="https://github.com/Dinkum/uptime-mesh"
             />
+            <p class="settings-help">Used by install/update flows as the source repository.</p>
           </label>
           <button class="btn btn-primary w-full mt-2" type="submit">Update Repository URL</button>
         </form>

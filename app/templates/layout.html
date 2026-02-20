@@ -37,9 +37,38 @@
         background: linear-gradient(180deg, rgba(15, 23, 42, 0.92), rgba(15, 23, 42, 0.82));
         backdrop-filter: blur(7px);
       }
-      .mesh-pill {
-        border: 1px solid rgba(148, 163, 184, 0.3);
-        background: rgba(15, 23, 42, 0.6);
+      .mesh-tabs {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+      .mesh-tab {
+        display: inline-flex;
+        align-items: center;
+        min-height: 36px;
+        padding: 0 12px;
+        border-radius: 10px;
+        border: 1px solid rgba(148, 163, 184, 0.24);
+        color: #cbd5e1;
+        background: rgba(15, 23, 42, 0.48);
+        text-decoration: none;
+        font-size: 0.88rem;
+        font-weight: 600;
+        transition: border-color 120ms ease, background 120ms ease, box-shadow 120ms ease, color 120ms ease;
+      }
+      .mesh-tab:hover {
+        border-color: rgba(56, 189, 248, 0.5);
+        background: rgba(14, 165, 233, 0.14);
+        color: #e2e8f0;
+      }
+      .mesh-tab.active {
+        border-color: rgba(56, 189, 248, 0.88);
+        background: linear-gradient(95deg, rgba(14, 165, 233, 0.28), rgba(56, 189, 248, 0.2));
+        color: #f0f9ff;
+        box-shadow: 0 0 0 2px rgba(14, 165, 233, 0.18), 0 0 24px rgba(14, 165, 233, 0.22);
+      }
+      .page-title {
+        margin-top: 18px;
       }
       .text-slate-500 {
         color: #94a3b8 !important;
@@ -51,30 +80,42 @@
   </head>
   <body>
     <div class="max-w-6xl mx-auto px-6 py-10">
-      <header class="flex flex-col gap-6 md:flex-row md:items-center md:justify-between">
-        <div>
-          <p class="mono text-xs uppercase tracking-[0.3em] text-slate-500">UptimeMesh</p>
-          <h1 class="text-3xl md:text-4xl font-semibold">{{ title }}</h1>
-          <p class="text-sm text-slate-500">{{ subtitle }}</p>
+      <header>
+        <div class="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+          <div>
+            <p class="mono text-xs uppercase tracking-[0.3em] text-slate-500">UptimeMesh</p>
+          </div>
+          <div class="flex items-center gap-3 text-sm">
+            {% if auth_user %}
+              <span class="badge badge-outline mono py-3">{{ auth_user }}</span>
+            {% endif %}
+            <a class="btn btn-sm btn-outline" href="/auth/logout">Sign Out</a>
+          </div>
         </div>
-        <nav class="flex flex-wrap gap-2 text-sm">
-          <a class="btn btn-sm mesh-pill" href="{{ ui_prefix }}">Overview</a>
-          <a class="btn btn-sm mesh-pill" href="{{ ui_prefix }}/nodes">Nodes</a>
-          <a class="btn btn-sm mesh-pill" href="{{ ui_prefix }}/services">Services</a>
-          <a class="btn btn-sm mesh-pill" href="{{ ui_prefix }}/replicas">Replicas</a>
-          <a class="btn btn-sm mesh-pill" href="{{ ui_prefix }}/scheduler">Scheduler</a>
-          <a class="btn btn-sm mesh-pill" href="{{ ui_prefix }}/wireguard">WireGuard</a>
-          <a class="btn btn-sm mesh-pill" href="{{ ui_prefix }}/discovery">Discovery</a>
-          <a class="btn btn-sm mesh-pill" href="{{ ui_prefix }}/gateway">Gateway</a>
-          <a class="btn btn-sm mesh-pill" href="{{ ui_prefix }}/monitoring">Monitoring</a>
-          <a class="btn btn-sm mesh-pill" href="{{ ui_prefix }}/events">Events</a>
-          <a class="btn btn-sm mesh-pill" href="{{ ui_prefix }}/support">Support</a>
-          <a class="btn btn-sm mesh-pill" href="{{ ui_prefix }}/settings">Settings</a>
-          {% if auth_user %}
-            <span class="badge badge-outline mono py-3">{{ auth_user }}</span>
-          {% endif %}
-          <a class="btn btn-sm btn-outline" href="/auth/logout">Sign Out</a>
+        <nav class="mesh-tabs mt-4">
+          <a class="mesh-tab{% if current_tab == 'overview' %} active{% endif %}" href="{{ ui_prefix }}">Overview</a>
+          <a class="mesh-tab{% if current_tab == 'network' %} active{% endif %}" href="{{ ui_prefix }}/network">Network</a>
+          <a class="mesh-tab{% if current_tab == 'nodes' %} active{% endif %}" href="{{ ui_prefix }}/nodes">Nodes</a>
+          <a class="mesh-tab{% if current_tab == 'roles' %} active{% endif %}" href="{{ ui_prefix }}/roles">Roles</a>
+          <a class="mesh-tab{% if current_tab == 'services' %} active{% endif %}" href="{{ ui_prefix }}/services">Services</a>
+          <a class="mesh-tab{% if current_tab == 'replicas' %} active{% endif %}" href="{{ ui_prefix }}/replicas">Replicas</a>
+          <a class="mesh-tab{% if current_tab == 'scheduler' %} active{% endif %}" href="{{ ui_prefix }}/scheduler">Scheduler</a>
+          <a class="mesh-tab{% if current_tab == 'wireguard' %} active{% endif %}" href="{{ ui_prefix }}/wireguard">WireGuard</a>
+          <a class="mesh-tab{% if current_tab == 'discovery' %} active{% endif %}" href="{{ ui_prefix }}/discovery">Discovery</a>
+          <a class="mesh-tab{% if current_tab == 'gateway' %} active{% endif %}" href="{{ ui_prefix }}/gateway">Gateway</a>
+          <a class="mesh-tab{% if current_tab == 'monitoring' %} active{% endif %}" href="{{ ui_prefix }}/monitoring">Monitoring</a>
+          <a class="mesh-tab{% if current_tab == 'events' %} active{% endif %}" href="{{ ui_prefix }}/events">Events</a>
+          <a class="mesh-tab{% if current_tab == 'support' %} active{% endif %}" href="{{ ui_prefix }}/support">Support</a>
+          <a class="mesh-tab{% if current_tab == 'settings' %} active{% endif %}" href="{{ ui_prefix }}/settings">Settings</a>
         </nav>
+        {% if current_tab != "overview" %}
+          <div class="page-title">
+            <h1 class="text-3xl md:text-4xl font-semibold">{{ title }}</h1>
+            {% if subtitle %}
+              <p class="text-sm text-slate-500 mt-1">{{ subtitle }}</p>
+            {% endif %}
+          </div>
+        {% endif %}
       </header>
 
       {% if etcd_status and etcd_status != "ok" %}

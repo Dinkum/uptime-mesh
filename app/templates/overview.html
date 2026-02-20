@@ -1,62 +1,57 @@
 {% extends "layout.html" %}
 
 {% block content %}
-  <section class="grid grid-cols-1 md:grid-cols-3 gap-6">
-    <div class="mesh-card bg-white rounded-2xl p-6">
-      <p class="text-sm text-slate-500">Nodes</p>
-      <p class="text-3xl font-semibold">{{ node_count }}</p>
-      <p class="text-xs text-slate-400">Control-plane nodes</p>
+  <section class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-5">
+    <div class="mesh-card rounded-2xl p-6">
+      <p class="text-sm text-slate-500">Nodes Online</p>
+      <p class="text-3xl font-semibold">{{ node_online_count }}/{{ node_count }}</p>
+      <p class="text-xs text-slate-400">Current cluster availability</p>
     </div>
-    <div class="mesh-card bg-white rounded-2xl p-6">
-      <p class="text-sm text-slate-500">Services</p>
-      <p class="text-3xl font-semibold">{{ service_count }}</p>
-      <p class="text-xs text-slate-400">Pinned placement</p>
+    <div class="mesh-card rounded-2xl p-6">
+      <p class="text-sm text-slate-500">Network Uptime (24h)</p>
+      <p class="text-3xl font-semibold">
+        {% if uptime_pct_24h is not none %}
+          {{ "%.2f"|format(uptime_pct_24h) }}%
+        {% else %}
+          --
+        {% endif %}
+      </p>
+      <p class="text-xs text-slate-400">Estimated from lease + heartbeat recency</p>
     </div>
-    <div class="mesh-card bg-white rounded-2xl p-6">
-      <p class="text-sm text-slate-500">Replicas</p>
-      <p class="text-3xl font-semibold">{{ replica_count }}</p>
-      <p class="text-xs text-slate-400">Active sandboxes</p>
+    <div class="mesh-card rounded-2xl p-6">
+      <p class="text-sm text-slate-500">Events (24h)</p>
+      <p class="text-3xl font-semibold">{{ event_count_24h }}</p>
+      <p class="text-xs text-slate-400">{{ warning_event_count_24h }} warning/error entries</p>
+    </div>
+    <div class="mesh-card rounded-2xl p-6">
+      <p class="text-sm text-slate-500">Version</p>
+      <p class="text-3xl font-semibold">{{ app_version }}</p>
+      <p class="text-xs text-slate-400">Agent {{ agent_version }}</p>
     </div>
   </section>
 
-  <section class="grid grid-cols-1 md:grid-cols-2 gap-6 mt-8">
-    <div class="mesh-card bg-white rounded-2xl p-6">
-      <h2 class="text-lg font-semibold">Router Assignments</h2>
-      <p class="text-sm text-slate-500">{{ router_assignment_count }} assignments</p>
-      <div class="mt-4 flex flex-wrap gap-2">
-        {% for assignment in router_assignments %}
-          <span class="badge badge-outline mono">{{ assignment.node_id }} -> {{ assignment.primary_router_id }} / {{ assignment.secondary_router_id }}</span>
-        {% else %}
-          <span class="text-sm text-slate-400">No assignments yet.</span>
-        {% endfor %}
-      </div>
+  <section class="grid grid-cols-1 md:grid-cols-3 gap-5 mt-6">
+    <div class="mesh-card rounded-2xl p-5">
+      <p class="text-sm text-slate-500">Healthy Nodes</p>
+      <p class="text-2xl font-semibold">{{ "%.1f"|format(healthy_node_pct) }}%</p>
     </div>
-
-    <div class="mesh-card bg-white rounded-2xl p-6">
-      <h2 class="text-lg font-semibold">Snapshots + Support Bundles</h2>
-      <p class="text-sm text-slate-500">Latest runs</p>
-      <div class="mt-4 space-y-2 text-sm">
-        {% if latest_snapshot %}
-          <div class="flex justify-between">
-            <span class="mono">Snapshot {{ latest_snapshot.id }}</span>
-            <span class="text-slate-500">{{ latest_snapshot.status }}</span>
-          </div>
+    <div class="mesh-card rounded-2xl p-5">
+      <p class="text-sm text-slate-500">Nodes in Failover</p>
+      <p class="text-2xl font-semibold">{{ failover_node_count }}</p>
+    </div>
+    <div class="mesh-card rounded-2xl p-5">
+      <p class="text-sm text-slate-500">Latest Heartbeat Age</p>
+      <p class="text-2xl font-semibold">
+        {% if heartbeat_lag_seconds is not none %}
+          {{ heartbeat_lag_seconds }}s
         {% else %}
-          <p class="text-slate-400">No snapshots yet.</p>
+          --
         {% endif %}
-        {% if latest_bundle %}
-          <div class="flex justify-between">
-            <span class="mono">Bundle {{ latest_bundle.id }}</span>
-            <span class="text-slate-500">{{ latest_bundle.status }}</span>
-          </div>
-        {% else %}
-          <p class="text-slate-400">No support bundles yet.</p>
-        {% endif %}
-      </div>
+      </p>
     </div>
   </section>
 
-  <section class="mesh-card bg-white rounded-2xl p-6 mt-8">
+  <section class="mesh-card rounded-2xl p-6 mt-8">
     <div class="flex items-center justify-between">
       <h2 class="text-lg font-semibold">Recent Events</h2>
       <a class="btn btn-sm btn-outline" href="{{ ui_prefix }}/events">View all</a>

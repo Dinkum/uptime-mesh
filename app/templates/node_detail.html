@@ -1,0 +1,235 @@
+{% extends "layout.html" %}
+
+{% block content %}
+  <div class="flex flex-wrap items-center gap-2 mb-5">
+    <a class="btn btn-sm btn-outline" href="{{ ui_prefix }}/nodes">Back to Nodes</a>
+    <button class="btn btn-sm btn-outline" onclick="nodeAction('{{ node_id }}', 'cordon')">Cordon</button>
+    <button class="btn btn-sm btn-outline" onclick="nodeAction('{{ node_id }}', 'drain')">Drain</button>
+    <button class="btn btn-sm btn-outline" onclick="nodeAction('{{ node_id }}', 'rotate-wg-keys')">Rotate Keys</button>
+  </div>
+
+  <section class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+    <div class="mesh-card rounded-2xl p-5">
+      <p class="text-sm text-slate-500">Node Health</p>
+      <p class="text-2xl font-semibold">{{ node.health_text }}</p>
+      <p class="mono text-xs text-slate-400 mt-1">Heartbeat {{ node.heartbeat_age }}</p>
+    </div>
+    <div class="mesh-card rounded-2xl p-5">
+      <p class="text-sm text-slate-500">Mesh Address</p>
+      <p class="mono text-xl font-semibold">{{ node.mesh_ip }}</p>
+      <p class="mono text-xs text-slate-400 mt-1">{{ node.endpoint }}</p>
+    </div>
+    <div class="mesh-card rounded-2xl p-5">
+      <p class="text-sm text-slate-500">Lease</p>
+      <p class="text-xl font-semibold">{{ node.lease_state }}</p>
+      <p class="mono text-xs text-slate-400 mt-1">{{ node.lease_expires_at }}</p>
+    </div>
+  </section>
+
+  <section class="grid grid-cols-1 md:grid-cols-5 gap-4 mb-6">
+    <div class="mesh-card rounded-2xl p-4">
+      <p class="text-xs text-slate-500">CPU Load</p>
+      <p class="text-2xl font-semibold">{% if node.load_cpu is not none %}{{ "%.1f"|format(node.load_cpu) }}{% else %}--{% endif %}</p>
+    </div>
+    <div class="mesh-card rounded-2xl p-4">
+      <p class="text-xs text-slate-500">RAM Load</p>
+      <p class="text-2xl font-semibold">{% if node.load_ram is not none %}{{ "%.1f"|format(node.load_ram) }}{% else %}--{% endif %}</p>
+    </div>
+    <div class="mesh-card rounded-2xl p-4">
+      <p class="text-xs text-slate-500">Disk Load</p>
+      <p class="text-2xl font-semibold">{% if node.load_disk is not none %}{{ "%.1f"|format(node.load_disk) }}{% else %}--{% endif %}</p>
+    </div>
+    <div class="mesh-card rounded-2xl p-4">
+      <p class="text-xs text-slate-500">Network Load</p>
+      <p class="text-2xl font-semibold">{% if node.load_network is not none %}{{ "%.1f"|format(node.load_network) }}{% else %}--{% endif %}</p>
+    </div>
+    <div class="mesh-card rounded-2xl p-4">
+      <p class="text-xs text-slate-500">Total Load</p>
+      <p class="text-2xl font-semibold">{% if node.load_total is not none %}{{ "%.1f"|format(node.load_total) }}{% else %}--{% endif %}</p>
+    </div>
+  </section>
+
+  <section class="grid grid-cols-1 xl:grid-cols-2 gap-5">
+    <div class="mesh-card rounded-2xl p-6">
+      <h2 class="text-lg font-semibold mb-4">Node Info</h2>
+      <div class="space-y-3 text-sm">
+        <div>
+          <p class="text-slate-500">Name</p>
+          <p class="font-medium">{{ node.name }}</p>
+        </div>
+        <div>
+          <p class="text-slate-500">Node ID</p>
+          <p class="mono">{{ node.id }}</p>
+        </div>
+        <div>
+          <p class="text-slate-500">Roles</p>
+          <p>{{ node.roles_text }}</p>
+        </div>
+        <div>
+          <p class="text-slate-500">Created</p>
+          <p class="mono">{{ created_at }}</p>
+        </div>
+        <div>
+          <p class="text-slate-500">Updated</p>
+          <p class="mono">{{ updated_at }}</p>
+        </div>
+        <div>
+          <p class="text-slate-500">Labels</p>
+          {% if node_labels %}
+            <div class="flex flex-wrap gap-2 mt-1">
+              {% for key, value in node_labels.items() %}
+                <span class="badge badge-outline mono">{{ key }}={{ value }}</span>
+              {% endfor %}
+            </div>
+          {% else %}
+            <p>-</p>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+
+    <div class="mesh-card rounded-2xl p-6">
+      <h2 class="text-lg font-semibold mb-4">Identity + WireGuard</h2>
+      <div class="space-y-3 text-sm">
+        <div>
+          <p class="text-slate-500">Certificate Fingerprint</p>
+          <p class="mono break-all">{{ node.fingerprint }}</p>
+        </div>
+        <div>
+          <p class="text-slate-500">Certificate Expiry</p>
+          <p class="mono">{{ node.identity_expires_at }}</p>
+        </div>
+        <div>
+          <p class="text-slate-500">Active Route</p>
+          <p class="mono">{{ node.wg_active_route }}</p>
+        </div>
+        <div>
+          <p class="text-slate-500">Failover State</p>
+          <p class="mono">{{ node.wg_failover }}</p>
+        </div>
+        <div>
+          <p class="text-slate-500">SWIM State</p>
+          <p class="mono">{{ swim_member.state or node.swim_state }}</p>
+        </div>
+        <div>
+          <p class="text-slate-500">SWIM Incarnation</p>
+          <p class="mono">{{ swim_member.incarnation or node.swim_incarnation }}</p>
+        </div>
+        <div>
+          <p class="text-slate-500">SWIM Updated</p>
+          <p class="mono">{{ swim_member.updated_at or "-" }}</p>
+        </div>
+        <div>
+          <p class="text-slate-500">Last Heartbeat Timestamp</p>
+          <p class="mono">{{ node.heartbeat_at }}</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="grid grid-cols-1 xl:grid-cols-2 gap-5 mt-6">
+    <div class="mesh-card rounded-2xl p-6">
+      <h2 class="text-lg font-semibold mb-4">Role Placement</h2>
+      <p class="text-xs text-slate-500">Roles currently assigned to this node from deterministic placement.</p>
+      <div class="mt-3 flex flex-wrap gap-2">
+        {% for role_name in placement_roles %}
+          <a class="badge badge-outline mono py-3" href="{{ ui_prefix }}/roles/{{ role_name }}">{{ role_name }}</a>
+        {% else %}
+          <span class="text-slate-500 text-sm">No placed roles on this node.</span>
+        {% endfor %}
+      </div>
+      <div class="mt-4 space-y-2 text-sm">
+        {% for row in role_holder_rows %}
+          <div class="flex items-center justify-between border border-slate-700/40 rounded-xl px-3 py-2">
+            <a class="mono hover:underline" href="{{ ui_prefix }}/roles/{{ row.role_name }}">{{ row.role_name }}</a>
+            <span class="badge {% if row.is_holder %}badge-success{% else %}badge-outline{% endif %}">{{ "holder" if row.is_holder else "not-holder" }}</span>
+          </div>
+        {% else %}
+          <p class="text-slate-500 text-sm">No role holder records available.</p>
+        {% endfor %}
+      </div>
+    </div>
+
+    <div class="mesh-card rounded-2xl p-6">
+      <h2 class="text-lg font-semibold mb-4">SWIM Peers</h2>
+      <p class="text-xs text-slate-500">Nodes this node is currently tracking via SWIM membership.</p>
+      <div class="mt-4 overflow-x-auto">
+        <table class="table w-full">
+          <thead>
+            <tr>
+              <th>Peer</th>
+              <th>State</th>
+              <th>Failures</th>
+              <th>Incarnation</th>
+              <th>Last Seen</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for peer in swim_peer_rows %}
+              <tr>
+                <td class="mono">{{ peer.node_id }}</td>
+                <td class="mono">{{ peer.state }}</td>
+                <td class="mono">{{ peer.failures }}</td>
+                <td class="mono">{{ peer.incarnation }}</td>
+                <td class="mono text-xs">{{ peer.last_seen or "-" }}</td>
+              </tr>
+            {% else %}
+              <tr>
+                <td colspan="5" class="text-slate-500">No SWIM peer data for this node yet.</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="mesh-card rounded-2xl p-6 mt-6">
+    <h2 class="text-lg font-semibold mb-4">Runtime Status</h2>
+    <div class="overflow-x-auto">
+      <table class="table w-full">
+        <thead>
+          <tr>
+            <th>Field</th>
+            <th>Value</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in known_status_rows %}
+            <tr>
+              <td class="text-slate-400">{{ row.label }}</td>
+              <td class="mono text-xs break-all">{{ row.value }}</td>
+            </tr>
+          {% endfor %}
+          {% if extra_status_rows %}
+            <tr>
+              <td colspan="2" class="text-xs uppercase tracking-wide text-slate-500 pt-4">Additional Fields</td>
+            </tr>
+            {% for row in extra_status_rows %}
+              <tr>
+                <td class="text-slate-400">{{ row.label }}</td>
+                <td class="mono text-xs break-all">{{ row.value }}</td>
+              </tr>
+            {% endfor %}
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <script>
+    async function nodeAction(nodeId, action) {
+      try {
+        const response = await fetch(`/nodes/${nodeId}/${action}`, { method: "POST" });
+        if (response.ok) {
+          window.location.reload();
+          return;
+        }
+        const body = await response.text();
+        alert(`Action failed (${response.status}): ${body}`);
+      } catch (error) {
+        alert(`Action failed: ${error}`);
+      }
+    }
+  </script>
+{% endblock %}

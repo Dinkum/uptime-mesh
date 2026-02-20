@@ -6,6 +6,91 @@ REPO_URL="${UPTIMEMESH_REPO_URL:-${DEFAULT_REPO_URL}}"
 REPO_REF="${UPTIMEMESH_REPO_REF:-main}"
 INSTALL_DIR="${UPTIMEMESH_INSTALL_DIR:-/opt/uptime-mesh}"
 CONFIG_PATH="${UPTIMEMESH_CONFIG_PATH:-${INSTALL_DIR}/config.yaml}"
+INSTALL_LOG=""
+LOG_READY=0
+
+say() {
+  echo "(*) $*"
+}
+
+warn() {
+  echo "(!) $*" >&2
+}
+
+fail() {
+  echo "(x) $*" >&2
+  exit 1
+}
+
+init_install_log() {
+  if [[ "$LOG_READY" -eq 1 ]]; then
+    return 0
+  fi
+  mkdir -p "${APP_DIR}/data"
+  INSTALL_LOG="${UPTIMEMESH_INSTALL_LOG:-${APP_DIR}/data/install.log}"
+  touch "${INSTALL_LOG}"
+  chmod 600 "${INSTALL_LOG}" || true
+  exec > >(tee -a "${INSTALL_LOG}") 2>&1
+  LOG_READY=1
+  echo "----- $(date -u +%Y-%m-%dT%H:%M:%SZ) | install.sh -----"
+  say "install.log | path: ${INSTALL_LOG}"
+}
+
+run_quiet_command() {
+  local label="$1"
+  shift
+  local tmp_file
+  tmp_file="$(mktemp)"
+  say "${label}"
+  if "$@" >"${tmp_file}" 2>&1; then
+    cat "${tmp_file}" >> "${INSTALL_LOG}"
+    rm -f "${tmp_file}"
+    return 0
+  fi
+  local rc=$?
+  cat "${tmp_file}" >> "${INSTALL_LOG}"
+  warn "${label} failed (exit ${rc})"
+  warn "last output:"
+  tail -n 30 "${tmp_file}" >&2 || true
+  rm -f "${tmp_file}"
+  return "${rc}"
+}
+
+apt_quiet_retry() {
+  local label="$1"
+  shift
+  local attempt=1
+  local max_attempts=3
+  while (( attempt <= max_attempts )); do
+    if run_quiet_command "${label} (attempt ${attempt}/${max_attempts})" "$@"; then
+      return 0
+    fi
+    sleep $((attempt * 2))
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
+apt_install_optional() {
+  local package_name="$1"
+  if ! apt_quiet_retry "Install optional package: ${package_name}" apt-get install -y "${package_name}"; then
+    warn "optional package not installed: ${package_name}"
+  fi
+}
+
+unit_exists() {
+  local unit="$1"
+  systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -qx "${unit}"
+}
+
+enable_service_if_exists() {
+  local unit="$1"
+  if unit_exists "${unit}"; then
+    systemctl enable --now "${unit}" >/dev/null 2>&1 || warn "failed to enable/start ${unit}"
+  else
+    warn "service unit not found: ${unit}"
+  fi
+}
 
 require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -64,6 +149,8 @@ if [[ ! -d "${APP_DIR}/app" || ! -f "${APP_DIR}/pyproject.toml" ]]; then
   exec sudo "${INSTALL_DIR}/install.sh" "$@"
 fi
 
+init_install_log
+
 usage() {
   cat <<'USAGE'
 Usage:
@@ -74,12 +161,12 @@ Usage:
 Options:
   --name <name>              Node display name (default: generated 3-word name)
   --username <username>      Initial admin username for first-node bootstrap (default: admin)
-  --role <role>              Optional advanced override: worker | gateway (default: worker)
+  --role <role>              Optional advanced override: general | backend_server | reverse_proxy | gateway (default: general)
   --join <peer-ip|url>       Join an existing mesh via peer API
   --join-port <port>         Peer API port for --join when omitted in target (default: 8010)
   --api-url <url>            Cluster API URL (default: http://127.0.0.1:8010)
   --api-endpoint <url>       This node endpoint advertised to cluster
-  --etcd-peer-url <url>      etcd peer URL for worker membership (default: derived from node endpoint host:2380)
+  --etcd-peer-url <url>      etcd peer URL for node membership (default: derived from node endpoint host:2380)
   --token <join-token>       Join token for enrollment (required for join mode)
   --port <port>              Local API port (default: 8010)
   --install-deps             Force apt dependency install (auto-enabled by default)
@@ -94,7 +181,7 @@ Examples:
   sudo ./install.sh --wizard
 
   # Join an existing mesh (token required)
-  sudo ./install.sh --join 51.15.211.158 --token <worker-token>
+  sudo ./install.sh --join 51.15.211.158 --token <join-token>
 USAGE
 }
 
@@ -116,6 +203,7 @@ WIZARD=0
 INITIAL_ADMIN_USERNAME=""
 INITIAL_ADMIN_PASSWORD=""
 INITIAL_ADMIN_GENERATED=0
+WEB_UI_URL=""
 
 generate_three_word_phrase() {
   local words_a=(amber silent crimson silver golden rapid steady bright cedar iron polar brisk cobalt ember)
@@ -252,6 +340,187 @@ derive_etcd_peer_url() {
   fi
 }
 
+extract_endpoint_host() {
+  local endpoint="$1"
+  local host="$endpoint"
+  host="${host#*://}"
+  host="${host%%/*}"
+  if [[ "$host" == \[*\]* ]]; then
+    host="${host#\[}"
+    host="${host%%\]*}"
+  else
+    host="${host%%:*}"
+  fi
+  printf '%s' "$host"
+}
+
+generate_self_signed_cert() {
+  local host=""
+  local cert_dir="${APP_DIR}/data/tls"
+  local cert_path="${cert_dir}/ui-selfsigned.crt"
+  local key_path="${cert_dir}/ui-selfsigned.key"
+  local san="DNS:localhost,IP:127.0.0.1"
+  local openssl_cfg=""
+
+  host="$(extract_endpoint_host "${API_ENDPOINT}")"
+  if [[ -z "$host" ]]; then
+    host="localhost"
+  fi
+  if [[ "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    san="${san},IP:${host}"
+  else
+    san="${san},DNS:${host}"
+  fi
+
+  mkdir -p "${cert_dir}"
+  if [[ ! -s "${cert_path}" || ! -s "${key_path}" ]]; then
+    say "Generating self-signed TLS certificate"
+    openssl_cfg="$(mktemp)"
+    cat > "${openssl_cfg}" <<EOF
+[req]
+distinguished_name=req_distinguished_name
+x509_extensions=v3_req
+prompt=no
+[req_distinguished_name]
+CN=${host}
+[v3_req]
+subjectAltName=${san}
+EOF
+    openssl req -x509 -nodes -newkey rsa:2048 -sha256 -days 825 \
+      -keyout "${key_path}" \
+      -out "${cert_path}" \
+      -config "${openssl_cfg}" \
+      -extensions v3_req
+    rm -f "${openssl_cfg}"
+    chmod 600 "${key_path}"
+    chmod 644 "${cert_path}"
+  fi
+}
+
+configure_self_signed_tls_proxy_nginx() {
+  local host=""
+  local cert_path="${APP_DIR}/data/tls/ui-selfsigned.crt"
+  local key_path="${APP_DIR}/data/tls/ui-selfsigned.key"
+  local nginx_conf="/etc/nginx/conf.d/uptimemesh-selfsigned.conf"
+
+  host="$(extract_endpoint_host "${API_ENDPOINT}")"
+  if [[ -z "${host}" ]]; then
+    host="localhost"
+  fi
+
+  generate_self_signed_cert
+  say "Configuring HTTPS reverse proxy (nginx)"
+
+  cat > "${nginx_conf}" <<EOF
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name _;
+
+    ssl_certificate ${cert_path};
+    ssl_certificate_key ${key_path};
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:MESHSSL:10m;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options SAMEORIGIN always;
+    add_header Referrer-Policy no-referrer-when-downgrade always;
+
+    location / {
+        proxy_pass http://127.0.0.1:${PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name _;
+    return 301 https://\$host\$request_uri;
+}
+EOF
+
+  nginx -t
+  systemctl enable --now nginx
+  systemctl reload nginx || systemctl restart nginx
+  WEB_UI_URL="https://${host}/ui"
+}
+
+configure_self_signed_tls_proxy_caddy() {
+  local host=""
+  local cert_path="${APP_DIR}/data/tls/ui-selfsigned.crt"
+  local key_path="${APP_DIR}/data/tls/ui-selfsigned.key"
+  local caddyfile="/etc/caddy/Caddyfile"
+
+  host="$(extract_endpoint_host "${API_ENDPOINT}")"
+  if [[ -z "${host}" ]]; then
+    host="localhost"
+  fi
+
+  generate_self_signed_cert
+  say "Configuring HTTPS reverse proxy (caddy)"
+
+  install -d /etc/caddy
+  cat > "${caddyfile}" <<EOF
+http://${host}, http://localhost {
+    redir https://{host}{uri} permanent
+}
+
+https://${host}, https://localhost {
+    tls ${cert_path} ${key_path}
+    reverse_proxy 127.0.0.1:${PORT}
+    header {
+        Strict-Transport-Security "max-age=31536000"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+        Referrer-Policy "no-referrer-when-downgrade"
+    }
+}
+EOF
+
+  caddy validate --config "${caddyfile}" >/dev/null 2>&1 || fail "caddy config validation failed"
+  systemctl enable --now caddy
+  systemctl reload caddy || systemctl restart caddy
+  WEB_UI_URL="https://${host}/ui"
+}
+
+ensure_self_signed_tls_proxy() {
+  if ! command -v openssl >/dev/null 2>&1; then
+    fail "openssl is required to generate the self-signed certificate"
+  fi
+
+  if command -v nginx >/dev/null 2>&1; then
+    configure_self_signed_tls_proxy_nginx
+    return 0
+  fi
+  if command -v caddy >/dev/null 2>&1; then
+    configure_self_signed_tls_proxy_caddy
+    return 0
+  fi
+
+  warn "No proxy binary found; attempting to install nginx/caddy now"
+  export DEBIAN_FRONTEND=noninteractive
+  apt_quiet_retry "Refresh package index for HTTPS proxy" apt-get update -y || true
+
+  if apt_quiet_retry "Install nginx for HTTPS proxy" apt-get install -y nginx; then
+    configure_self_signed_tls_proxy_nginx
+    return 0
+  fi
+  if apt_quiet_retry "Install caddy for HTTPS proxy" apt-get install -y caddy; then
+    configure_self_signed_tls_proxy_caddy
+    return 0
+  fi
+
+  fail "Unable to configure HTTPS proxy with self-signed certificate (nginx/caddy unavailable)"
+}
+
 apply_cluster_secrets_from_join_json() {
   local join_json="$1"
   local extracted=""
@@ -346,7 +615,7 @@ run_wizard() {
   esac
 
   if [[ -z "$NODE_ROLE" ]]; then
-    NODE_ROLE="worker"
+    NODE_ROLE="general"
   fi
 
   if [[ "$mode" == "first" ]]; then
@@ -356,8 +625,8 @@ run_wizard() {
   else
     BOOTSTRAP=0
     INSTALL_MONITORING=1
-    peer_target="$(prompt_required "Peer worker API host/IP")"
-    peer_port="$(prompt_default "Peer worker API port" "$JOIN_PORT")"
+    peer_target="$(prompt_required "Peer node API host/IP")"
+    peer_port="$(prompt_default "Peer node API port" "$JOIN_PORT")"
     JOIN_TARGET="$peer_target"
     JOIN_PORT="$peer_port"
     API_URL="$(normalize_join_api_url "$JOIN_TARGET" "$JOIN_PORT")"
@@ -368,8 +637,8 @@ run_wizard() {
   endpoint_default="$(default_api_endpoint)"
   API_ENDPOINT="$(prompt_default "Advertised API endpoint for this node" "$endpoint_default")"
 
-  if [[ "$NODE_ROLE" == "worker" ]]; then
-    ETCD_PEER_URL="$(prompt_default "etcd peer URL for this worker node" "$(derive_etcd_peer_url "$API_ENDPOINT")")"
+  if [[ "$NODE_ROLE" != "gateway" ]]; then
+    ETCD_PEER_URL="$(prompt_default "etcd peer URL for this node" "$(derive_etcd_peer_url "$API_ENDPOINT")")"
     if [[ "$mode" == "first" ]]; then
       API_URL="$(prompt_default "API URL used for bootstrap" "http://127.0.0.1:${PORT}")"
     fi
@@ -436,6 +705,7 @@ print_install_summary() {
 | local_api         : http://127.0.0.1:${PORT}
 | advertised_api    : ${API_ENDPOINT}
 | cluster_api       : ${API_URL}
+| web_ui            : ${WEB_UI_URL:-"(https proxy unavailable)"}
 | bootstrap         : ${BOOTSTRAP}
 | join_target       : ${JOIN_TARGET:-"(none)"}
 | etcd_peer_url     : ${ETCD_PEER_URL:-"(none)"}
@@ -507,12 +777,12 @@ if [[ -z "$NODE_ID" ]]; then
   NODE_ID="$(generate_short_uuid)"
 fi
 if [[ -z "$NODE_ROLE" ]]; then
-  NODE_ROLE="worker"
+  NODE_ROLE="general"
 fi
 case "$NODE_ROLE" in
-  worker|gateway) ;;
+  general|backend_server|reverse_proxy|gateway|worker) ;;
   *)
-    echo "--role must be one of: worker, gateway" >&2
+    echo "--role must be one of: general, backend_server, reverse_proxy, gateway, worker" >&2
     exit 1 ;;
 esac
 
@@ -525,7 +795,7 @@ fi
 if [[ -z "$API_ENDPOINT" ]]; then
   API_ENDPOINT="$(default_api_endpoint)"
 fi
-if [[ -z "$ETCD_PEER_URL" && "$NODE_ROLE" == "worker" ]]; then
+if [[ -z "$ETCD_PEER_URL" && "$NODE_ROLE" != "gateway" ]]; then
   ETCD_PEER_URL="$(derive_etcd_peer_url "$API_ENDPOINT")"
 fi
 if [[ -n "$JOIN_TARGET" ]]; then
@@ -536,10 +806,6 @@ if [[ -n "$JOIN_TARGET" ]]; then
   BOOTSTRAP=0
 else
   BOOTSTRAP=1
-fi
-if [[ "$BOOTSTRAP" -eq 1 && "$NODE_ROLE" != "worker" ]]; then
-  echo "first-node install requires --role worker" >&2
-  exit 1
 fi
 if [[ "$BOOTSTRAP" -eq 1 && -z "${INSTALL_ADMIN_USERNAME// }" ]]; then
   echo "--username cannot be empty for first-node install" >&2
@@ -558,16 +824,11 @@ fi
 if [[ "$INSTALL_DEPS" -eq 1 ]]; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
-  apt-get install -y python3 python3-venv python3-pip curl ca-certificates git golang-go iproute2 iputils-ping
-  if [[ "$NODE_ROLE" == "worker" ]]; then
-    apt-get install -y lxd || true
-  fi
-  if [[ "$NODE_ROLE" == "worker" ]]; then
-    apt-get install -y etcd || apt-get install -y etcd-server etcd-client || true
-  fi
-  if [[ "$NODE_ROLE" == "gateway" ]]; then
-    apt-get install -y nginx || true
-  fi
+  apt-get install -y python3 python3-venv python3-pip curl ca-certificates git golang-go iproute2 iputils-ping openssl
+  apt-get install -y lxd || true
+  apt-get install -y etcd || apt-get install -y etcd-server etcd-client || true
+  apt-get install -y nginx || true
+  apt-get install -y caddy || true
   apt-get install -y prometheus prometheus-node-exporter prometheus-alertmanager grafana || true
 fi
 
@@ -625,9 +886,9 @@ setv("AGENT_ENABLE_UNIX_SOCKET", kv.get("AGENT_ENABLE_UNIX_SOCKET", "true") or "
 setv("AGENT_UNIX_SOCKET", kv.get("AGENT_UNIX_SOCKET", "./data/agent.sock") or "./data/agent.sock")
 setv("MANAGED_CONFIG_PATH", kv.get("MANAGED_CONFIG_PATH", "config.yaml") or "config.yaml")
 setv("METRICS_ENABLED", kv.get("METRICS_ENABLED", "true") or "true")
-default_etcd_enabled = "true" if "${NODE_ROLE}" == "worker" and "${ETCD_AVAILABLE}" == "1" else "false"
+default_etcd_enabled = "true" if "${ETCD_AVAILABLE}" == "1" else "false"
 setv("ETCD_ENABLED", kv.get("ETCD_ENABLED", default_etcd_enabled) or default_etcd_enabled)
-default_etcd_endpoints = "http://127.0.0.1:2379" if "${NODE_ROLE}" == "worker" and "${ETCD_AVAILABLE}" == "1" else ""
+default_etcd_endpoints = "http://127.0.0.1:2379" if "${ETCD_AVAILABLE}" == "1" else ""
 setv("ETCD_ENDPOINTS", kv.get("ETCD_ENDPOINTS", default_etcd_endpoints) or default_etcd_endpoints)
 setv("ETCDCTL_COMMAND", kv.get("ETCDCTL_COMMAND", "etcdctl") or "etcdctl")
 setv("ETCD_PREFIX", kv.get("ETCD_PREFIX", "/uptimemesh") or "/uptimemesh")
@@ -655,7 +916,7 @@ setv("RUNTIME_NODE_NAME", "${NODE_NAME}")
 setv("RUNTIME_NODE_ROLE", "${NODE_ROLE}")
 setv("RUNTIME_API_BASE_URL", "http://127.0.0.1:${PORT}")
 setv("RUNTIME_IDENTITY_DIR", "./data/identities")
-setv("RUNTIME_HEARTBEAT_INTERVAL_SECONDS", kv.get("RUNTIME_HEARTBEAT_INTERVAL_SECONDS", "10") or "10")
+setv("RUNTIME_HEARTBEAT_INTERVAL_SECONDS", kv.get("RUNTIME_HEARTBEAT_INTERVAL_SECONDS", "15") or "15")
 setv("RUNTIME_HEARTBEAT_TTL_SECONDS", kv.get("RUNTIME_HEARTBEAT_TTL_SECONDS", "45") or "45")
 setv("RUNTIME_MESH_CIDR", kv.get("RUNTIME_MESH_CIDR", "10.42.0.0/16") or "10.42.0.0/16")
 setv("RUNTIME_WG_PRIMARY_IFACE", kv.get("RUNTIME_WG_PRIMARY_IFACE", "wg-mesh0") or "wg-mesh0")
@@ -684,7 +945,16 @@ setv("RUNTIME_ROUTE_PRIMARY_METRIC", kv.get("RUNTIME_ROUTE_PRIMARY_METRIC", "100
 setv("RUNTIME_ROUTE_SECONDARY_METRIC", kv.get("RUNTIME_ROUTE_SECONDARY_METRIC", "200") or "200")
 setv("RUNTIME_ETCD_ENDPOINTS", kv.get("RUNTIME_ETCD_ENDPOINTS", default_etcd_endpoints) or default_etcd_endpoints)
 setv("RUNTIME_ETCD_PROBE_INTERVAL_SECONDS", kv.get("RUNTIME_ETCD_PROBE_INTERVAL_SECONDS", "10") or "10")
-default_discovery = "true" if "${NODE_ROLE}" == "worker" else "false"
+setv("RUNTIME_SWIM_ENABLE", kv.get("RUNTIME_SWIM_ENABLE", "true") or "true")
+setv("RUNTIME_SWIM_PORT", kv.get("RUNTIME_SWIM_PORT", "7946") or "7946")
+setv("RUNTIME_SWIM_PROBE_TIMEOUT_MS", kv.get("RUNTIME_SWIM_PROBE_TIMEOUT_MS", "500") or "500")
+setv("RUNTIME_SWIM_SUSPECT_THRESHOLD", kv.get("RUNTIME_SWIM_SUSPECT_THRESHOLD", "2") or "2")
+setv("RUNTIME_SWIM_DEAD_THRESHOLD", kv.get("RUNTIME_SWIM_DEAD_THRESHOLD", "4") or "4")
+setv("RUNTIME_SWIM_COOLDOWN_SECONDS", kv.get("RUNTIME_SWIM_COOLDOWN_SECONDS", "30") or "30")
+setv("RUNTIME_INTERNAL_CDN_DIR", kv.get("RUNTIME_INTERNAL_CDN_DIR", "data/internal-cdn") or "data/internal-cdn")
+setv("RUNTIME_BACKEND_LISTEN_PORT", kv.get("RUNTIME_BACKEND_LISTEN_PORT", "8081") or "8081")
+setv("RUNTIME_PROXY_LISTEN_PORT", kv.get("RUNTIME_PROXY_LISTEN_PORT", "8080") or "8080")
+default_discovery = "true"
 setv("RUNTIME_DISCOVERY_ENABLE", kv.get("RUNTIME_DISCOVERY_ENABLE", default_discovery) or default_discovery)
 setv("RUNTIME_DISCOVERY_DOMAIN", kv.get("RUNTIME_DISCOVERY_DOMAIN", "mesh.local") or "mesh.local")
 setv("RUNTIME_DISCOVERY_TTL_SECONDS", kv.get("RUNTIME_DISCOVERY_TTL_SECONDS", "30") or "30")
@@ -703,7 +973,7 @@ setv(
 )
 setv("RUNTIME_DISCOVERY_INTERVAL_SECONDS", kv.get("RUNTIME_DISCOVERY_INTERVAL_SECONDS", "10") or "10")
 setv("RUNTIME_DISCOVERY_RELOAD_COMMAND", kv.get("RUNTIME_DISCOVERY_RELOAD_COMMAND", ""))
-default_gateway = "true" if "${NODE_ROLE}" == "gateway" else "false"
+default_gateway = "false"
 setv("RUNTIME_GATEWAY_ENABLE", kv.get("RUNTIME_GATEWAY_ENABLE", default_gateway) or default_gateway)
 setv("RUNTIME_GATEWAY_CONFIG_PATH", kv.get("RUNTIME_GATEWAY_CONFIG_PATH", "data/nginx/nginx.conf") or "data/nginx/nginx.conf")
 setv(
@@ -734,7 +1004,7 @@ setv(
     "RUNTIME_GATEWAY_HEALTHCHECK_EXPECTED_STATUS",
     kv.get("RUNTIME_GATEWAY_HEALTHCHECK_EXPECTED_STATUS", "200") or "200",
 )
-default_monitoring = "true" if "${NODE_ROLE}" == "worker" else "false"
+default_monitoring = "true"
 setv("RUNTIME_MONITORING_ENABLE", kv.get("RUNTIME_MONITORING_ENABLE", default_monitoring) or default_monitoring)
 setv("RUNTIME_MONITORING_INTERVAL_SECONDS", kv.get("RUNTIME_MONITORING_INTERVAL_SECONDS", "15") or "15")
 setv(
@@ -889,17 +1159,20 @@ SYSTEMD
 
 systemctl daemon-reload
 
-if [[ "$NODE_ROLE" == "worker" ]]; then
-  if systemctl list-unit-files | awk '{print $1}' | grep -qx 'etcd.service'; then
-    systemctl enable --now etcd || true
-  fi
-  if systemctl list-unit-files | awk '{print $1}' | grep -qx 'etcd-server.service'; then
-    systemctl enable --now etcd-server || true
-  fi
+if systemctl list-unit-files | awk '{print $1}' | grep -qx 'etcd.service'; then
+  systemctl enable --now etcd || true
+fi
+if systemctl list-unit-files | awk '{print $1}' | grep -qx 'etcd-server.service'; then
+  systemctl enable --now etcd-server || true
 fi
 
 systemctl enable uptime-mesh.service
 systemctl restart uptime-mesh.service || systemctl start uptime-mesh.service
+if command -v nginx >/dev/null 2>&1 && command -v openssl >/dev/null 2>&1; then
+  configure_self_signed_tls_proxy
+else
+  echo "warning: HTTPS proxy not configured (nginx and openssl are required)."
+fi
 systemctl enable --now uptime-mesh-watchdog.timer
 systemctl start uptime-mesh-watchdog.service || true
 systemctl enable --now prometheus prometheus-node-exporter prometheus-alertmanager || true

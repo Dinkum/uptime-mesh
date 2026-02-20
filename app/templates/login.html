@@ -10,66 +10,158 @@
       href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=IBM+Plex+Mono:wght@400;600&display=swap"
       rel="stylesheet"
     />
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://cdn.jsdelivr.net/npm/daisyui@4.7.3/dist/full.min.js"></script>
     <style>
+      :root {
+        color-scheme: dark;
+      }
+      * {
+        box-sizing: border-box;
+      }
       body {
         font-family: "Space Grotesk", sans-serif;
-        min-height: 100vh;
+        margin: 0;
         color: #e2e8f0;
+        min-height: 100vh;
         background: radial-gradient(circle at 12% 12%, rgba(14, 165, 233, 0.18), transparent 32%),
           radial-gradient(circle at 82% 18%, rgba(56, 189, 248, 0.14), transparent 28%),
           linear-gradient(160deg, #030712 0%, #0b1220 55%, #0f172a 100%);
       }
-      .mono {
-        font-family: "IBM Plex Mono", monospace;
+      .page {
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 24px;
       }
       .mesh-card {
+        width: min(100%, 460px);
+        border-radius: 20px;
+        padding: 30px;
         border: 1px solid rgba(148, 163, 184, 0.22);
         box-shadow: 0 28px 60px rgba(2, 6, 23, 0.6);
         background: linear-gradient(180deg, rgba(15, 23, 42, 0.9), rgba(15, 23, 42, 0.82));
         backdrop-filter: blur(8px);
       }
+      h1 {
+        margin: 0;
+        font-size: 2rem;
+        line-height: 1.1;
+        letter-spacing: -0.01em;
+      }
+      .subtitle {
+        margin: 10px 0 0;
+        font-size: 0.96rem;
+        color: #94a3b8;
+      }
+      .form {
+        margin-top: 24px;
+      }
+      .field {
+        margin-top: 14px;
+      }
+      .field:first-child {
+        margin-top: 0;
+      }
+      .label {
+        display: block;
+        margin-bottom: 8px;
+        font-size: 0.9rem;
+        font-weight: 600;
+        color: #cbd5e1;
+      }
+      .input {
+        width: 100%;
+        min-height: 48px;
+        border-radius: 12px;
+        border: 1px solid rgba(148, 163, 184, 0.35);
+        background: rgba(15, 23, 42, 0.82);
+        color: #f8fafc;
+        font-size: 1rem;
+        padding: 12px 44px 12px 14px;
+        outline: none;
+        transition: border-color 120ms ease, box-shadow 120ms ease, background 120ms ease;
+      }
+      .input::placeholder {
+        color: #64748b;
+      }
+      .input:focus {
+        border-color: rgba(56, 189, 248, 0.9);
+        box-shadow: 0 0 0 3px rgba(14, 165, 233, 0.22), 0 0 28px rgba(14, 165, 233, 0.18);
+        background: rgba(15, 23, 42, 0.95);
+      }
+      .submit {
+        margin-top: 18px;
+        width: 100%;
+        min-height: 48px;
+        border: 0;
+        border-radius: 12px;
+        background: linear-gradient(95deg, #0ea5e9, #38bdf8);
+        color: #082032;
+        font-size: 1rem;
+        font-weight: 700;
+        cursor: pointer;
+        box-shadow: 0 10px 24px rgba(14, 165, 233, 0.32);
+        transition: transform 100ms ease, box-shadow 100ms ease, filter 100ms ease;
+      }
+      .submit:hover {
+        filter: brightness(1.04);
+        transform: translateY(-1px);
+        box-shadow: 0 14px 28px rgba(14, 165, 233, 0.38);
+      }
+      .submit:active {
+        transform: translateY(0);
+      }
+      .error {
+        margin-top: 16px;
+        border: 1px solid rgba(239, 68, 68, 0.45);
+        border-radius: 12px;
+        padding: 10px 12px;
+        background: rgba(127, 29, 29, 0.35);
+        color: #fecaca;
+        font-size: 0.9rem;
+      }
     </style>
   </head>
-  <body class="flex items-center justify-center p-6">
-    <div class="w-full max-w-md rounded-2xl p-8 mesh-card">
-      <h1 class="text-3xl font-semibold mt-2">Sign In</h1>
-      <p class="text-sm text-slate-400 mt-2">Cluster administration requires authentication.</p>
+  <body>
+    <main class="page">
+      <section class="mesh-card">
+        <h1>Sign In</h1>
+        <p class="subtitle">Cluster administration requires authentication.</p>
 
-      {% if error %}
-        <div class="alert alert-error mt-5 text-sm">
-          <span>{{ error }}</span>
-        </div>
-      {% endif %}
+        {% if error %}
+          <div class="error">{{ error }}</div>
+        {% endif %}
 
-      <form method="post" action="/auth/login" class="mt-6 space-y-4">
-        <input type="hidden" name="next" value="{{ next_path }}" />
-        <label class="form-control">
-          <span class="label-text text-sm text-slate-300">Username</span>
-          <input
-            class="input input-bordered"
-            type="text"
-            name="username"
-            value=""
-            required
-            autocomplete="username"
-            placeholder="admin"
-            autofocus
-          />
-        </label>
-        <label class="form-control">
-          <span class="label-text text-sm text-slate-300">Password</span>
-          <input
-            class="input input-bordered"
-            type="password"
-            name="password"
-            required
-            autocomplete="current-password"
-          />
-        </label>
-        <button class="btn btn-primary w-full" type="submit">Sign In</button>
-      </form>
-    </div>
+        <form method="post" action="/auth/login" class="form">
+          <input type="hidden" name="next" value="{{ next_path }}" />
+          <div class="field">
+            <label class="label" for="username">Username</label>
+            <input
+              id="username"
+              class="input"
+              type="text"
+              name="username"
+              value=""
+              required
+              autocomplete="username"
+              placeholder="admin"
+              autofocus
+            />
+          </div>
+          <div class="field">
+            <label class="label" for="password">Password</label>
+            <input
+              id="password"
+              class="input"
+              type="password"
+              name="password"
+              required
+              autocomplete="current-password"
+              placeholder="Enter password"
+            />
+          </div>
+          <button class="submit" type="submit">Sign In</button>
+        </form>
+      </section>
+    </main>
   </body>
 </html>

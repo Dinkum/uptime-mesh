@@ -29,7 +29,10 @@ router = APIRouter(prefix="/etcd", tags=["etcd"])
 
 def _is_worker_node(node: Node) -> bool:
     roles = node.roles if isinstance(node.roles, list) else []
-    return any(str(role).strip().lower() == "worker" for role in roles)
+    normalized = {str(role).strip().lower() for role in roles}
+    if "gateway" in normalized and len(normalized) == 1:
+        return False
+    return bool(normalized)
 
 
 def _node_peer_url(node: Node) -> str:

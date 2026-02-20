@@ -11,7 +11,7 @@ class ClusterBootstrapRequest(BaseModel):
 
 
 class JoinTokenCreate(BaseModel):
-    role: str = Field(pattern="^(worker|gateway)$")
+    role: str = Field(default="general")
     ttl_seconds: int = Field(default=1800, ge=60, le=86400)
 
 
@@ -31,7 +31,7 @@ class NodeJoinRequest(BaseModel):
     token: str
     node_id: str
     name: str
-    role: str = Field(pattern="^(worker|gateway)$")
+    role: str = Field(default="general")
     mesh_ip: Optional[str] = None
     api_endpoint: Optional[str] = None
     etcd_peer_url: Optional[str] = None
@@ -75,3 +75,41 @@ class NodeLeaseOut(BaseModel):
     heartbeat_at: Optional[datetime]
     lease_expires_at: Optional[datetime]
     lease_state: str
+
+
+class ClusterPeerOut(BaseModel):
+    node_id: str
+    name: str
+    mesh_ip: str
+    api_endpoint: str
+
+
+class SwimReportRequest(BaseModel):
+    node_id: str
+    lease_token: str
+    incarnation: int = Field(default=0, ge=0)
+    state: str = Field(default="healthy")
+    flags: Dict[str, Any] = Field(default_factory=dict)
+    peers: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+
+
+class SwimMemberOut(BaseModel):
+    node_id: str
+    state: str
+    incarnation: int
+    updated_at: str
+    flags: Dict[str, Any] = Field(default_factory=dict)
+    peers: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+
+
+class SwimReportOut(BaseModel):
+    node_id: str
+    accepted: bool
+    updated_at: str
+
+
+class ContentActiveOut(BaseModel):
+    version: str
+    hash_sha256: str
+    size_bytes: int
+    body_base64: str
