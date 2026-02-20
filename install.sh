@@ -132,7 +132,7 @@ ensure_required_runtime_binaries() {
 
 unit_exists() {
   local unit="$1"
-  systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -qx "${unit}"
+  systemctl list-unit-files "${unit}" --no-legend 2>/dev/null | awk '{print $1}' | grep -qx "${unit}"
 }
 
 enable_service_if_exists() {
@@ -142,6 +142,54 @@ enable_service_if_exists() {
   else
     say "Skipping optional service (not installed): ${unit}"
   fi
+}
+
+ensure_etcd_services_started() {
+  local unit
+  local found=0
+  local active=0
+  for unit in etcd.service etcd-server.service etcd2.service; do
+    if unit_exists "${unit}"; then
+      found=1
+      systemctl enable --now "${unit}" >/dev/null 2>&1 || warn "failed to enable/start ${unit}"
+      if systemctl is-active --quiet "${unit}"; then
+        active=1
+      fi
+    fi
+  done
+  if [[ "${found}" -eq 0 ]]; then
+    warn "no etcd service unit detected on host; first-node bootstrap may be write-guarded"
+  elif [[ "${active}" -ne 1 ]]; then
+    warn "etcd service detected but not active; bootstrap will retry while waiting for writable state"
+  fi
+}
+
+run_cli_with_write_retry() {
+  local attempt=1
+  local max_attempts=20
+  local delay_seconds=3
+  local output=""
+  local rc=0
+  while (( attempt <= max_attempts )); do
+    set +e
+    output="$("$@" 2>&1)"
+    rc=$?
+    set -e
+    if [[ "${rc}" -eq 0 ]]; then
+      printf '%s' "${output}"
+      return 0
+    fi
+    if printf '%s' "${output}" | grep -q "writes are disabled while etcd is unavailable or stale"; then
+      warn "cluster writes unavailable (attempt ${attempt}/${max_attempts}); retrying in ${delay_seconds}s"
+      sleep "${delay_seconds}"
+      attempt=$((attempt + 1))
+      continue
+    fi
+    printf '%s\n' "${output}" >&2
+    return "${rc}"
+  done
+  printf '%s\n' "${output}" >&2
+  return 1
 }
 
 require_cmd() {
@@ -1568,9 +1616,7 @@ WantedBy=timers.target
 SYSTEMD
 
 systemctl daemon-reload
-
-enable_service_if_exists etcd.service
-enable_service_if_exists etcd-server.service
+ensure_etcd_services_started
 
 say "Starting core services"
 systemctl enable uptime-mesh.service
@@ -1618,12 +1664,12 @@ target.write_text(f"{resolved}\n", encoding="utf-8")
 PY
 
 if [[ "$BOOTSTRAP" -eq 1 ]]; then
-  bootstrap_prep_json="$(${APP_DIR}/.venv/bin/uptimemesh prepare-bootstrap-admin --username "${INSTALL_ADMIN_USERNAME}")"
+  bootstrap_prep_json="$(run_cli_with_write_retry "${APP_DIR}/.venv/bin/uptimemesh" prepare-bootstrap-admin --username "${INSTALL_ADMIN_USERNAME}")" || fail "failed to prepare bootstrap admin credentials"
   bootstrap_action="$(printf '%s' "$bootstrap_prep_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("action",""))')"
   if [[ "$bootstrap_action" == "generated" ]]; then
     INITIAL_ADMIN_USERNAME="$(printf '%s' "$bootstrap_prep_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("username",""))')"
     INITIAL_ADMIN_PASSWORD="$(printf '%s' "$bootstrap_prep_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("password",""))')"
-    bootstrap_json="$(${APP_DIR}/.venv/bin/uptimemesh --api-url "${API_URL}" bootstrap --username "${INITIAL_ADMIN_USERNAME}" --password "${INITIAL_ADMIN_PASSWORD}")"
+    bootstrap_json="$(run_cli_with_write_retry "${APP_DIR}/.venv/bin/uptimemesh" --api-url "${API_URL}" bootstrap --username "${INITIAL_ADMIN_USERNAME}" --password "${INITIAL_ADMIN_PASSWORD}")" || fail "failed to bootstrap first node"
     worker_token="$(printf '%s' "$bootstrap_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["worker_token"]["token"])')"
     join_cmd=(
       "${APP_DIR}/.venv/bin/uptimemesh" --api-url "${API_URL}" join
@@ -1637,7 +1683,7 @@ if [[ "$BOOTSTRAP" -eq 1 ]]; then
     if [[ -n "$ETCD_PEER_URL" ]]; then
       join_cmd+=(--etcd-peer-url "${ETCD_PEER_URL}")
     fi
-    "${join_cmd[@]}" >/dev/null
+    run_cli_with_write_retry "${join_cmd[@]}" >/dev/null || fail "failed to enroll local node after bootstrap"
     INITIAL_ADMIN_GENERATED=1
     echo "Bootstrap complete."
   else
@@ -1656,7 +1702,7 @@ elif [[ -n "$JOIN_TOKEN" ]]; then
   if [[ -n "$ETCD_PEER_URL" ]]; then
     join_cmd+=(--etcd-peer-url "${ETCD_PEER_URL}")
   fi
-  "${join_cmd[@]}" >/dev/null
+  run_cli_with_write_retry "${join_cmd[@]}" >/dev/null || fail "failed to join node with provided token"
   echo "Join complete."
 else
   echo "Install complete (service running)."

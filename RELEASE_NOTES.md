@@ -1,5 +1,21 @@
 # Release Notes
 
+## v0.0.6
+
+### Major
+- Hardened first-node bootstrap reliability during fresh install:
+  - Added retry logic around installer bootstrap/join CLI calls when writes are temporarily blocked by `etcd_status` (`down/stale`) during startup convergence.
+  - Eliminates transient first-run failures like `HTTP 503: Cluster writes are disabled while etcd is unavailable or stale.` during install finalization.
+
+### Minor
+- Improved etcd unit detection/start in installer:
+  - `unit_exists` now performs exact unit lookup (`systemctl list-unit-files <unit>`) to avoid false negatives.
+  - Installer now attempts known etcd unit variants (`etcd.service`, `etcd-server.service`, `etcd2.service`) with clearer warning messages when none are present/active.
+- Updated install script checksum in `version.json` for manifest validation.
+
+## Included Changes Since v0.0.5
+- This release includes all commits after `v0.0.5`, focused on first-install bootstrap stability and etcd service startup detection on clean nodes.
+
 ## v0.0.5
 
 ### Major
