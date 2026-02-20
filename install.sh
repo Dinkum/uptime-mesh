@@ -365,6 +365,11 @@ sha256_file() {
   return 1
 }
 
+is_github_generated_tarball_url() {
+  local url="$1"
+  [[ "$url" =~ ^https://api\.github\.com/repos/.+/tarball/ ]] || [[ "$url" =~ ^https://codeload\.github\.com/.+/tar\.gz/ ]]
+}
+
 repo_slug_from_url() {
   local url="$1"
   python3 - "${url}" <<'PY'
@@ -404,6 +409,8 @@ fetch_release_into_install_dir() {
   local slug
   local release_api
   local latest_tag
+  local channel_version
+  local latest_version
   local tarball_url
   local source_sha
 
@@ -435,24 +442,40 @@ source = cfg.get("source", {}) if isinstance(cfg, dict) else {}
 tag_name = str(release.get("tag_name", "")).strip()
 tarball_url = str(release.get("tarball_url", "")).strip()
 source_sha = str(source.get("sha256", "")).strip()
+channel_version = str(cfg.get("version", "")).strip() if isinstance(cfg, dict) else ""
 print(f"LATEST_TAG={shlex.quote(tag_name)}")
 print(f"TARBALL_URL={shlex.quote(tarball_url)}")
 print(f"SOURCE_SHA={shlex.quote(source_sha)}")
+print(f"CHANNEL_VERSION={shlex.quote(channel_version)}")
 PY
   )"
 
   latest_tag="${LATEST_TAG:-}"
+  latest_version="${latest_tag#v}"
+  channel_version="${CHANNEL_VERSION:-}"
   tarball_url="${TARBALL_URL:-}"
   source_sha="${SOURCE_SHA:-}"
   [[ -n "${latest_tag}" ]] || fail "release metadata missing tag_name"
+  if [[ -n "${channel_version}" && "${channel_version}" != "${latest_version}" ]]; then
+    fail "manifest channel version (${channel_version}) does not match latest release (${latest_version})"
+  fi
   [[ -n "${tarball_url}" ]] || fail "release metadata missing tarball_url"
-  [[ -n "${source_sha}" ]] || fail "manifest missing source.sha256 for channel ${UPDATE_CHANNEL}"
 
   download_url_retry "${tarball_url}" "${tarball_path}" || fail "failed to download release tarball"
-  local tar_sha
-  tar_sha="$(sha256_file "${tarball_path}" || true)"
-  [[ -n "${tar_sha}" ]] || fail "failed to compute source tarball sha256"
-  [[ "${tar_sha}" == "${source_sha}" ]] || fail "source tarball checksum mismatch"
+  if [[ -n "${source_sha}" ]]; then
+    local tar_sha
+    tar_sha="$(sha256_file "${tarball_path}" || true)"
+    [[ -n "${tar_sha}" ]] || fail "failed to compute source tarball sha256"
+    if [[ "${tar_sha}" != "${source_sha}" ]]; then
+      if is_github_generated_tarball_url "${tarball_url}"; then
+        warn "source checksum mismatch on GitHub-generated tarball; continuing | expected: ${source_sha} actual: ${tar_sha}"
+      else
+        fail "source tarball checksum mismatch | expected: ${source_sha} actual: ${tar_sha}"
+      fi
+    fi
+  else
+    warn "manifest source checksum missing for channel ${UPDATE_CHANNEL}; continuing with release API tarball"
+  fi
 
   tar -xzf "${tarball_path}" -C "${unpack_dir}" || fail "failed to extract source tarball"
   src_root="$(find "${unpack_dir}" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
@@ -464,10 +487,15 @@ PY
     rm -rf "${INSTALL_DIR}"
   fi
   mv "${install_tmp}" "${INSTALL_DIR}"
-  printf '%s\n' "${latest_tag#v}" > "${INSTALL_DIR}/VERSION"
+  printf '%s\n' "${latest_version}" > "${INSTALL_DIR}/VERSION"
 }
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -n "${BASH_SOURCE:-}" ]]; then
+  SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+else
+  SCRIPT_SOURCE="$0"
+fi
+SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_SOURCE}")" && pwd)"
 APP_DIR="${SCRIPT_DIR}"
 
 # Remote mode (e.g. curl | bash): fetch latest release source into install dir, then run install there.

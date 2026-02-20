@@ -14,7 +14,8 @@ This directory contains the node-side lifecycle scripts used in production.
   - Compares installed `VERSION` vs latest release.
   - Uses `update-state.json` failed-version gate.
   - Backs up app dir + sqlite DB + agent binary.
-  - Downloads and verifies source tarball checksum.
+  - Downloads latest release source tarball from GitHub release metadata.
+  - Optionally verifies source checksum when `channels.<name>.source.sha256` is provided.
   - Applies source update, rebuilds Go agent, runs migrations.
   - Restarts services and enforces health gate.
   - Rolls back on failure.
@@ -31,7 +32,11 @@ This directory contains the node-side lifecycle scripts used in production.
 - `bootstrap.path`, `bootstrap.sha256`
 - `install.path`, `install.sha256`
 - `update.path`, `update.sha256`
-- `source.url`, `source.sha256`
+- Optional: `source.sha256`
+
+Notes:
+- Source tarball URL is resolved dynamically from GitHub Releases API (`releases/latest`), not pinned via manifest URL.
+- Channel `version` must match `releases/latest` tag version, otherwise install/update aborts to prevent version drift.
 
 ## Systemd
 

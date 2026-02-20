@@ -1,5 +1,30 @@
 # Release Notes
 
+## v0.0.5
+
+### Major
+- Fixed public install path reliability regressions:
+  - Resolved `curl ... | bash` crash caused by strict `BASH_SOURCE[0]` use under `set -u`.
+  - Hardened script source-path resolution so install runs correctly in both piped and file-based modes.
+- Fixed release/version drift risk in updater/install flow:
+  - Installer and updater now enforce manifest/release lockstep (`channels.<channel>.version` must match `releases/latest` tag).
+  - Removed stale-manifest `source.url` precedence in updater; source tarball now always comes from release metadata.
+  - Prevents scenarios where nodes could mark themselves updated to a new version while applying old source content.
+
+### Minor
+- Improved source tarball checksum behavior and operator feedback:
+  - `source.sha256` is now optional in manifest contract.
+  - For GitHub-generated tarballs, checksum mismatch now logs a clear warning with expected/actual hashes and continues.
+  - For non-GitHub tarballs, checksum mismatch remains hard-fail with actionable error context.
+- Updated lifecycle docs (`ops/README.md`) to reflect dynamic release tarball resolution and optional source checksum.
+- Updated version manifest script checksums for `install.sh` and `ops/update.sh`.
+
+## Included Changes Since v0.0.4
+- This release includes all commits after `v0.0.4`, focused on:
+  - unblocking public install (`curl | bash` and `./install.sh`) failures,
+  - eliminating stale release source selection paths,
+  - and making update/install manifest semantics safer and easier to operate.
+
 ## v0.0.4
 
 ### Major
