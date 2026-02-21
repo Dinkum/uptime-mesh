@@ -16,11 +16,15 @@
     </div>
   </section>
 
-  <div class="flex flex-wrap gap-3 mb-6">
-    <a class="btn btn-sm {% if workloads_subtab == 'services' %}btn-primary{% else %}btn-outline{% endif %}" href="{{ ui_prefix }}/workloads?tab=services">Services</a>
-    <a class="btn btn-sm {% if workloads_subtab == 'replicas' %}btn-primary{% else %}btn-outline{% endif %}" href="{{ ui_prefix }}/workloads?tab=replicas">Replicas</a>
-    <a class="btn btn-sm {% if workloads_subtab == 'scheduler' %}btn-primary{% else %}btn-outline{% endif %}" href="{{ ui_prefix }}/workloads?tab=scheduler">Scheduler Plan</a>
-  </div>
+  <section class="mesh-subtabs-shell mb-6" aria-label="Workloads sections">
+    <p class="mesh-subtabs-label">Workloads Sections</p>
+    <nav class="mesh-subtabs">
+      <a class="mesh-subtab{% if workloads_subtab == 'services' %} active{% endif %}" href="{{ ui_prefix }}/workloads?tab=services">Services</a>
+      <a class="mesh-subtab{% if workloads_subtab == 'rollouts' %} active{% endif %}" href="{{ ui_prefix }}/workloads?tab=rollouts">Rollout Watch</a>
+      <a class="mesh-subtab{% if workloads_subtab == 'replicas' %} active{% endif %}" href="{{ ui_prefix }}/workloads?tab=replicas">Replicas</a>
+      <a class="mesh-subtab{% if workloads_subtab == 'scheduler' %} active{% endif %}" href="{{ ui_prefix }}/workloads?tab=scheduler">Scheduler Plan</a>
+    </nav>
+  </section>
 
   {% if workloads_subtab == "services" %}
     <section class="mesh-card rounded-2xl p-6">
@@ -83,6 +87,80 @@
             {% endfor %}
           </tbody>
         </table>
+      </div>
+    </section>
+  {% elif workloads_subtab == "rollouts" %}
+    <section class="mesh-card rounded-2xl p-6">
+      <div class="flex flex-wrap items-center justify-between gap-2">
+        <h2 class="text-lg font-semibold">Rollout Watch</h2>
+        <span class="text-xs text-slate-500">Needs-attention-first rollout view across all services</span>
+      </div>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-4">
+        <div class="rounded-xl border border-slate-700/40 p-3">
+          <p class="text-slate-500 text-xs">Errors</p>
+          <p class="mono mt-1 text-lg">{{ rollout_watch_errors }}</p>
+        </div>
+        <div class="rounded-xl border border-slate-700/40 p-3">
+          <p class="text-slate-500 text-xs">Stalled</p>
+          <p class="mono mt-1 text-lg">{{ rollout_watch_stalled }}</p>
+        </div>
+        <div class="rounded-xl border border-slate-700/40 p-3">
+          <p class="text-slate-500 text-xs">Active / Outdated</p>
+          <p class="mono mt-1 text-lg">{{ rollout_watch_active }}</p>
+        </div>
+        <div class="rounded-xl border border-slate-700/40 p-3">
+          <p class="text-slate-500 text-xs">Blocking Replicas</p>
+          <p class="mono mt-1 text-lg">{{ rollout_watch_blocked_replicas }}</p>
+        </div>
+      </div>
+      <div class="space-y-4 mt-4">
+        {% for row in rollout_watch_rows %}
+          <article class="rounded-xl border border-slate-700/40 p-4">
+            <div class="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p class="font-semibold">{{ row.service_name }}</p>
+                <p class="mono text-[11px] text-slate-500 mt-1">{{ row.service_id }}</p>
+              </div>
+              <div class="text-right">
+                {% if row.state_key == "complete" %}
+                  <span class="badge badge-success badge-outline">{{ row.state_text }}</span>
+                {% elif row.state_key == "rolling" %}
+                  <span class="badge badge-info badge-outline">{{ row.state_text }}</span>
+                {% elif row.state_key in ["stalled", "outdated"] %}
+                  <span class="badge badge-warning badge-outline">{{ row.state_text }}</span>
+                {% elif row.state_key == "error" %}
+                  <span class="badge badge-error badge-outline">{{ row.state_text }}</span>
+                {% else %}
+                  <span class="badge badge-outline">{{ row.state_text }}</span>
+                {% endif %}
+                <p class="mono text-xs text-slate-500 mt-2">progress {{ row.progress_pct }}%</p>
+              </div>
+            </div>
+            <progress class="progress progress-info w-full mt-3" value="{{ row.progress_pct }}" max="100"></progress>
+            <div class="grid grid-cols-2 md:grid-cols-5 gap-2 mt-3 text-xs">
+              <div class="rounded-lg border border-slate-700/30 px-2 py-2 mono">up {{ row.up_to_date }}</div>
+              <div class="rounded-lg border border-slate-700/30 px-2 py-2 mono">outdated {{ row.outdated }}</div>
+              <div class="rounded-lg border border-slate-700/30 px-2 py-2 mono">pending {{ row.pending }}</div>
+              <div class="rounded-lg border border-slate-700/30 px-2 py-2 mono">in_progress {{ row.in_progress }}</div>
+              <div class="rounded-lg border border-slate-700/30 px-2 py-2 mono">failed {{ row.failed }}</div>
+            </div>
+            <p class="text-xs text-slate-500 mt-3">
+              request age {{ row.rollout_requested_age }} · oldest pending {{ row.oldest_pending_age }} ·
+              blocking replicas {{ row.blocking_count }}
+            </p>
+            <div class="mt-3 flex flex-wrap gap-2">
+              {% for replica in row.blocking_preview %}
+                <span class="badge badge-outline mono">
+                  {{ replica.id }} · {{ replica.update_state }} · {{ replica.applied_generation }}/{{ replica.target_generation }}
+                </span>
+              {% else %}
+                <span class="text-xs text-slate-500">No blocking replicas.</span>
+              {% endfor %}
+            </div>
+          </article>
+        {% else %}
+          <p class="text-sm text-slate-400">No rollout activity right now.</p>
+        {% endfor %}
       </div>
     </section>
   {% elif workloads_subtab == "replicas" %}

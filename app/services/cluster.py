@@ -60,15 +60,11 @@ _secrets_cache = {
     "cluster_signing_key": "",
     "expires_at_monotonic": 0.0,
 }
+_HEARTBEAT_REJECT_EVENT_COOLDOWN_SECONDS = 60
+_heartbeat_reject_event_cache: dict[str, float] = {}
 
-_ROLE_ALIASES = {
-    "worker": "general",
-    "gateway": "general",
-    "node": "general",
-    "general": "general",
-    "backend_server": "backend_server",
-    "reverse_proxy": "reverse_proxy",
-}
+_RUNTIME_NODE_ROLES = {"backend_server", "reverse_proxy"}
+_AUTO_ROLE_ALIASES = {"", "auto", "worker", "gateway", "general", "node"}
 
 _DEFAULT_CONTENT_HTML = """<!doctype html>
 <html lang="en">
@@ -146,11 +142,13 @@ def _content_sha256(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
-def _canonical_role(value: str) -> str:
-    clean = str(value).strip().lower()
-    if clean in _ROLE_ALIASES:
-        return _ROLE_ALIASES[clean]
-    return "general"
+def _canonical_role(value: Optional[str]) -> str:
+    clean = str(value or "").strip().lower()
+    if clean in _RUNTIME_NODE_ROLES:
+        return clean
+    if clean in _AUTO_ROLE_ALIASES:
+        return "auto"
+    return "auto"
 
 
 def _parse_json_map(value: str) -> dict[str, object]:
@@ -168,6 +166,60 @@ def _parse_json_map(value: str) -> dict[str, object]:
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+async def _record_node_event(
+    session: AsyncSession,
+    *,
+    node_id: str,
+    name: str,
+    level: str = "INFO",
+    category: str = "cluster",
+    fields: Optional[dict[str, object]] = None,
+) -> None:
+    await record_event(
+        session,
+        event_id=str(uuid4()),
+        category=category,
+        name=name,
+        level=level,
+        fields={"node_id": node_id, **(fields or {})},
+    )
+
+
+async def _record_heartbeat_reject_event(
+    session: AsyncSession,
+    *,
+    node_id: str,
+    reason: str,
+    fields: Optional[dict[str, object]] = None,
+) -> None:
+    cache_key = f"{node_id}:{reason}"
+    now_monotonic = time.monotonic()
+    next_allowed = _heartbeat_reject_event_cache.get(cache_key, 0.0)
+    if now_monotonic < next_allowed:
+        return
+    _heartbeat_reject_event_cache[cache_key] = (
+        now_monotonic + _HEARTBEAT_REJECT_EVENT_COOLDOWN_SECONDS
+    )
+    try:
+        await _record_node_event(
+            session,
+            node_id=node_id,
+            name=f"heartbeat.reject.{reason}",
+            level="WARNING",
+            fields=fields or {},
+        )
+        await session.commit()
+    except Exception as exc:  # noqa: BLE001
+        _logger.debug(
+            "heartbeat.reject.event",
+            "Failed to persist heartbeat reject event",
+            node_id=node_id,
+            reason=reason,
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
 
 
 def _normalize_utc(value: Optional[datetime]) -> Optional[datetime]:
@@ -258,18 +310,36 @@ async def _persist_node_etcd_member_metadata(
         )
 
 
-def _is_worker_node(node: Node) -> bool:
+def _is_router_eligible_node(node: Node) -> bool:
     roles = node.roles if isinstance(node.roles, list) else []
     normalized = {str(role).strip().lower() for role in roles if str(role).strip()}
     if not normalized:
-        return False
-    if normalized == {"gateway"}:
-        return False
-    return bool(normalized & {"worker", "general", "backend_server", "reverse_proxy"})
+        return True
+    if normalized & _RUNTIME_NODE_ROLES:
+        return True
+    return bool(normalized & _AUTO_ROLE_ALIASES)
 
 
-def _desired_router_pair(node_id: str, worker_ids: list[str]) -> tuple[str, str]:
-    others = [item for item in worker_ids if item != node_id]
+async def _choose_auto_role(session: AsyncSession) -> str:
+    result = await session.execute(select(Node))
+    nodes = list(result.scalars().all())
+    backend_count = 0
+    proxy_count = 0
+    for node in nodes:
+        roles = node.roles if isinstance(node.roles, list) else []
+        normalized = {str(role).strip().lower() for role in roles if str(role).strip()}
+        if "backend_server" in normalized:
+            backend_count += 1
+        if "reverse_proxy" in normalized:
+            proxy_count += 1
+    # Keep the default 50/50 split while preferring backend_server under ties/scarcity.
+    if backend_count <= proxy_count:
+        return "backend_server"
+    return "reverse_proxy"
+
+
+def _desired_router_pair(node_id: str, eligible_ids: list[str]) -> tuple[str, str]:
+    others = [item for item in eligible_ids if item != node_id]
     if len(others) >= 2:
         return others[0], others[1]
     if len(others) == 1:
@@ -289,8 +359,8 @@ async def _reconcile_router_assignments(
     ) as op:
         node_rows = await session.execute(select(Node))
         nodes = list(node_rows.scalars().all())
-        worker_ids = sorted(node.id for node in nodes if _is_worker_node(node))
-        if not worker_ids:
+        eligible_ids = sorted(node.id for node in nodes if _is_router_eligible_node(node))
+        if not eligible_ids:
             op.step("nodes.none", "No eligible nodes found; skipping router assignment reconcile")
             return 0, 0
 
@@ -300,8 +370,8 @@ async def _reconcile_router_assignments(
 
         created_count = 0
         updated_count = 0
-        for node_id in worker_ids:
-            primary_router_id, secondary_router_id = _desired_router_pair(node_id, worker_ids)
+        for node_id in eligible_ids:
+            primary_router_id, secondary_router_id = _desired_router_pair(node_id, eligible_ids)
             current = by_node_id.get(node_id)
             if current is None:
                 current = RouterAssignment(
@@ -371,7 +441,7 @@ async def _reconcile_router_assignments(
             )
 
             if _etcd_configured():
-                for node_id in worker_ids:
+                for node_id in eligible_ids:
                     assignment = by_node_id.get(node_id)
                     if assignment is None:
                         continue
@@ -481,7 +551,7 @@ async def _ensure_default_content_registry(session: AsyncSession) -> None:
 async def create_join_token(
     session: AsyncSession,
     *,
-    role: str,
+    role: Optional[str],
     ttl_seconds: int,
     issued_by: Optional[str],
 ) -> JoinTokenOut:
@@ -565,16 +635,16 @@ async def bootstrap_cluster(
             already_bootstrapped=already_bootstrapped,
         )
 
-        worker = await create_join_token(
+        join_token = await create_join_token(
             session,
-            role="general",
+            role="auto",
             ttl_seconds=payload.worker_token_ttl_seconds,
             issued_by=requested_by,
         )
         op.step(
             "token.issue",
             "Issued bootstrap join token",
-            worker_token_id=worker.id,
+            join_token_id=join_token.id,
         )
 
         if not already_bootstrapped:
@@ -585,7 +655,7 @@ async def bootstrap_cluster(
                 "Marked cluster as bootstrapped",
                 requested_by=requested_by or "unknown",
             )
-        return True, worker
+        return True, join_token
 
 
 async def _get_join_token_for_use(
@@ -608,12 +678,12 @@ async def _get_join_token_for_use(
 
 
 async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional[NodeJoinOut]:
-    canonical_role = _canonical_role(payload.role)
+    requested_role = _canonical_role(payload.role)
     async with _logger.operation(
         "node.join",
         "Processing node join request",
         node_id=payload.node_id,
-        role=canonical_role,
+        role=requested_role,
         node_name=payload.name,
     ) as op:
         _, cluster_signing_key, secrets_persisted = await _resolve_cluster_secrets(
@@ -630,14 +700,39 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
             payload.token,
         )
         if join_token is None:
+            await _record_node_event(
+                session,
+                node_id=payload.node_id,
+                name="node.join.reject.invalid_token",
+                level="WARNING",
+                fields={
+                    "requested_role": requested_role,
+                },
+            )
+            await session.commit()
             _logger.warning(
                 "node.join.reject",
                 "Rejected node join with invalid token",
                 node_id=payload.node_id,
-                role=canonical_role,
+                role=requested_role,
             )
             return None
         op.step("token.validate", "Validated join token", token_id=join_token.id)
+        token_role = _canonical_role(join_token.role)
+        resolved_role = requested_role if requested_role != "auto" else token_role
+        role_source = "payload" if requested_role != "auto" else "token"
+        if resolved_role == "auto":
+            resolved_role = await _choose_auto_role(session)
+            role_source = "auto"
+        assigned_roles = [resolved_role] if resolved_role in _RUNTIME_NODE_ROLES else []
+        op.step(
+            "role.resolve",
+            "Resolved node runtime role",
+            requested_role=requested_role,
+            token_role=token_role,
+            resolved_role=resolved_role,
+            role_source=role_source,
+        )
 
         try:
             node_cert_pem, ca_cert_pem, identity_fingerprint, identity_expires_at = sign_node_csr(
@@ -647,11 +742,21 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
                 validity_days=settings.node_cert_validity_days,
             )
         except ValueError:
+            await _record_node_event(
+                session,
+                node_id=payload.node_id,
+                name="node.join.reject.invalid_csr",
+                level="WARNING",
+                fields={
+                    "resolved_role": resolved_role,
+                },
+            )
+            await session.commit()
             _logger.warning(
                 "node.join.reject",
                 "Rejected node join due to invalid CSR",
                 node_id=payload.node_id,
-                role=canonical_role,
+                role=resolved_role,
             )
             return None
         op.step(
@@ -679,13 +784,14 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
 
         status = dict(payload.status)
         status["enrolled_at"] = now.isoformat()
-        status["node_role"] = canonical_role
+        status["node_role"] = resolved_role
+        status["node_role_source"] = role_source
 
         if node is None:
             node = Node(
                 id=payload.node_id,
                 name=payload.name,
-                roles=[canonical_role],
+                roles=assigned_roles,
                 labels=payload.labels,
                 mesh_ip=payload.mesh_ip,
                 status=status,
@@ -700,7 +806,7 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
             event_name = "node.join"
         else:
             node.name = payload.name
-            node.roles = [canonical_role]
+            node.roles = assigned_roles
             node.labels = payload.labels
             node.mesh_ip = payload.mesh_ip
             node.api_endpoint = payload.api_endpoint
@@ -722,7 +828,8 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
             fields={
                 "node_id": payload.node_id,
                 "name": payload.name,
-                "role": canonical_role,
+                "role": resolved_role,
+                "role_source": role_source,
                 "token_id": join_token.id,
             },
         )
@@ -737,8 +844,8 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
                         {
                             "node_id": payload.node_id,
                             "name": payload.name,
-                            "role": canonical_role,
-                            "roles": [canonical_role],
+                            "role": resolved_role,
+                            "roles": assigned_roles,
                             "labels": payload.labels,
                             "mesh_ip": payload.mesh_ip,
                             "api_endpoint": payload.api_endpoint,
@@ -757,7 +864,7 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
                     error_type=type(exc).__name__,
                     error=str(exc),
                 )
-        if canonical_role in {"general", "backend_server", "reverse_proxy"} and _etcd_configured():
+        if resolved_role in _RUNTIME_NODE_ROLES and _etcd_configured():
             peer_url = _resolve_etcd_peer_url(payload)
             if peer_url:
                 try:
@@ -776,14 +883,14 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
                         member_id = added.member_id
                         op.step(
                             "etcd.member_add",
-                            "Added worker node as etcd member",
+                            "Added node as etcd member",
                             member_id=member_id,
                             peer_url=peer_url,
                         )
                     else:
                         op.step(
                             "etcd.member_exists",
-                            "Worker node already exists in etcd membership",
+                            "Node already exists in etcd membership",
                             member_id=member_id,
                             peer_url=peer_url,
                         )
@@ -803,7 +910,7 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
                 except Exception as exc:  # noqa: BLE001
                     op.step_warning(
                         "etcd.member_add",
-                        "Failed to ensure worker node etcd member",
+                        "Failed to ensure node etcd member",
                         error_type=type(exc).__name__,
                         error=str(exc),
                         peer_url=peer_url,
@@ -814,7 +921,7 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
                     "Skipped etcd member add due to missing peer URL",
                     node_id=payload.node_id,
                 )
-        if canonical_role in {"general", "backend_server", "reverse_proxy"}:
+        if resolved_role in _RUNTIME_NODE_ROLES:
             created_assignments, updated_assignments = await _reconcile_router_assignments(
                 session,
                 changed_node_id=payload.node_id,
@@ -858,6 +965,11 @@ async def apply_heartbeat(
         op.step_debug("secrets.resolve", "Resolved cluster signing key for heartbeat validation")
         lease_claims = decode_lease_token(lease_token, cluster_signing_key)
         if lease_claims is None:
+            await _record_heartbeat_reject_event(
+                session,
+                node_id=node_id,
+                reason="invalid_lease_token",
+            )
             _logger.warning(
                 "heartbeat.reject",
                 "Rejected heartbeat with invalid lease token",
@@ -865,6 +977,12 @@ async def apply_heartbeat(
             )
             return None
         if lease_claims.get("n") != node_id:
+            await _record_heartbeat_reject_event(
+                session,
+                node_id=node_id,
+                reason="node_id_mismatch",
+                fields={"lease_node_id": str(lease_claims.get("n") or "")},
+            )
             _logger.warning(
                 "heartbeat.reject",
                 "Rejected heartbeat due to node ID mismatch",
@@ -876,6 +994,11 @@ async def apply_heartbeat(
 
         node = await session.get(Node, node_id)
         if node is None or not node.identity_cert_pem or not node.identity_fingerprint:
+            await _record_heartbeat_reject_event(
+                session,
+                node_id=node_id,
+                reason="unknown_node",
+            )
             _logger.warning(
                 "heartbeat.reject",
                 "Rejected heartbeat for unknown or unprovisioned node",
@@ -883,6 +1006,11 @@ async def apply_heartbeat(
             )
             return None
         if lease_claims.get("fp") != node.identity_fingerprint:
+            await _record_heartbeat_reject_event(
+                session,
+                node_id=node_id,
+                reason="fingerprint_mismatch",
+            )
             _logger.warning(
                 "heartbeat.reject",
                 "Rejected heartbeat due to fingerprint mismatch",
@@ -893,6 +1021,16 @@ async def apply_heartbeat(
 
         now_epoch = int(time.time())
         if abs(now_epoch - signed_at) > settings.heartbeat_signature_max_skew_seconds:
+            await _record_heartbeat_reject_event(
+                session,
+                node_id=node_id,
+                reason="clock_skew",
+                fields={
+                    "signed_at": signed_at,
+                    "now_epoch": now_epoch,
+                    "max_skew_seconds": settings.heartbeat_signature_max_skew_seconds,
+                },
+            )
             _logger.warning(
                 "heartbeat.reject",
                 "Rejected heartbeat outside allowed clock skew",
@@ -907,6 +1045,15 @@ async def apply_heartbeat(
         if isinstance(node.status, dict):
             last_signed_at = int(node.status.get("last_heartbeat_signed_at", 0) or 0)
         if signed_at <= last_signed_at:
+            await _record_heartbeat_reject_event(
+                session,
+                node_id=node_id,
+                reason="signature_replay",
+                fields={
+                    "signed_at": signed_at,
+                    "last_signed_at": last_signed_at,
+                },
+            )
             _logger.warning(
                 "heartbeat.reject",
                 "Rejected replayed or stale heartbeat signature",
@@ -929,6 +1076,11 @@ async def apply_heartbeat(
             message=message,
             signature_b64=signature,
         ):
+            await _record_heartbeat_reject_event(
+                session,
+                node_id=node_id,
+                reason="signature_verification",
+            )
             _logger.warning(
                 "heartbeat.reject",
                 "Rejected heartbeat due to signature verification failure",

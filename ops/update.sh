@@ -312,6 +312,23 @@ PY
   done
 }
 
+install_global_cli_shims() {
+  local shim_path="/usr/local/bin/uptime-mesh"
+  local compat_path="/usr/local/bin/uptimemesh"
+  cat > "$shim_path" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+CLI_BIN="${INSTALL_DIR}/.venv/bin/uptimemesh"
+if [[ ! -x "\${CLI_BIN}" ]]; then
+  echo "uptime-mesh CLI is not installed yet at \${CLI_BIN}" >&2
+  exit 1
+fi
+exec "\${CLI_BIN}" "\$@"
+EOF
+  chmod 0755 "$shim_path"
+  ln -sfn "$shim_path" "$compat_path"
+}
+
 prune_glob_keep() {
   local pattern="$1"
   local keep="$2"
@@ -557,6 +574,7 @@ if [[ ! -x "$INSTALL_DIR/.venv/bin/pip" ]]; then
 fi
 run_or_rollback "pip upgrade failed" run_logged "pip.upgrade" "$INSTALL_DIR/.venv/bin/pip" install --upgrade pip
 run_or_rollback "pip install failed" run_logged "pip.install" "$INSTALL_DIR/.venv/bin/pip" install -e "$INSTALL_DIR"
+run_or_rollback "failed installing CLI command shims" run_logged "cli.shims" install_global_cli_shims
 run_or_rollback "database migration failed" run_logged "db.migrate" bash -lc "cd '$INSTALL_DIR' && ./.venv/bin/alembic upgrade head"
 
 normalize_log_paths

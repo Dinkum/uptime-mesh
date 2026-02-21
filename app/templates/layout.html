@@ -106,6 +106,51 @@
         border-radius: 999px;
         background: linear-gradient(90deg, rgba(186, 230, 253, 0.95), rgba(125, 211, 252, 0.9));
       }
+      .mesh-subtabs-shell {
+        padding: 10px 12px;
+        border-radius: 14px;
+        border: 1px solid rgba(56, 189, 248, 0.25);
+        background: linear-gradient(180deg, rgba(3, 12, 28, 0.72), rgba(3, 12, 28, 0.48));
+      }
+      .mesh-subtabs-label {
+        margin: 0 0 8px 2px;
+        font-size: 0.7rem;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+        color: #7dd3fc;
+        font-family: "IBM Plex Mono", monospace;
+      }
+      .mesh-subtabs {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+      .mesh-subtab {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 34px;
+        padding: 0 12px;
+        border-radius: 10px;
+        border: 1px solid rgba(100, 116, 139, 0.52);
+        background: rgba(15, 23, 42, 0.65);
+        color: #cbd5e1;
+        text-decoration: none;
+        font-size: 0.82rem;
+        font-weight: 600;
+        transition: border-color 120ms ease, background 120ms ease, color 120ms ease, box-shadow 120ms ease;
+      }
+      .mesh-subtab:hover {
+        border-color: rgba(56, 189, 248, 0.62);
+        background: rgba(14, 165, 233, 0.14);
+        color: #e2e8f0;
+      }
+      .mesh-subtab.active {
+        border-color: rgba(56, 189, 248, 0.88);
+        background: linear-gradient(95deg, rgba(14, 165, 233, 0.3), rgba(56, 189, 248, 0.2));
+        color: #f0f9ff;
+        box-shadow: 0 0 0 1px rgba(14, 165, 233, 0.28), 0 0 16px rgba(14, 165, 233, 0.18);
+      }
       .page-title {
         margin-top: 18px;
       }

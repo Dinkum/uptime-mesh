@@ -13,6 +13,8 @@ from app.models.endpoint import Endpoint
 from app.models.replica import Replica
 from app.models.service import Service
 from app.schemas.gateway import GatewayRouteEndpointOut, GatewayRouteOut
+from app.services import applications as applications_service
+from app.services import cluster_settings
 from app.utils import sanitize_label
 
 _logger = get_logger("services.gateway")
@@ -94,14 +96,29 @@ async def list_gateway_routes(
         )
         rows = (await session.execute(query)).all()
         op.step("db.select", "Fetched candidate gateway rows", rows=len(rows))
+        settings_map = await cluster_settings.get_settings_map(session)
+        applications = applications_service.parse_applications_from_settings(settings_map)
+        app_ids = {str(item.get("id")) for item in applications}
+        domain_routes = applications_service.parse_domain_routes_from_settings(
+            settings_map,
+            application_ids=app_ids,
+        )
+        domain_bindings = applications_service.build_domain_bindings(
+            applications=applications,
+            domain_routes=domain_routes,
+        )
 
         grouped: dict[str, dict[str, object]] = {}
         collisions: set[tuple[str, str]] = set()
         seen_routes: set[tuple[str, str]] = set()
+        service_endpoints: dict[str, set[tuple[str, int]]] = {}
+        service_names: dict[str, str] = {}
         for row in rows:
             service_id = str(row.service_id)
             service_name = str(row.service_name)
+            service_names[service_id] = service_name
             service_spec = row.service_spec if isinstance(row.service_spec, dict) else {}
+            service_endpoints.setdefault(service_id, set()).add((str(row.address), int(row.port)))
             enabled, host, path = _resolve_gateway_route(
                 service_id=service_id,
                 service_name=service_name,
@@ -131,6 +148,40 @@ async def list_gateway_routes(
 
             payload["endpoints"].add((str(row.address), int(row.port)))
 
+        domain_route_count = 0
+        domain_route_skipped = 0
+        for binding in domain_bindings:
+            if not bool(binding.get("route_enabled", False)):
+                continue
+            service_id = str(binding.get("application_target_service_id") or "").strip()
+            if not service_id:
+                domain_route_skipped += 1
+                continue
+            endpoints = service_endpoints.get(service_id, set())
+            if not endpoints:
+                domain_route_skipped += 1
+                continue
+            host = _normalize_host(str(binding.get("domain") or "_"), fallback="_")
+            path = _normalize_path(str(binding.get("path") or "/"), fallback="/")
+            route_key = (host, path)
+            if route_key in seen_routes:
+                collisions.add(route_key)
+                domain_route_skipped += 1
+                continue
+            seen_routes.add(route_key)
+            app_id = str(binding.get("application_id") or "app")
+            service_name = service_names.get(service_id, service_id)
+            upstream_seed = f"app_{_sanitize_name(app_id, fallback='app')}_{service_id[:8]}"
+            grouped[f"{service_id}:{host}:{path}"] = {
+                "service_id": service_id,
+                "service_name": service_name,
+                "host": host,
+                "path": path,
+                "upstream": _sanitize_name(upstream_seed, fallback=f"app_{service_id[:8]}"),
+                "endpoints": set(endpoints),
+            }
+            domain_route_count += 1
+
         routes: list[GatewayRouteOut] = []
         for value in grouped.values():
             raw_endpoints = sorted(list(value["endpoints"]))
@@ -156,6 +207,13 @@ async def list_gateway_routes(
                 "Skipped duplicate host/path routes across services",
                 collisions=len(collisions),
             )
+        op.step(
+            "route.domain_bindings",
+            "Applied domain-to-application route bindings",
+            configured=len(domain_bindings),
+            applied=domain_route_count,
+            skipped=domain_route_skipped,
+        )
         op.step(
             "route.build",
             "Built gateway routes",

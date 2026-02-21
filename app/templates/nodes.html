@@ -1,130 +1,142 @@
 {% extends "layout.html" %}
 
 {% block content %}
-  <section class="grid grid-cols-1 md:grid-cols-5 gap-4 mb-6">
-    <div class="mesh-card rounded-2xl p-5">
-      <p class="text-sm text-slate-500">Total Nodes</p>
-      <p class="text-2xl font-semibold">{{ node_total }}</p>
-    </div>
-    <div class="mesh-card rounded-2xl p-5">
-      <p class="text-sm text-slate-500">Online</p>
-      <p class="text-2xl font-semibold text-emerald-300">{{ node_online }}</p>
-    </div>
-    <div class="mesh-card rounded-2xl p-5">
-      <p class="text-sm text-slate-500">Stale / Offline</p>
-      <p class="text-2xl font-semibold text-amber-200">{{ node_stale }} / {{ node_offline }}</p>
-    </div>
-    <div class="mesh-card rounded-2xl p-5">
-      <p class="text-sm text-slate-500">Failover Active</p>
-      <p class="text-2xl font-semibold">{{ node_failover }}</p>
-    </div>
-    <div class="mesh-card rounded-2xl p-5">
-      <p class="text-sm text-slate-500">Cert Risk</p>
-      <p class="text-2xl font-semibold text-amber-200">{{ cert_warning + cert_critical + cert_expired }}</p>
-      <p class="text-[11px] text-slate-500 mt-1">
-        warn {{ cert_warning }} · critical {{ cert_critical }} · expired {{ cert_expired }}
-      </p>
-    </div>
-  </section>
-
-  {% if etcd.error %}
-    <div class="mb-6 alert alert-warning mesh-card text-sm">
-      <span class="mono">{{ etcd.error }}</span>
-    </div>
-  {% endif %}
-
-  <div class="flex flex-wrap gap-3 mb-6">
-    <a class="btn btn-sm {% if view_mode == 'table' %}btn-primary{% else %}btn-outline{% endif %}" href="{{ ui_prefix }}/nodes?view=table">Table View</a>
-    <a class="btn btn-sm {% if view_mode == 'map' %}btn-primary{% else %}btn-outline{% endif %}" href="{{ ui_prefix }}/nodes?view=map">Topology View</a>
-    <span class="badge badge-outline mono py-3">etcd members {{ etcd.member_count }}</span>
-    <span class="badge badge-outline mono py-3">
-      quorum {{ "ok" if etcd.has_quorum else "at-risk" }} ({{ etcd.healthy_endpoint_count }}/{{ etcd.endpoint_count }})
-    </span>
-  </div>
-
-  {% if view_mode == "map" %}
-    <section class="mesh-card rounded-2xl p-6 mb-6">
-      <div class="flex items-center justify-between mb-4">
-        <h2 class="text-lg font-semibold">Network Map</h2>
-        <p class="text-xs text-slate-500">Node color = total load (green 0 -> red 100)</p>
+  <div class="max-w-7xl mx-auto">
+    <section class="grid grid-cols-2 lg:grid-cols-6 gap-4 mb-6">
+      <div class="mesh-card rounded-2xl p-5 min-h-[110px]">
+        <p class="text-xs uppercase tracking-[0.14em] text-slate-500">Total Nodes</p>
+        <p class="text-3xl font-semibold mt-2">{{ node_total }}</p>
       </div>
-      <div id="network-map" class="w-full rounded-2xl border border-slate-700/40 bg-slate-950/40 overflow-hidden"></div>
-    </section>
-
-    <section class="mesh-card rounded-2xl p-6">
-      <h2 class="text-lg font-semibold mb-4">Node Connectivity</h2>
-      <div class="overflow-x-auto">
-        <table class="table w-full">
-          <thead>
-            <tr>
-              <th>Node ID</th>
-              <th>Role</th>
-              <th>SWIM State</th>
-              <th>Total Load</th>
-              <th>CPU/RAM/DISK/NET</th>
-            </tr>
-          </thead>
-          <tbody>
-            {% for node in map_nodes %}
-              <tr>
-                <td class="mono">{{ node.id }}</td>
-                <td>{{ node.role_text }}</td>
-                <td class="mono">{{ node.swim_state }}</td>
-                <td class="mono">
-                  {% if node.load_total is not none %}
-                    {{ "%.1f"|format(node.load_total) }}
-                  {% else %}
-                    --
-                  {% endif %}
-                </td>
-                <td class="mono text-xs">
-                  {% if node.load_total is not none %}
-                    {{ "%.1f"|format(node.load_cpu or 0) }} /
-                    {{ "%.1f"|format(node.load_ram or 0) }} /
-                    {{ "%.1f"|format(node.load_disk or 0) }} /
-                    {{ "%.1f"|format(node.load_network or 0) }}
-                  {% else %}
-                    --
-                  {% endif %}
-                </td>
-              </tr>
-            {% else %}
-              <tr>
-                <td colspan="5" class="text-slate-500">No nodes discovered.</td>
-              </tr>
-            {% endfor %}
-          </tbody>
-        </table>
+      <div class="mesh-card rounded-2xl p-5 min-h-[110px]">
+        <p class="text-xs uppercase tracking-[0.14em] text-slate-500">Online</p>
+        <p class="text-3xl font-semibold text-emerald-300 mt-2">{{ node_online }}</p>
+      </div>
+      <div class="mesh-card rounded-2xl p-5 min-h-[110px]">
+        <p class="text-xs uppercase tracking-[0.14em] text-slate-500">Stale</p>
+        <p class="text-3xl font-semibold text-amber-200 mt-2">{{ node_stale }}</p>
+      </div>
+      <div class="mesh-card rounded-2xl p-5 min-h-[110px]">
+        <p class="text-xs uppercase tracking-[0.14em] text-slate-500">Offline</p>
+        <p class="text-3xl font-semibold text-rose-300 mt-2">{{ node_offline }}</p>
+      </div>
+      <div class="mesh-card rounded-2xl p-5 min-h-[110px]">
+        <p class="text-xs uppercase tracking-[0.14em] text-slate-500">Failover Active</p>
+        <p class="text-3xl font-semibold mt-2">{{ node_failover }}</p>
+      </div>
+      <div class="mesh-card rounded-2xl p-5 min-h-[110px]">
+        <p class="text-xs uppercase tracking-[0.14em] text-slate-500">Cert Alerts</p>
+        <p class="text-3xl font-semibold text-amber-200 mt-2">{{ cert_warning + cert_critical + cert_expired }}</p>
+        <p class="text-[11px] text-slate-500 mt-2">warn {{ cert_warning }} · crit {{ cert_critical }} · exp {{ cert_expired }}</p>
       </div>
     </section>
-  {% else %}
-    <section class="mesh-card rounded-2xl p-6 mb-6">
-      <h2 class="text-lg font-semibold">Node Inventory</h2>
-      <div class="overflow-x-auto mt-5">
-        <table class="table w-full align-middle">
-          <thead>
-            <tr>
-              <th>Name</th>
-              <th>Status</th>
-              <th>Mesh IP</th>
-              <th>Endpoint</th>
-              <th>Roles</th>
-              <th>Load</th>
-              <th>SWIM</th>
-              <th>WireGuard</th>
-              <th>Cert</th>
-              <th>Lease</th>
-              <th>Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {% for node in nodes %}
-              <tr class="hover">
-                <td>
-                  <a class="font-semibold hover:underline" href="{{ ui_prefix }}/nodes/{{ node.id }}">{{ node.name }}</a>
-                  <p class="mono text-[11px] text-slate-500 mt-1">{{ node.id }}</p>
-                </td>
-                <td>
+
+    <section class="mesh-subtabs-shell mb-6" aria-label="Nodes views">
+      <div class="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
+        <div>
+          <p class="mesh-subtabs-label mb-2">Nodes Views</p>
+          <nav class="mesh-subtabs">
+            <a class="mesh-subtab{% if view_mode == 'table' %} active{% endif %}" href="{{ ui_prefix }}/nodes?view=table">Node List</a>
+            <a class="mesh-subtab{% if view_mode == 'map' %} active{% endif %}" href="{{ ui_prefix }}/nodes?view=map">Network Map</a>
+          </nav>
+        </div>
+        <div class="flex flex-wrap items-center gap-2 text-xs">
+          {% if not etcd.enabled %}
+            <span class="badge badge-outline mono py-3">etcd disabled</span>
+          {% elif not etcd.configured %}
+            <span class="badge badge-outline mono py-3">etcd unconfigured</span>
+          {% else %}
+            <span class="badge badge-outline mono py-3">members {{ etcd.member_count }}</span>
+            <span class="badge {% if etcd.has_quorum %}badge-success{% else %}badge-warning{% endif %} badge-outline mono py-3">
+              quorum {{ "ok" if etcd.has_quorum else "at-risk" }} ({{ etcd.healthy_endpoint_count }}/{{ etcd.endpoint_count }})
+            </span>
+          {% endif %}
+        </div>
+      </div>
+    </section>
+
+    {% if etcd.error %}
+      <div class="mb-6 alert alert-warning mesh-card text-sm">
+        <span class="mono">{{ etcd.error }}</span>
+      </div>
+    {% endif %}
+
+    {% if view_mode == "map" %}
+      <section class="grid grid-cols-1 xl:grid-cols-3 gap-6 mb-6">
+        <article class="mesh-card rounded-2xl p-6 xl:col-span-2">
+          <div class="flex items-center justify-between mb-4">
+            <h2 class="text-lg font-semibold">Network Map</h2>
+            <p class="text-xs text-slate-500">Node color indicates total load</p>
+          </div>
+          <div id="network-map" class="w-full rounded-2xl border border-slate-700/40 bg-slate-950/45 overflow-hidden"></div>
+        </article>
+        <article class="mesh-card rounded-2xl p-6">
+          <h3 class="text-base font-semibold mb-3">Map Legend</h3>
+          <div class="space-y-3 text-sm">
+            <div>
+              <p class="text-slate-400 mb-1">Total load scale</p>
+              <div class="h-3 rounded-full" style="background: linear-gradient(90deg, #22c55e 0%, #eab308 50%, #ef4444 100%);"></div>
+              <div class="flex justify-between text-[11px] text-slate-500 mt-1 mono">
+                <span>0 (low)</span><span>50</span><span>100 (high)</span>
+              </div>
+            </div>
+            <div class="pt-2 border-t border-slate-700/40">
+              <p class="text-slate-400">Topology mode shows inter-node links and role placement.</p>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <section class="mesh-card rounded-2xl p-6 mb-6">
+        <h2 class="text-lg font-semibold mb-4">Connectivity Detail</h2>
+        <div class="overflow-x-auto">
+          <table class="table w-full">
+            <thead>
+              <tr>
+                <th>Node</th>
+                <th>Role</th>
+                <th>SWIM</th>
+                <th>Total Load</th>
+                <th>CPU / RAM / DISK / NET</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for node in map_nodes %}
+                <tr>
+                  <td>
+                    <p class="font-semibold">{{ node.name }}</p>
+                    <p class="mono text-[11px] text-slate-500">{{ node.id }}</p>
+                  </td>
+                  <td>{{ node.role_text }}</td>
+                  <td class="mono text-xs">{{ node.swim_state }}</td>
+                  <td class="mono text-xs">
+                    {% if node.load_total is not none %}{{ "%.1f"|format(node.load_total) }}{% else %}--{% endif %}
+                  </td>
+                  <td class="mono text-[11px] text-slate-500">
+                    {% if node.load_total is not none %}
+                      {{ "%.1f"|format(node.load_cpu or 0) }} / {{ "%.1f"|format(node.load_ram or 0) }} /
+                      {{ "%.1f"|format(node.load_disk or 0) }} / {{ "%.1f"|format(node.load_network or 0) }}
+                    {% else %}
+                      --
+                    {% endif %}
+                  </td>
+                </tr>
+              {% else %}
+                <tr>
+                  <td colspan="5" class="text-slate-500">No nodes discovered.</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    {% else %}
+      <section class="space-y-4 mb-6">
+        {% for node in nodes %}
+          <article class="mesh-card rounded-2xl p-5">
+            <div class="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-4">
+              <div>
+                <div class="flex flex-wrap items-center gap-3">
+                  <a class="text-xl font-semibold hover:underline" href="{{ ui_prefix }}/nodes/{{ node.id }}">{{ node.name }}</a>
                   {% if node.health_tone == "success" %}
                     <span class="badge badge-success badge-outline">{{ node.health_text }}</span>
                   {% elif node.health_tone == "warning" %}
@@ -132,31 +144,47 @@
                   {% else %}
                     <span class="badge badge-error badge-outline">{{ node.health_text }}</span>
                   {% endif %}
-                  <p class="mono text-[11px] text-slate-500 mt-1">hb {{ node.heartbeat_age }}</p>
-                </td>
-                <td class="mono text-xs">{{ node.mesh_ip }}</td>
-                <td class="mono text-xs">{{ node.endpoint }}</td>
-                <td>{{ node.roles_text }}</td>
-                <td>
-                  {% if node.load_total is not none %}
-                    <p class="mono text-xs">total {{ "%.1f"|format(node.load_total) }}</p>
-                    <p class="text-[11px] text-slate-500 mt-1">
-                      c {{ "%.1f"|format(node.load_cpu or 0) }} · r {{ "%.1f"|format(node.load_ram or 0) }} ·
-                      d {{ "%.1f"|format(node.load_disk or 0) }} · n {{ "%.1f"|format(node.load_network or 0) }}
-                    </p>
-                  {% else %}
-                    <span class="text-slate-500 text-xs">No load report</span>
-                  {% endif %}
-                </td>
-                <td>
-                  <p class="mono text-xs">{{ node.swim_state }}</p>
-                  <p class="text-[11px] text-slate-500 mt-1">inc {{ node.swim_incarnation }}</p>
-                </td>
-                <td>
-                  <p class="mono text-xs">{{ node.wg_active_route }}</p>
-                  <p class="text-[11px] text-slate-500 mt-1">{{ node.wg_failover }}</p>
-                </td>
-                <td>
+                </div>
+                <p class="mono text-[11px] text-slate-500 mt-1">{{ node.id }}</p>
+              </div>
+              <div class="text-xs text-slate-400 lg:text-right">
+                <p>Heartbeat {{ node.heartbeat_age }}</p>
+                <p class="mono text-[11px] text-slate-500 mt-1">Lease {{ node.lease_expires_at }}</p>
+              </div>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-4 mt-5">
+              <div>
+                <p class="text-[11px] uppercase tracking-[0.12em] text-slate-500">Endpoint</p>
+                <p class="mono text-xs mt-1 break-all">{{ node.endpoint }}</p>
+                <p class="mono text-xs text-slate-500 mt-1">mesh {{ node.mesh_ip }}</p>
+              </div>
+              <div>
+                <p class="text-[11px] uppercase tracking-[0.12em] text-slate-500">Placement</p>
+                <p class="text-sm mt-1">{{ node.roles_text }}</p>
+                <p class="mono text-xs text-slate-500 mt-1">swim {{ node.swim_state }} · inc {{ node.swim_incarnation }}</p>
+              </div>
+              <div>
+                <p class="text-[11px] uppercase tracking-[0.12em] text-slate-500">WireGuard</p>
+                <p class="mono text-xs mt-1">{{ node.wg_active_route }}</p>
+                <p class="text-xs text-slate-500 mt-1">{{ node.wg_failover }}</p>
+              </div>
+              <div>
+                <p class="text-[11px] uppercase tracking-[0.12em] text-slate-500">Load</p>
+                {% if node.load_total is not none %}
+                  <p class="mono text-xs mt-1">total {{ "%.1f"|format(node.load_total) }}/100</p>
+                  <progress class="progress progress-info w-full h-2 mt-2" value="{{ "%.1f"|format(node.load_total) }}" max="100"></progress>
+                  <p class="text-[11px] text-slate-500 mt-1">
+                    c {{ "%.1f"|format(node.load_cpu or 0) }} · r {{ "%.1f"|format(node.load_ram or 0) }} ·
+                    d {{ "%.1f"|format(node.load_disk or 0) }} · n {{ "%.1f"|format(node.load_network or 0) }}
+                  </p>
+                {% else %}
+                  <p class="text-xs text-slate-500 mt-1">No load report</p>
+                {% endif %}
+              </div>
+              <div>
+                <p class="text-[11px] uppercase tracking-[0.12em] text-slate-500">Identity + Lease</p>
+                <div class="mt-1">
                   {% if node.identity_expiry_state == "ok" %}
                     <span class="badge badge-success badge-outline">{{ node.identity_expiry_text }}</span>
                   {% elif node.identity_expiry_state == "warning" %}
@@ -166,72 +194,74 @@
                   {% else %}
                     <span class="badge badge-outline">{{ node.identity_expiry_text }}</span>
                   {% endif %}
-                  <p class="mono text-[11px] text-slate-500 mt-1">{{ node.identity_expires_in }}</p>
-                </td>
-                <td class="text-sm">
-                  <p>{{ node.lease_state }}</p>
-                  <p class="mono text-[11px] text-slate-500 mt-1">{{ node.lease_expires_at }}</p>
-                </td>
+                </div>
+                <p class="mono text-[11px] text-slate-500 mt-2">{{ node.identity_expires_in }}</p>
+                <p class="text-xs mt-1">{{ node.lease_state }}</p>
+              </div>
+            </div>
+
+            <div class="flex flex-wrap gap-2 mt-5 pt-4 border-t border-slate-700/40">
+              <a class="btn btn-sm btn-outline" href="{{ ui_prefix }}/nodes/{{ node.id }}">View Details</a>
+              <button class="btn btn-sm btn-outline" onclick="nodeAction('{{ node.id }}', 'cordon')">Cordon</button>
+              <button class="btn btn-sm btn-outline" onclick="nodeAction('{{ node.id }}', 'drain')">Drain</button>
+              <button class="btn btn-sm btn-outline" onclick="nodeAction('{{ node.id }}', 'rotate-wg-keys')">Rotate Keys</button>
+            </div>
+          </article>
+        {% else %}
+          <section class="mesh-card rounded-2xl p-8 text-center text-slate-400">
+            No nodes registered yet.
+          </section>
+        {% endfor %}
+      </section>
+    {% endif %}
+
+    <section class="mesh-card rounded-2xl p-6">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-lg font-semibold">Role Placement</h2>
+        <a class="btn btn-xs btn-outline" href="{{ ui_prefix }}/roles">Detailed Role View</a>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="table w-full">
+          <thead>
+            <tr>
+              <th>Role</th>
+              <th>Desired</th>
+              <th>Assigned</th>
+              <th>Gap</th>
+              <th>Holders</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for role in role_rows %}
+              <tr>
+                <td class="mono">{{ role.name }}</td>
+                <td class="mono">{{ role.desired }}</td>
+                <td class="mono">{{ role.assigned }}</td>
                 <td>
-                  <div class="flex flex-wrap gap-2">
-                    <a class="btn btn-xs btn-outline" href="{{ ui_prefix }}/nodes/{{ node.id }}">View</a>
-                    <button class="btn btn-xs btn-outline" onclick="nodeAction('{{ node.id }}', 'cordon')">Cordon</button>
-                    <button class="btn btn-xs btn-outline" onclick="nodeAction('{{ node.id }}', 'drain')">Drain</button>
-                    <button class="btn btn-xs btn-outline" onclick="nodeAction('{{ node.id }}', 'rotate-wg-keys')">Rotate Keys</button>
-                  </div>
+                  {% if role.deficit > 0 %}
+                    <span class="badge badge-warning badge-outline mono">{{ role.deficit }}</span>
+                  {% else %}
+                    <span class="badge badge-success badge-outline mono">0</span>
+                  {% endif %}
+                </td>
+                <td class="mono text-xs">
+                  {% if role.holders %}
+                    {{ role.holders | join(", ") }}
+                  {% else %}
+                    -
+                  {% endif %}
                 </td>
               </tr>
             {% else %}
               <tr>
-                <td colspan="11" class="text-center text-slate-400">No nodes registered yet.</td>
+                <td colspan="5" class="text-slate-500">No role definitions found.</td>
               </tr>
             {% endfor %}
           </tbody>
         </table>
       </div>
     </section>
-  {% endif %}
-
-  <section class="mesh-card rounded-2xl p-6">
-    <div class="flex items-center justify-between mb-4">
-      <h2 class="text-lg font-semibold">Role Placement</h2>
-      <a class="btn btn-xs btn-outline" href="{{ ui_prefix }}/roles">Detailed Role View</a>
-    </div>
-    <div class="overflow-x-auto">
-      <table class="table w-full">
-        <thead>
-          <tr>
-            <th>Role</th>
-            <th>Desired</th>
-            <th>Assigned</th>
-            <th>Deficit</th>
-            <th>Holders</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for role in role_rows %}
-            <tr>
-              <td class="mono">{{ role.name }}</td>
-              <td class="mono">{{ role.desired }}</td>
-              <td class="mono">{{ role.assigned }}</td>
-              <td class="mono">{{ role.deficit }}</td>
-              <td class="mono text-xs">
-                {% if role.holders %}
-                  {{ role.holders | join(", ") }}
-                {% else %}
-                  -
-                {% endif %}
-              </td>
-            </tr>
-          {% else %}
-            <tr>
-              <td colspan="5" class="text-slate-500">No role definitions found.</td>
-            </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
-  </section>
+  </div>
 
   <script>
     async function nodeAction(nodeId, action) {
@@ -265,7 +295,7 @@
         const host = document.getElementById("network-map");
         if (!host) return;
         const width = host.clientWidth || 1000;
-        const height = 560;
+        const height = 540;
         host.style.height = `${height}px`;
         host.innerHTML = "";
 
@@ -305,7 +335,7 @@
           group.setAttribute("transform", `translate(${node.x}, ${node.y})`);
 
           const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-          circle.setAttribute("r", "34");
+          circle.setAttribute("r", "32");
           circle.setAttribute("fill", nodeColor(node.load_total));
           circle.setAttribute("stroke", "rgba(255,255,255,0.65)");
           circle.setAttribute("stroke-width", "1.3");
@@ -315,14 +345,14 @@
           idLabel.setAttribute("text-anchor", "middle");
           idLabel.setAttribute("y", "4");
           idLabel.setAttribute("fill", "#f8fafc");
-          idLabel.setAttribute("font-size", "10");
+          idLabel.setAttribute("font-size", "9");
           idLabel.setAttribute("font-family", "IBM Plex Mono, monospace");
           idLabel.textContent = node.id;
           group.appendChild(idLabel);
 
           const roleLabel = document.createElementNS("http://www.w3.org/2000/svg", "text");
           roleLabel.setAttribute("text-anchor", "middle");
-          roleLabel.setAttribute("y", "50");
+          roleLabel.setAttribute("y", "48");
           roleLabel.setAttribute("fill", "#cbd5e1");
           roleLabel.setAttribute("font-size", "11");
           roleLabel.textContent = node.role_text || "-";
@@ -330,7 +360,7 @@
 
           const swimLabel = document.createElementNS("http://www.w3.org/2000/svg", "text");
           swimLabel.setAttribute("text-anchor", "middle");
-          swimLabel.setAttribute("y", "63");
+          swimLabel.setAttribute("y", "61");
           swimLabel.setAttribute("fill", "#94a3b8");
           swimLabel.setAttribute("font-size", "10");
           swimLabel.textContent = `${node.swim_state}`;
@@ -338,9 +368,10 @@
 
           const title = document.createElementNS("http://www.w3.org/2000/svg", "title");
           title.textContent =
-            `${node.id}\nrole: ${node.role_text}\nstate: ${node.swim_state}\n` +
-            `total: ${node.load_total ?? "--"}\n` +
-            `cpu: ${node.load_cpu ?? "--"} ram: ${node.load_ram ?? "--"} disk: ${node.load_disk ?? "--"} net: ${node.load_network ?? "--"}`;
+            `${node.name} (${node.id})\n` +
+            `role: ${node.role_text || "-"}\n` +
+            `state: ${node.swim_state || "unknown"}\n` +
+            `load: ${node.load_total === null || node.load_total === undefined ? "--" : Number(node.load_total).toFixed(1)}`;
           group.appendChild(title);
 
           svg.appendChild(group);

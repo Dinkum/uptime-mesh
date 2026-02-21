@@ -30,19 +30,19 @@
         min-height: 100vh;
         display: grid;
         place-items: center;
-        padding: 24px;
+        padding: 32px 18px;
       }
       .um-login .frame {
-        width: min(100%, 540px);
-        border-radius: 24px;
+        width: min(100%, 520px);
+        border-radius: 22px;
         padding: 1px;
         background: linear-gradient(150deg, rgba(56, 189, 248, 0.42), rgba(148, 163, 184, 0.12));
         box-shadow: 0 30px 80px rgba(2, 6, 23, 0.68), 0 0 64px rgba(14, 165, 233, 0.1);
       }
       .um-login .mesh-card {
         width: 100%;
-        border-radius: 23px;
-        padding: 34px;
+        border-radius: 21px;
+        padding: 32px 30px 30px;
         border: 1px solid rgba(148, 163, 184, 0.16);
         background: radial-gradient(circle at 16% -12%, rgba(56, 189, 248, 0.1), transparent 42%),
           linear-gradient(180deg, rgba(15, 23, 42, 0.94), rgba(15, 23, 42, 0.84));
@@ -50,26 +50,27 @@
       }
       .um-login h1 {
         margin: 0;
-        font-size: 2.8rem;
+        font-size: 2.5rem;
         line-height: 1.05;
         letter-spacing: -0.02em;
         color: #f8fafc;
       }
       .um-login .subtitle {
         margin: 10px 0 0;
-        font-size: 1rem;
+        font-size: 1.01rem;
+        line-height: 1.45;
         color: #94a3b8;
       }
       .um-login .form {
-        margin-top: 28px;
+        margin-top: 24px;
         width: 100%;
         display: grid !important;
-        gap: 16px;
+        gap: 14px;
       }
       .um-login .um-field {
         width: 100%;
         display: grid !important;
-        gap: 8px;
+        gap: 7px;
       }
       .um-login .um-label {
         display: block !important;
@@ -90,14 +91,14 @@
         display: block !important;
         width: 100% !important;
         min-width: 0 !important;
-        min-height: 50px;
+        min-height: 52px;
         border-radius: 12px;
         border: 1px solid rgba(148, 163, 184, 0.34) !important;
         background: rgba(2, 6, 23, 0.72) !important;
         color: #f8fafc !important;
         font-size: 1rem;
         font-family: "Space Grotesk", sans-serif;
-        padding: 12px 46px 12px 14px;
+        padding: 13px 14px;
         line-height: 1.4;
         outline: none;
         box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
@@ -119,30 +120,10 @@
         box-shadow: 0 0 0 1000px rgba(2, 6, 23, 0.86) inset !important;
         transition: background-color 5000s ease-in-out 0s;
       }
-      .um-login .pw-toggle {
-        position: absolute;
-        right: 10px;
-        top: 50%;
-        transform: translateY(-50%);
-        width: 28px;
-        height: 28px;
-        border: 1px solid rgba(148, 163, 184, 0.3);
-        border-radius: 8px;
-        background: rgba(15, 23, 42, 0.7);
-        color: #cbd5e1;
-        font-size: 0.72rem;
-        font-weight: 700;
-        letter-spacing: 0.02em;
-        cursor: pointer;
-      }
-      .um-login .pw-toggle:hover {
-        border-color: rgba(56, 189, 248, 0.75);
-        color: #e2e8f0;
-      }
       .um-login .submit {
-        margin-top: 6px;
+        margin-top: 8px;
         width: 100%;
-        min-height: 50px;
+        min-height: 52px;
         border: 0;
         border-radius: 12px;
         background: linear-gradient(95deg, #0ea5e9, #38bdf8);
@@ -172,10 +153,10 @@
       }
       @media (max-width: 640px) {
         .um-login .mesh-card {
-          padding: 24px;
+          padding: 24px 20px 22px;
         }
         .um-login h1 {
-          font-size: 2.2rem;
+          font-size: 2.1rem;
         }
       }
     </style>
@@ -204,7 +185,7 @@
                   value=""
                   required
                   autocomplete="username"
-                  placeholder="admin"
+                  placeholder="Username"
                   autofocus
                 />
               </div>
@@ -221,9 +202,6 @@
                   autocomplete="current-password"
                   placeholder="Enter password"
                 />
-                <button class="pw-toggle" type="button" aria-label="Toggle password visibility" onclick="togglePassword()">
-                  show
-                </button>
               </div>
             </div>
             <button class="submit" type="submit">Sign In</button>
@@ -231,21 +209,5 @@
         </section>
       </div>
     </main>
-    <script>
-      function togglePassword() {
-        const input = document.getElementById("password");
-        const button = document.querySelector(".pw-toggle");
-        if (!input || !button) {
-          return;
-        }
-        if (input.type === "password") {
-          input.type = "text";
-          button.textContent = "hide";
-          return;
-        }
-        input.type = "password";
-        button.textContent = "show";
-      }
-    </script>
   </body>
 </html>

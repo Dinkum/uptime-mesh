@@ -21,6 +21,7 @@
           <tr>
             <th>Role</th>
             <th>Kind</th>
+            <th>Enabled</th>
             <th>Priority</th>
             <th>Ratio</th>
             <th>Desired</th>
@@ -36,6 +37,13 @@
                 <a class="mono hover:underline" href="{{ ui_prefix }}/roles/{{ role.name }}">{{ role.name }}</a>
               </td>
               <td class="mono">{{ role.kind }}</td>
+              <td>
+                {% if role.enabled %}
+                  <span class="badge badge-success badge-outline">on</span>
+                {% else %}
+                  <span class="badge badge-outline">off</span>
+                {% endif %}
+              </td>
               <td class="mono">{{ role.priority }}</td>
               <td class="mono">{{ role.ratio }}</td>
               <td class="mono">{{ role.desired }}</td>
@@ -51,7 +59,7 @@
             </tr>
           {% else %}
             <tr>
-              <td colspan="8" class="text-slate-500">No role definitions found.</td>
+              <td colspan="9" class="text-slate-500">No role definitions found.</td>
             </tr>
           {% endfor %}
         </tbody>

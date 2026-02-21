@@ -40,10 +40,15 @@
     }
   </style>
 
-  <div class="flex flex-wrap gap-3 mb-6">
-    <a class="btn btn-sm {% if settings_section == 'auth' %}btn-primary{% else %}btn-outline{% endif %}" href="{{ ui_prefix }}/settings?section=auth">Auth & Preferences</a>
-    <a class="btn btn-sm {% if settings_section == 'support' %}btn-primary{% else %}btn-outline{% endif %}" href="{{ ui_prefix }}/settings?section=support">Support & Snapshots</a>
-  </div>
+  <section class="mesh-subtabs-shell mb-6" aria-label="Settings sections">
+    <p class="mesh-subtabs-label">Settings Sections</p>
+    <nav class="mesh-subtabs">
+      <a class="mesh-subtab{% if settings_section == 'auth' %} active{% endif %}" href="{{ ui_prefix }}/settings?section=auth">Auth & Preferences</a>
+      <a class="mesh-subtab{% if settings_section == 'routing' %} active{% endif %}" href="{{ ui_prefix }}/settings?section=routing">Routing & Domains</a>
+      <a class="mesh-subtab{% if settings_section == 'providers' %} active{% endif %}" href="{{ ui_prefix }}/settings?section=providers">Providers</a>
+      <a class="mesh-subtab{% if settings_section == 'support' %} active{% endif %}" href="{{ ui_prefix }}/settings?section=support">Support & Snapshots</a>
+    </nav>
+  </section>
 
   {% if settings_section == "support" %}
     <section class="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -232,6 +237,303 @@
         await restoreSnapshot(snapshotId);
       });
     </script>
+
+  {% elif settings_section == "routing" %}
+    <section class="grid gap-6 lg:grid-cols-2">
+      <article class="settings-card rounded-2xl p-6 lg:col-span-2">
+        <h2 class="text-lg font-semibold">Applications</h2>
+        <p class="text-sm text-slate-500">Map external domains to internal application/service targets. `hello-world` is pre-seeded.</p>
+
+        {% if routing_success %}
+          <div class="alert alert-success text-sm mt-3">
+            <span>{{ routing_success }}</span>
+          </div>
+        {% endif %}
+        {% if routing_error %}
+          <div class="alert alert-error text-sm mt-3">
+            <span>{{ routing_error }}</span>
+          </div>
+        {% endif %}
+
+        <div class="overflow-x-auto mt-4">
+          <table class="table w-full">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Name</th>
+                <th>Target Service</th>
+                <th>Default Path</th>
+                <th>Enabled</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for app in applications %}
+                <tr>
+                  <td class="mono text-xs">{{ app.id }}</td>
+                  <td>{{ app.name }}</td>
+                  <td class="mono text-xs">{{ app.target_service_id or "-" }}</td>
+                  <td class="mono text-xs">{{ app.default_path }}</td>
+                  <td>
+                    {% if app.enabled %}
+                      <span class="badge badge-success badge-outline">on</span>
+                    {% else %}
+                      <span class="badge badge-outline">off</span>
+                    {% endif %}
+                  </td>
+                </tr>
+              {% else %}
+                <tr>
+                  <td colspan="5" class="text-slate-500">No applications configured.</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+
+        <form method="post" action="{{ ui_prefix }}/settings/routing/application" class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-5">
+          <label class="block">
+            <span class="settings-label">Application ID</span>
+            <input class="settings-input mono" type="text" name="app_id" placeholder="hello-world" />
+            <p class="settings-help">Use existing ID to update, or leave blank to derive from the name.</p>
+          </label>
+          <label class="block">
+            <span class="settings-label">Name</span>
+            <input class="settings-input" type="text" name="name" placeholder="Hello World" />
+          </label>
+          <label class="block md:col-span-2">
+            <span class="settings-label">Description</span>
+            <input class="settings-input" type="text" name="description" placeholder="Public app description" />
+          </label>
+          <label class="block">
+            <span class="settings-label">Target Service</span>
+            <select class="settings-input mono" name="target_service_id">
+              <option value="">(none)</option>
+              {% for service in service_options %}
+                <option value="{{ service.id }}">{{ service.name }} ({{ service.id }})</option>
+              {% endfor %}
+            </select>
+          </label>
+          <label class="block">
+            <span class="settings-label">Default Path</span>
+            <input class="settings-input mono" type="text" name="default_path" value="/" />
+          </label>
+          <label class="inline-flex items-center gap-2 mt-1 md:col-span-2">
+            <input type="checkbox" name="enabled" value="true" checked />
+            <span class="text-sm text-slate-300">Application enabled</span>
+          </label>
+          <div class="md:col-span-2">
+            <button class="btn btn-primary" type="submit">Save Application</button>
+          </div>
+        </form>
+      </article>
+
+      <article class="settings-card rounded-2xl p-6 lg:col-span-2">
+        <h2 class="text-lg font-semibold">Domain Routes</h2>
+        <p class="text-sm text-slate-500">Bind domains/subdomains to applications. Gateway will route matching host + path to the selected app target service.</p>
+
+        <div class="overflow-x-auto mt-4">
+          <table class="table w-full">
+            <thead>
+              <tr>
+                <th>Domain</th>
+                <th>Path</th>
+                <th>Application</th>
+                <th>Route</th>
+                <th>Ready</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for binding in domain_bindings %}
+                <tr>
+                  <td class="mono text-xs">{{ binding.domain }}</td>
+                  <td class="mono text-xs">{{ binding.path }}</td>
+                  <td>{{ binding.application_name }} <span class="text-xs text-slate-500 mono">({{ binding.application_id }})</span></td>
+                  <td>
+                    {% if binding.route_enabled %}
+                      <span class="badge badge-success badge-outline">enabled</span>
+                    {% else %}
+                      <span class="badge badge-outline">disabled</span>
+                    {% endif %}
+                  </td>
+                  <td>
+                    {% if binding.routing_ready %}
+                      <span class="badge badge-success badge-outline">ready</span>
+                    {% else %}
+                      <span class="badge badge-warning badge-outline">blocked</span>
+                    {% endif %}
+                  </td>
+                  <td>
+                    <form method="post" action="{{ ui_prefix }}/settings/routing/domain/delete">
+                      <input type="hidden" name="route_id" value="{{ binding.id }}" />
+                      <button class="btn btn-xs btn-outline" type="submit">Delete</button>
+                    </form>
+                  </td>
+                </tr>
+              {% else %}
+                <tr>
+                  <td colspan="6" class="text-slate-500">No domain routes configured.</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+
+        <form method="post" action="{{ ui_prefix }}/settings/routing/domain" class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-5">
+          <label class="block">
+            <span class="settings-label">Route ID</span>
+            <input class="settings-input mono" type="text" name="route_id" placeholder="optional-id" />
+            <p class="settings-help">Use existing ID to update. Leave blank to auto-generate.</p>
+          </label>
+          <label class="block">
+            <span class="settings-label">Domain</span>
+            <input class="settings-input mono" type="text" name="domain" placeholder="app.example.com" required />
+          </label>
+          <label class="block">
+            <span class="settings-label">Path Prefix</span>
+            <input class="settings-input mono" type="text" name="path" value="/" />
+          </label>
+          <label class="block">
+            <span class="settings-label">Application</span>
+            <select class="settings-input mono" name="application_id" required>
+              <option value="">Select application</option>
+              {% for app in applications %}
+                <option value="{{ app.id }}">{{ app.name }} ({{ app.id }})</option>
+              {% endfor %}
+            </select>
+          </label>
+          <label class="inline-flex items-center gap-2 mt-1 md:col-span-2">
+            <input type="checkbox" name="enabled" value="true" checked />
+            <span class="text-sm text-slate-300">Route enabled</span>
+          </label>
+          <div class="md:col-span-2">
+            <button class="btn btn-primary" type="submit">Save Domain Route</button>
+          </div>
+        </form>
+      </article>
+
+      <article class="settings-card rounded-2xl p-6 lg:col-span-2">
+        <h2 class="text-lg font-semibold">External DNS Records</h2>
+        <p class="text-sm text-slate-500">If UptimeMesh is not managing DNS in your provider account, create these records manually.</p>
+        {% if not domain_ingress_target %}
+          <div class="alert alert-warning text-sm mt-3">
+            <span>Set <span class="mono">Domain Ingress Target</span> under the Providers section to generate concrete DNS records.</span>
+          </div>
+        {% else %}
+          <p class="text-xs text-slate-400 mt-3">Ingress target: <span class="mono">{{ domain_ingress_target }}</span></p>
+        {% endif %}
+        <div class="overflow-x-auto mt-4">
+          <table class="table w-full">
+            <thead>
+              <tr>
+                <th>Domain</th>
+                <th>Type</th>
+                <th>Value</th>
+                <th>Instructions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in dns_record_rows %}
+                <tr>
+                  <td class="mono text-xs">{{ row.domain }}</td>
+                  <td class="mono text-xs">{{ row.record_type }}</td>
+                  <td class="mono text-xs">{{ row.record_value }}</td>
+                  <td class="text-xs">{{ row.instructions or "Set a domain ingress target to generate instructions." }}</td>
+                </tr>
+              {% else %}
+                <tr>
+                  <td colspan="4" class="text-slate-500">No domain routes found.</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </article>
+    </section>
+
+  {% elif settings_section == "providers" %}
+    <section class="grid gap-6 lg:grid-cols-2">
+      <article class="settings-card rounded-2xl p-6 lg:col-span-2">
+        <h2 class="text-lg font-semibold">Provider Credentials</h2>
+        <p class="text-sm text-slate-500">Configure external API providers for DNS automation, VPS provisioning, and Codex/OpenAI-assisted operations.</p>
+
+        {% if provider_success %}
+          <div class="alert alert-success text-sm mt-3">
+            <span>{{ provider_success }}</span>
+          </div>
+        {% endif %}
+
+        {% if provider_error %}
+          <div class="alert alert-error text-sm mt-3">
+            <span>{{ provider_error }}</span>
+          </div>
+        {% endif %}
+
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-3 mt-4 text-sm">
+          <div class="rounded-xl border border-slate-700/40 p-3">
+            <p class="text-slate-500">OpenAI API Key</p>
+            <p class="mono mt-1">{{ "configured" if provider_configured.provider_openai_api_key else "not set" }}</p>
+          </div>
+          <div class="rounded-xl border border-slate-700/40 p-3">
+            <p class="text-slate-500">Cloudflare Token</p>
+            <p class="mono mt-1">{{ "configured" if provider_configured.provider_cloudflare_api_token else "not set" }}</p>
+          </div>
+          <div class="rounded-xl border border-slate-700/40 p-3">
+            <p class="text-slate-500">Hetzner Token</p>
+            <p class="mono mt-1">{{ "configured" if provider_configured.provider_hetzner_api_token else "not set" }}</p>
+          </div>
+          <div class="rounded-xl border border-slate-700/40 p-3">
+            <p class="text-slate-500">Scaleway Token</p>
+            <p class="mono mt-1">{{ "configured" if provider_configured.provider_scaleway_api_token else "not set" }}</p>
+          </div>
+          <div class="rounded-xl border border-slate-700/40 p-3">
+            <p class="text-slate-500">Online.net Token</p>
+            <p class="mono mt-1">{{ "configured" if provider_configured.provider_online_api_token else "not set" }}</p>
+          </div>
+          <div class="rounded-xl border border-slate-700/40 p-3">
+            <p class="text-slate-500">Cloudflare Zone ID</p>
+            <p class="mono mt-1">{{ provider_cloudflare_zone_id or "not set" }}</p>
+          </div>
+        </div>
+
+        <form method="post" action="{{ ui_prefix }}/settings/providers" class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-5">
+          <label class="block md:col-span-2">
+            <span class="settings-label">Domain Ingress Target</span>
+            <input class="settings-input mono" type="text" name="domain_ingress_target" value="{{ domain_ingress_target }}" placeholder="203.0.113.10 or ingress.example.net" />
+            <p class="settings-help">Used to generate DNS records for manual provider setup.</p>
+          </label>
+
+          <label class="block">
+            <span class="settings-label">OpenAI API Key</span>
+            <input class="settings-input" type="password" name="provider_openai_api_key" placeholder="Leave blank to keep existing" />
+          </label>
+          <label class="block">
+            <span class="settings-label">Cloudflare API Token</span>
+            <input class="settings-input" type="password" name="provider_cloudflare_api_token" placeholder="Leave blank to keep existing" />
+          </label>
+          <label class="block">
+            <span class="settings-label">Cloudflare Zone ID</span>
+            <input class="settings-input mono" type="text" name="provider_cloudflare_zone_id" value="{{ provider_cloudflare_zone_id }}" placeholder="Cloudflare zone id" />
+          </label>
+          <label class="block">
+            <span class="settings-label">Hetzner API Token</span>
+            <input class="settings-input" type="password" name="provider_hetzner_api_token" placeholder="Leave blank to keep existing" />
+          </label>
+          <label class="block">
+            <span class="settings-label">Scaleway API Token</span>
+            <input class="settings-input" type="password" name="provider_scaleway_api_token" placeholder="Leave blank to keep existing" />
+          </label>
+          <label class="block">
+            <span class="settings-label">Online.net API Token</span>
+            <input class="settings-input" type="password" name="provider_online_api_token" placeholder="Leave blank to keep existing" />
+          </label>
+          <div class="md:col-span-2">
+            <button class="btn btn-primary" type="submit">Save Provider Settings</button>
+          </div>
+        </form>
+      </article>
+    </section>
+
   {% else %}
     <section class="grid gap-6 lg:grid-cols-2">
       <article class="settings-card rounded-2xl p-6">

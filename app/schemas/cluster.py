@@ -11,7 +11,7 @@ class ClusterBootstrapRequest(BaseModel):
 
 
 class JoinTokenCreate(BaseModel):
-    role: str = Field(default="general")
+    role: str = Field(default="auto")
     ttl_seconds: int = Field(default=1800, ge=60, le=86400)
 
 
@@ -31,7 +31,7 @@ class NodeJoinRequest(BaseModel):
     token: str
     node_id: str
     name: str
-    role: str = Field(default="general")
+    role: Optional[str] = Field(default=None)
     mesh_ip: Optional[str] = None
     api_endpoint: Optional[str] = None
     etcd_peer_url: Optional[str] = None

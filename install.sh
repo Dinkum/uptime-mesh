@@ -164,6 +164,23 @@ ensure_etcd_services_started() {
   fi
 }
 
+install_global_cli_shims() {
+  local shim_path="/usr/local/bin/uptime-mesh"
+  local compat_path="/usr/local/bin/uptimemesh"
+  cat > "${shim_path}" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+CLI_BIN="${APP_DIR}/.venv/bin/uptimemesh"
+if [[ ! -x "\${CLI_BIN}" ]]; then
+  echo "uptime-mesh CLI is not installed yet at \${CLI_BIN}" >&2
+  exit 1
+fi
+exec "\${CLI_BIN}" "\$@"
+EOF
+  chmod 0755 "${shim_path}"
+  ln -sfn "${shim_path}" "${compat_path}"
+}
+
 run_cli_with_write_retry() {
   local attempt=1
   local max_attempts=20
@@ -584,7 +601,7 @@ Usage:
 Options:
   --name <name>              Node display name (default: generated 3-word name)
   --username <username>      Initial admin username for first-node bootstrap (default: admin)
-  --role <role>              Optional advanced override: general | backend_server | reverse_proxy | gateway (default: general)
+  --role <role>              Optional advanced override: auto | backend_server | reverse_proxy (default: auto)
   --join <peer-ip|url>       Join an existing mesh via peer API
   --join-port <port>         Peer API port for --join when omitted in target (default: 8010)
   --api-url <url>            Cluster API URL (default: http://127.0.0.1:8010)
@@ -613,7 +630,7 @@ USAGE
 NODE_ID=""
 NODE_NAME=""
 INSTALL_ADMIN_USERNAME="admin"
-NODE_ROLE=""
+NODE_ROLE="auto"
 API_URL="http://127.0.0.1:8010"
 API_ENDPOINT=""
 ETCD_PEER_URL=""
@@ -1004,7 +1021,7 @@ run_wizard() {
   esac
 
   if [[ -z "$NODE_ROLE" ]]; then
-    NODE_ROLE="general"
+    NODE_ROLE="auto"
   fi
 
   if [[ "$mode" == "first" ]]; then
@@ -1026,11 +1043,9 @@ run_wizard() {
   endpoint_default="$(default_api_endpoint)"
   API_ENDPOINT="$(prompt_default "Advertised API endpoint for this node" "$endpoint_default")"
 
-  if [[ "$NODE_ROLE" != "gateway" ]]; then
-    ETCD_PEER_URL="$(prompt_default "etcd peer URL for this node" "$(derive_etcd_peer_url "$API_ENDPOINT")")"
-    if [[ "$mode" == "first" ]]; then
-      API_URL="$(prompt_default "API URL used for bootstrap" "http://127.0.0.1:${PORT}")"
-    fi
+  ETCD_PEER_URL="$(prompt_default "etcd peer URL for this node" "$(derive_etcd_peer_url "$API_ENDPOINT")")"
+  if [[ "$mode" == "first" ]]; then
+    API_URL="$(prompt_default "API URL used for bootstrap" "http://127.0.0.1:${PORT}")"
   fi
 
   echo
@@ -1106,6 +1121,7 @@ print_install_summary() {
 | app_log           : ${APP_DIR}/data/logs/app.log
 | agent_log         : ${APP_DIR}/data/logs/agent.log
 | agent_socket      : ${APP_DIR}/data/agent.sock
+| cli_command       : uptime-mesh
 +--------------------------------------------------------------+
 EOF
 }
@@ -1172,12 +1188,12 @@ if [[ -z "$NODE_ID" ]]; then
   NODE_ID="$(generate_short_uuid)"
 fi
 if [[ -z "$NODE_ROLE" ]]; then
-  NODE_ROLE="general"
+  NODE_ROLE="auto"
 fi
 case "$NODE_ROLE" in
-  general|backend_server|reverse_proxy|gateway|worker) ;;
+  auto|backend_server|reverse_proxy) ;;
   *)
-    echo "--role must be one of: general, backend_server, reverse_proxy, gateway, worker" >&2
+    echo "--role must be one of: auto, backend_server, reverse_proxy" >&2
     exit 1 ;;
 esac
 
@@ -1190,7 +1206,7 @@ fi
 if [[ -z "$API_ENDPOINT" ]]; then
   API_ENDPOINT="$(default_api_endpoint)"
 fi
-if [[ -z "$ETCD_PEER_URL" && "$NODE_ROLE" != "gateway" ]]; then
+if [[ -z "$ETCD_PEER_URL" ]]; then
   ETCD_PEER_URL="$(derive_etcd_peer_url "$API_ENDPOINT")"
 fi
 if [[ -n "$JOIN_TARGET" ]]; then
@@ -1261,6 +1277,7 @@ fi
 
 run_quiet_command "Upgrade pip" .venv/bin/pip install --upgrade pip || fail "pip upgrade failed"
 run_quiet_command "Install Python app dependencies" .venv/bin/pip install -e . || fail "python dependency install failed"
+install_global_cli_shims
 mkdir -p data
 mkdir -p data/logs
 
@@ -1336,7 +1353,7 @@ setv("RUNTIME_ENABLE", "false")
 setv("RUNTIME_NODE_ID", "${NODE_ID}")
 setv("RUNTIME_NODE_NAME", "${NODE_NAME}")
 setv("RUNTIME_NODE_ROLE", "${NODE_ROLE}")
-setv("RUNTIME_API_BASE_URL", "http://127.0.0.1:${PORT}")
+setv("RUNTIME_API_BASE_URL", "${API_URL}")
 setv("RUNTIME_IDENTITY_DIR", "./data/identities")
 setv("RUNTIME_HEARTBEAT_INTERVAL_SECONDS", kv.get("RUNTIME_HEARTBEAT_INTERVAL_SECONDS", "15") or "15")
 setv("RUNTIME_HEARTBEAT_TTL_SECONDS", kv.get("RUNTIME_HEARTBEAT_TTL_SECONDS", "45") or "45")
@@ -1664,22 +1681,24 @@ target.write_text(f"{resolved}\n", encoding="utf-8")
 PY
 
 if [[ "$BOOTSTRAP" -eq 1 ]]; then
-  bootstrap_prep_json="$(run_cli_with_write_retry "${APP_DIR}/.venv/bin/uptimemesh" prepare-bootstrap-admin --username "${INSTALL_ADMIN_USERNAME}")" || fail "failed to prepare bootstrap admin credentials"
+  bootstrap_prep_json="$(run_cli_with_write_retry uptime-mesh prepare-bootstrap-admin --username "${INSTALL_ADMIN_USERNAME}")" || fail "failed to prepare bootstrap admin credentials"
   bootstrap_action="$(printf '%s' "$bootstrap_prep_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("action",""))')"
   if [[ "$bootstrap_action" == "generated" ]]; then
     INITIAL_ADMIN_USERNAME="$(printf '%s' "$bootstrap_prep_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("username",""))')"
     INITIAL_ADMIN_PASSWORD="$(printf '%s' "$bootstrap_prep_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("password",""))')"
-    bootstrap_json="$(run_cli_with_write_retry "${APP_DIR}/.venv/bin/uptimemesh" --api-url "${API_URL}" bootstrap --username "${INITIAL_ADMIN_USERNAME}" --password "${INITIAL_ADMIN_PASSWORD}")" || fail "failed to bootstrap first node"
+    bootstrap_json="$(run_cli_with_write_retry uptime-mesh --api-url "${API_URL}" bootstrap --username "${INITIAL_ADMIN_USERNAME}" --password "${INITIAL_ADMIN_PASSWORD}")" || fail "failed to bootstrap first node"
     worker_token="$(printf '%s' "$bootstrap_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["worker_token"]["token"])')"
     join_cmd=(
-      "${APP_DIR}/.venv/bin/uptimemesh" --api-url "${API_URL}" join
+      uptime-mesh --api-url "${API_URL}" join
       --token "${worker_token}"
       --node-id "${NODE_ID}"
       --name "${NODE_NAME}"
-      --role "${NODE_ROLE}"
       --api-endpoint "${API_ENDPOINT}"
       --identity-dir ./data/identities
     )
+    if [[ -n "${NODE_ROLE}" && "${NODE_ROLE}" != "auto" ]]; then
+      join_cmd+=(--role "${NODE_ROLE}")
+    fi
     if [[ -n "$ETCD_PEER_URL" ]]; then
       join_cmd+=(--etcd-peer-url "${ETCD_PEER_URL}")
     fi
@@ -1691,14 +1710,16 @@ if [[ "$BOOTSTRAP" -eq 1 ]]; then
   fi
 elif [[ -n "$JOIN_TOKEN" ]]; then
   join_cmd=(
-    "${APP_DIR}/.venv/bin/uptimemesh" --api-url "${API_URL}" join
+    uptime-mesh --api-url "${API_URL}" join
     --token "${JOIN_TOKEN}"
     --node-id "${NODE_ID}"
     --name "${NODE_NAME}"
-    --role "${NODE_ROLE}"
     --api-endpoint "${API_ENDPOINT}"
     --identity-dir ./data/identities
   )
+  if [[ -n "${NODE_ROLE}" && "${NODE_ROLE}" != "auto" ]]; then
+    join_cmd+=(--role "${NODE_ROLE}")
+  fi
   if [[ -n "$ETCD_PEER_URL" ]]; then
     join_cmd+=(--etcd-peer-url "${ETCD_PEER_URL}")
   fi
@@ -1720,7 +1741,7 @@ fi
 
 echo "Status:"
 if [[ "$INITIAL_ADMIN_GENERATED" -eq 1 ]]; then
-  ${APP_DIR}/.venv/bin/uptimemesh --api-url "${API_URL}" nodes-status \
+  uptime-mesh --api-url "${API_URL}" nodes-status \
     --username "${INITIAL_ADMIN_USERNAME}" \
     --password "${INITIAL_ADMIN_PASSWORD}" || true
 else

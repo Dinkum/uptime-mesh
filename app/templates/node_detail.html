@@ -49,6 +49,126 @@
     </div>
   </section>
 
+  <section class="mesh-card rounded-2xl p-6 mb-6">
+    <div class="flex flex-wrap items-center justify-between gap-2">
+      <h2 class="text-lg font-semibold">Subsystem Health</h2>
+      <span class="text-xs text-slate-500">Operator snapshot of node reachability, mesh, workload, and identity health</span>
+    </div>
+    <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3 mt-4">
+      {% for row in subsystem_rows %}
+        <article class="rounded-xl border border-slate-700/40 p-4">
+          <div class="flex items-center justify-between gap-2">
+            <p class="text-sm font-semibold">{{ row.name }}</p>
+            {% if row.state_key == "healthy" %}
+              <span class="badge badge-success badge-outline">{{ row.state_text }}</span>
+            {% elif row.state_key == "degraded" %}
+              <span class="badge badge-warning badge-outline">{{ row.state_text }}</span>
+            {% elif row.state_key == "error" %}
+              <span class="badge badge-error badge-outline">{{ row.state_text }}</span>
+            {% else %}
+              <span class="badge badge-outline">{{ row.state_text }}</span>
+            {% endif %}
+          </div>
+          <p class="text-xs text-slate-500 mt-2">{{ row.detail }}</p>
+        </article>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="grid grid-cols-1 xl:grid-cols-2 gap-5 mb-6">
+    <article class="mesh-card rounded-2xl p-6">
+      <div class="flex items-center justify-between">
+        <h2 class="text-lg font-semibold">Node Endpoint Health</h2>
+        <span class="badge badge-outline mono">{{ node_endpoint_rows|length }} endpoints</span>
+      </div>
+      <div class="grid grid-cols-3 gap-2 mt-4 text-sm">
+        <div class="rounded-xl border border-slate-700/40 p-3">
+          <p class="text-slate-500 text-xs">Healthy</p>
+          <p class="mono mt-1">{{ endpoint_state_counts.healthy }}</p>
+        </div>
+        <div class="rounded-xl border border-slate-700/40 p-3">
+          <p class="text-slate-500 text-xs">Unhealthy</p>
+          <p class="mono mt-1">{{ endpoint_state_counts.unhealthy }}</p>
+        </div>
+        <div class="rounded-xl border border-slate-700/40 p-3">
+          <p class="text-slate-500 text-xs">Stale</p>
+          <p class="mono mt-1">{{ endpoint_state_counts.stale }}</p>
+        </div>
+      </div>
+      <div class="overflow-x-auto mt-4">
+        <table class="table w-full">
+          <thead>
+            <tr>
+              <th>Service</th>
+              <th>Replica</th>
+              <th>Endpoint</th>
+              <th>Health</th>
+              <th>Last Check</th>
+              <th>Age</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for endpoint in node_endpoint_rows %}
+              <tr>
+                <td>
+                  <p class="font-medium">{{ endpoint.service_name }}</p>
+                  <p class="mono text-[11px] text-slate-500">{{ endpoint.service_id }}</p>
+                </td>
+                <td class="mono text-xs">{{ endpoint.replica_id }}</td>
+                <td class="mono text-xs">{{ endpoint.address }}:{{ endpoint.port }}</td>
+                <td>
+                  {% if endpoint.health_state == "healthy" %}
+                    <span class="badge badge-success badge-outline">healthy</span>
+                  {% elif endpoint.health_state == "unhealthy" %}
+                    <span class="badge badge-error badge-outline">unhealthy</span>
+                  {% elif endpoint.health_state == "stale" %}
+                    <span class="badge badge-warning badge-outline">stale</span>
+                  {% else %}
+                    <span class="badge badge-outline">{{ endpoint.health_state }}</span>
+                  {% endif %}
+                </td>
+                <td class="mono text-xs">{{ endpoint.last_checked_at }}</td>
+                <td class="mono text-xs">{{ endpoint.age_text }}</td>
+              </tr>
+            {% else %}
+              <tr>
+                <td colspan="6" class="text-slate-500">No endpoint entries for this node yet.</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </article>
+
+    <article class="mesh-card rounded-2xl p-6">
+      <div class="flex items-center justify-between">
+        <h2 class="text-lg font-semibold">Node Activity</h2>
+        <span class="badge badge-outline mono">{{ node_event_rows|length }} events</span>
+      </div>
+      <p class="text-xs text-slate-500 mt-1">Join, heartbeat, auth, and runtime events. Warnings + errors: {{ node_event_warning_count }}</p>
+      <div class="mt-4 space-y-3 max-h-[28rem] overflow-auto pr-1">
+        {% for event in node_event_rows %}
+          <article class="rounded-xl border border-slate-700/40 p-3">
+            <div class="flex items-center justify-between gap-2">
+              <p class="font-medium text-sm">{{ event.name }}</p>
+              {% if event.level in ["ERROR", "CRITICAL"] %}
+                <span class="badge badge-error badge-outline">{{ event.level }}</span>
+              {% elif event.level == "WARNING" %}
+                <span class="badge badge-warning badge-outline">{{ event.level }}</span>
+              {% else %}
+                <span class="badge badge-outline">{{ event.level }}</span>
+              {% endif %}
+            </div>
+            <p class="mono text-[11px] text-slate-500 mt-1">{{ event.created_at }} · {{ event.category }}</p>
+            <p class="mono text-[11px] text-slate-400 mt-2 break-all">{{ event.summary }}</p>
+          </article>
+        {% else %}
+          <p class="text-slate-500 text-sm">No node events found yet.</p>
+        {% endfor %}
+      </div>
+    </article>
+  </section>
+
   <section class="grid grid-cols-1 xl:grid-cols-2 gap-5">
     <div class="mesh-card rounded-2xl p-6">
       <h2 class="text-lg font-semibold mb-4">Node Info</h2>

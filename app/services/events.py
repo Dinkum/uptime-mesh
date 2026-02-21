@@ -25,6 +25,41 @@ async def list_events(
     return list(result.scalars().all())
 
 
+def _event_matches_node(event: Event, node_id: str) -> bool:
+    fields = event.fields if isinstance(event.fields, dict) else {}
+    candidates = (
+        "node_id",
+        "target_node_id",
+        "source_node_id",
+        "peer_node_id",
+        "member_name",
+    )
+    for key in candidates:
+        value = fields.get(key)
+        if isinstance(value, str) and value.strip() == node_id:
+            return True
+    return False
+
+
+async def list_events_for_node(
+    session: AsyncSession,
+    *,
+    node_id: str,
+    limit: int = 40,
+    search_limit: int = 400,
+) -> List[Event]:
+    if not node_id.strip():
+        return []
+    rows = await list_events(session, limit=max(limit, search_limit))
+    matched: list[Event] = []
+    for row in rows:
+        if _event_matches_node(row, node_id):
+            matched.append(row)
+            if len(matched) >= limit:
+                break
+    return matched
+
+
 async def get_event(session: AsyncSession, event_id: str) -> Optional[Event]:
     result = await session.execute(select(Event).where(Event.id == event_id))
     return result.scalar_one_or_none()

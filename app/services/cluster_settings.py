@@ -12,7 +12,15 @@ from app.models.cluster_setting import ClusterSetting
 from app.services import config_yaml
 
 _logger = get_logger("services.cluster_settings")
-SENSITIVE_CLUSTER_SETTINGS = {"auth_secret_key", "cluster_signing_key"}
+SENSITIVE_CLUSTER_SETTINGS = {
+    "auth_secret_key",
+    "cluster_signing_key",
+    "provider_openai_api_key",
+    "provider_cloudflare_api_token",
+    "provider_hetzner_api_token",
+    "provider_scaleway_api_token",
+    "provider_online_api_token",
+}
 _SETTINGS_MAP_TTL_SECONDS = 5.0
 _settings_map_cache: Dict[str, str] | None = None
 _settings_map_cache_expires_at = 0.0

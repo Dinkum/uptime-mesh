@@ -21,6 +21,7 @@ from app.dependencies import get_sessionmaker
 from app.identity import heartbeat_signing_message
 from app.security import SESSION_COOKIE_NAME
 from app.services import auth as auth_service
+from app.services import cluster as cluster_service
 from app.services import cluster_settings
 
 
@@ -210,7 +211,7 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
         path="/cluster/bootstrap",
         method="POST",
         json_body={
-            "worker_token_ttl_seconds": args.worker_ttl,
+            "worker_token_ttl_seconds": args.join_ttl,
         },
         session_token=session_token,
     )
@@ -263,17 +264,39 @@ def cmd_create_token(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _create_join_token_local_async(
+    *,
+    role: str,
+    ttl_seconds: int,
+    issued_by: str,
+) -> Dict[str, Any]:
+    settings = get_settings()
+    sessionmaker = get_sessionmaker(settings.database_url)
+    async with sessionmaker() as session:
+        token = await cluster_service.create_join_token(
+            session,
+            role=role,
+            ttl_seconds=ttl_seconds,
+            issued_by=issued_by,
+        )
+    return {
+        "id": token.id,
+        "role": token.role,
+        "token": token.token,
+        "expires_at": token.expires_at.isoformat(),
+    }
+
+
 def cmd_join_command(args: argparse.Namespace) -> int:
-    session_token = _login(args.api_url, args.username, args.password)
-    token_payload = _api_request(
-        base_url=args.api_url,
-        path="/cluster/join-tokens",
-        method="POST",
-        json_body={"role": args.role, "ttl_seconds": args.ttl},
-        session_token=session_token,
+    token_payload = asyncio.run(
+        _create_join_token_local_async(
+            role=args.role,
+            ttl_seconds=args.ttl,
+            issued_by="uptimemesh.join_command.local",
+        )
     )
     if not isinstance(token_payload, dict):
-        raise RuntimeError("Unexpected response for /cluster/join-tokens")
+        raise RuntimeError("Unexpected response for local join token generation")
     token = str(token_payload.get("token") or "").strip()
     if not token:
         raise RuntimeError("Cluster did not return a join token")
@@ -284,11 +307,13 @@ def cmd_join_command(args: argparse.Namespace) -> int:
         "curl -fsSL https://raw.githubusercontent.com/Dinkum/uptime-mesh/main/install.sh | "
         f"bash -s -- --join {peer} --token {token}"
     )
-    if args.join_port:
+    if args.role and args.role != "auto":
+        install_command += f" --role {args.role}"
+    if args.join_port and int(args.join_port) != 8010:
         install_command += f" --join-port {args.join_port}"
     payload = {
         "peer": peer,
-        "role": args.role,
+        "role": token_payload.get("role"),
         "ttl_seconds": args.ttl,
         "token_id": token_payload.get("id"),
         "expires_at": token_payload.get("expires_at"),
@@ -300,23 +325,26 @@ def cmd_join_command(args: argparse.Namespace) -> int:
 
 def cmd_join(args: argparse.Namespace) -> int:
     key_pem, csr_pem = _generate_key_and_csr(args.node_id)
+    join_payload: Dict[str, Any] = {
+        "token": args.token,
+        "node_id": args.node_id,
+        "name": args.name,
+        "mesh_ip": args.mesh_ip,
+        "api_endpoint": args.api_endpoint,
+        "etcd_peer_url": args.etcd_peer_url,
+        "labels": _parse_labels(args.label),
+        "status": {},
+        "lease_ttl_seconds": args.lease_ttl,
+        "csr_pem": csr_pem,
+    }
+    if args.role:
+        join_payload["role"] = args.role
+
     response = _api_request(
         base_url=args.api_url,
         path="/cluster/join",
         method="POST",
-        json_body={
-            "token": args.token,
-            "node_id": args.node_id,
-            "name": args.name,
-            "role": args.role,
-            "mesh_ip": args.mesh_ip,
-            "api_endpoint": args.api_endpoint,
-            "etcd_peer_url": args.etcd_peer_url,
-            "labels": _parse_labels(args.label),
-            "status": {},
-            "lease_ttl_seconds": args.lease_ttl,
-            "csr_pem": csr_pem,
-        },
+        json_body=join_payload,
     )
     artifact_paths = _write_identity_artifacts(
         identity_root=args.identity_dir,
@@ -631,7 +659,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     bootstrap = sub.add_parser("bootstrap", help="Bootstrap cluster and issue initial join token")
     _add_auth_args(bootstrap)
-    bootstrap.add_argument("--worker-ttl", type=int, default=1800)
+    bootstrap.add_argument("--join-ttl", type=int, default=1800)
+    bootstrap.add_argument("--worker-ttl", dest="join_ttl", type=int, help=argparse.SUPPRESS)
     bootstrap.set_defaults(func=cmd_bootstrap)
 
     prepare_bootstrap_admin = sub.add_parser(
@@ -645,8 +674,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_auth_args(create_token)
     create_token.add_argument(
         "--role",
-        choices=["general", "backend_server", "reverse_proxy", "worker", "gateway"],
-        default="general",
+        choices=["auto", "backend_server", "reverse_proxy"],
+        default="auto",
     )
     create_token.add_argument("--ttl", type=int, default=1800)
     create_token.set_defaults(func=cmd_create_token)
@@ -655,13 +684,12 @@ def build_parser() -> argparse.ArgumentParser:
         "join-command",
         help="Generate one-time join token and full install command",
     )
-    _add_auth_args(join_command)
     join_command.add_argument("--peer", required=True, help="Existing cluster node IP/DNS")
     join_command.add_argument("--join-port", type=int, default=8010)
     join_command.add_argument(
         "--role",
-        choices=["general", "backend_server", "reverse_proxy", "worker", "gateway"],
-        default="general",
+        choices=["auto", "backend_server", "reverse_proxy"],
+        default="auto",
     )
     join_command.add_argument("--ttl", type=int, default=1800)
     join_command.set_defaults(func=cmd_join_command)
@@ -672,8 +700,8 @@ def build_parser() -> argparse.ArgumentParser:
     join.add_argument("--name", required=True)
     join.add_argument(
         "--role",
-        choices=["general", "backend_server", "reverse_proxy", "worker", "gateway"],
-        default="general",
+        choices=["auto", "backend_server", "reverse_proxy"],
+        default=None,
     )
     join.add_argument("--mesh-ip")
     join.add_argument("--api-endpoint")
@@ -737,7 +765,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     etcd_reconcile = sub.add_parser(
         "etcd-reconcile",
-        help="Reconcile etcd membership against worker nodes",
+        help="Reconcile etcd membership against enrolled nodes",
     )
     _add_auth_args(etcd_reconcile)
     etcd_reconcile.add_argument("--dry-run", action="store_true")

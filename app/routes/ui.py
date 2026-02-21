@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
@@ -15,6 +16,7 @@ from app.dependencies import get_db_session
 from app.models.event import Event
 from app.security import SESSION_COOKIE_NAME, create_session_token
 from app.services import (
+    applications as applications_service,
     auth as auth_service,
     cluster as cluster_service,
     cluster_settings,
@@ -58,6 +60,65 @@ def _as_utc(value: datetime | None) -> datetime | None:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return _as_utc(value)
+    if not isinstance(value, str):
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    try:
+        return _as_utc(datetime.fromisoformat(raw.replace("Z", "+00:00")))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _as_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        raw = value.strip().lower()
+        if raw in {"1", "true", "yes", "on"}:
+            return True
+        if raw in {"0", "false", "no", "off"}:
+            return False
+    return None
+
+
+def _as_form_bool(value: Any) -> bool:
+    parsed = _as_bool(value)
+    return bool(parsed) if parsed is not None else False
+
+
+def _dns_record_suggestion(domain: str, ingress_target: str) -> dict[str, str]:
+    clean_domain = str(domain or "").strip().lower()
+    clean_target = str(ingress_target or "").strip()
+    if not clean_domain or not clean_target:
+        return {"domain": clean_domain, "record_type": "-", "record_value": "-", "instructions": ""}
+    try:
+        parsed_ip = ipaddress.ip_address(clean_target)
+        record_type = "AAAA" if parsed_ip.version == 6 else "A"
+        return {
+            "domain": clean_domain,
+            "record_type": record_type,
+            "record_value": clean_target,
+            "instructions": f"Create a {record_type} record for {clean_domain} -> {clean_target}.",
+        }
+    except ValueError:
+        return {
+            "domain": clean_domain,
+            "record_type": "CNAME",
+            "record_value": clean_target.rstrip("."),
+            "instructions": (
+                f"Create a CNAME record for {clean_domain} -> {clean_target.rstrip('.')}. "
+                "If your DNS provider forbids root CNAMEs, use an A/AAAA flattening option."
+            ),
+        }
 
 
 async def _base_context(request: Request, session: AsyncSession) -> Dict[str, Any]:
@@ -126,6 +187,20 @@ def _format_age(now: datetime, value: datetime | None) -> str:
     return f"{_format_duration(seconds)} ago"
 
 
+def _format_bytes(value: int | None) -> str:
+    if value is None:
+        return "-"
+    size = float(max(int(value), 0))
+    units = ["B", "KB", "MB", "GB", "TB"]
+    unit_index = 0
+    while size >= 1024.0 and unit_index < len(units) - 1:
+        size /= 1024.0
+        unit_index += 1
+    if unit_index == 0:
+        return f"{int(size)} {units[unit_index]}"
+    return f"{size:.1f} {units[unit_index]}"
+
+
 def _format_remaining(now: datetime, value: datetime | None) -> str:
     timestamp = _as_utc(value)
     if timestamp is None:
@@ -144,6 +219,44 @@ def _format_value(value: Any) -> str:
     if isinstance(value, (dict, list)):
         return json.dumps(value, sort_keys=True)
     return str(value)
+
+
+def _event_field_summary(fields: Any, *, max_items: int = 4) -> str:
+    if not isinstance(fields, dict):
+        return "-"
+    skip = {"node_id"}
+    priority_keys = [
+        "reason",
+        "action",
+        "state",
+        "role",
+        "target_node_id",
+        "peer_node_id",
+        "service_id",
+        "replica_id",
+        "error_type",
+        "error",
+    ]
+    rendered: list[str] = []
+    used: set[str] = set()
+    for key in priority_keys:
+        value = fields.get(key)
+        if value in (None, "", []):
+            continue
+        rendered.append(f"{key}: {_format_value(value)}")
+        used.add(key)
+        if len(rendered) >= max_items:
+            return " | ".join(rendered)
+    for key in sorted(fields.keys()):
+        if key in used or key in skip:
+            continue
+        value = fields.get(key)
+        if value in (None, "", []):
+            continue
+        rendered.append(f"{key}: {_format_value(value)}")
+        if len(rendered) >= max_items:
+            break
+    return " | ".join(rendered) if rendered else "-"
 
 
 def _build_node_summary(node: Any, now: datetime) -> dict[str, Any]:
@@ -466,7 +579,7 @@ async def nodes_page(request: Request, session: AsyncSession = Depends(get_db_se
     context = {
         "request": request,
         "title": "Nodes",
-        "subtitle": "Inventory, topology, and role placement",
+        "subtitle": "Live node health, connectivity, and quick actions",
         "view_mode": view_mode,
         "nodes": node_rows,
         "map_nodes": node_map_rows,
@@ -578,6 +691,210 @@ async def node_detail_page(
         for key in sorted(node_status.keys())
         if key not in known_key_set and not str(key).startswith("role.")
     ]
+    node_events = await event_service.list_events_for_node(session, node_id=node.id, limit=30)
+    node_event_rows = []
+    for event in node_events:
+        event_fields = event.fields if isinstance(event.fields, dict) else {}
+        node_event_rows.append(
+            {
+                "id": event.id,
+                "name": event.name,
+                "level": event.level,
+                "category": event.category,
+                "created_at": _format_timestamp(_as_utc(event.created_at)),
+                "summary": _event_field_summary(event_fields),
+            }
+        )
+    node_event_warning_count = sum(
+        1 for row in node_event_rows if row["level"] in {"WARNING", "ERROR", "CRITICAL"}
+    )
+
+    stale_after_seconds = max(settings.runtime_discovery_interval_seconds * 3, 90)
+    endpoint_registry = await discovery_service.list_endpoint_registry(
+        session,
+        stale_after_seconds=stale_after_seconds,
+    )
+    node_endpoint_rows: list[dict[str, Any]] = []
+    endpoint_state_counts = {"healthy": 0, "unhealthy": 0, "stale": 0}
+    for endpoint in endpoint_registry:
+        if str(endpoint.get("node_id") or "") != node.id:
+            continue
+        health_state = str(endpoint.get("health_state") or "unknown")
+        if health_state in endpoint_state_counts:
+            endpoint_state_counts[health_state] += 1
+        age_seconds = endpoint.get("age_seconds")
+        age_text = "-"
+        if isinstance(age_seconds, int) and age_seconds >= 0:
+            age_text = _format_duration(age_seconds)
+        node_endpoint_rows.append(
+            {
+                "service_name": str(endpoint.get("service_name") or ""),
+                "service_id": str(endpoint.get("service_id") or ""),
+                "replica_id": str(endpoint.get("replica_id") or ""),
+                "address": str(endpoint.get("address") or ""),
+                "port": endpoint.get("port"),
+                "health_state": health_state,
+                "last_checked_at": _format_timestamp(_as_utc(endpoint.get("last_checked_at"))),
+                "age_text": age_text,
+            }
+        )
+    node_endpoint_rows.sort(key=lambda row: (row["service_name"].lower(), row["replica_id"]))
+
+    subsystem_rows: list[dict[str, str]] = []
+    heartbeat_state = node_row["health_key"]
+    subsystem_rows.append(
+        {
+            "name": "Node Reachability",
+            "state_key": (
+                "healthy"
+                if heartbeat_state == "online"
+                else "degraded" if heartbeat_state == "stale" else "error"
+            ),
+            "state_text": node_row["health_text"],
+            "detail": f"heartbeat {node_row['heartbeat_age']} · {node_row['lease_state']}",
+        }
+    )
+
+    loop_at = _parse_datetime(node_status.get("agent_loop_at"))
+    loop_age_seconds = (
+        int(max((now - loop_at).total_seconds(), 0))
+        if loop_at is not None
+        else None
+    )
+    loop_threshold = max(settings.runtime_heartbeat_interval_seconds * 3, 30)
+    if loop_at is None:
+        loop_state_key = "unknown"
+        loop_state_text = "Unknown"
+        loop_detail = "No loop timestamp reported."
+    elif loop_age_seconds is not None and loop_age_seconds <= loop_threshold:
+        loop_state_key = "healthy"
+        loop_state_text = "Healthy"
+        loop_detail = f"last loop {_format_duration(loop_age_seconds)} ago"
+    else:
+        loop_state_key = "degraded"
+        loop_state_text = "Lagging"
+        loop_detail = (
+            f"last loop {_format_duration(loop_age_seconds or 0)} ago"
+            if loop_age_seconds is not None
+            else "Loop age unknown"
+        )
+    agent_runtime_row = {
+        "name": "Agent Loop",
+        "state_key": loop_state_key,
+        "state_text": loop_state_text,
+        "detail": loop_detail,
+    }
+
+    wg_primary = _as_bool(node_status.get("wg_primary_health"))
+    wg_secondary = _as_bool(node_status.get("wg_secondary_health"))
+    if wg_primary is None and wg_secondary is None:
+        wg_state_key = "unknown"
+        wg_state_text = "Unknown"
+        wg_detail = "No tunnel health report yet."
+    elif wg_primary or wg_secondary:
+        if wg_primary and wg_secondary:
+            wg_state_key = "healthy"
+            wg_state_text = "Healthy"
+        else:
+            wg_state_key = "degraded"
+            wg_state_text = "Degraded"
+        wg_detail = f"primary={wg_primary} secondary={wg_secondary} route={node_row['wg_active_route']}"
+    else:
+        wg_state_key = "error"
+        wg_state_text = "Down"
+        wg_detail = f"primary={wg_primary} secondary={wg_secondary}"
+    subsystem_rows.append(
+        {
+            "name": "Mesh Connectivity",
+            "state_key": wg_state_key,
+            "state_text": wg_state_text,
+            "detail": wg_detail,
+        }
+    )
+
+    swim_state_raw = str(swim_member.get("state") or node_row["swim_state"] or "unknown").strip().lower()
+    if swim_state_raw in {"healthy", "alive"}:
+        swim_state_key = "healthy"
+    elif swim_state_raw in {"degraded", "suspect"}:
+        swim_state_key = "degraded"
+    elif swim_state_raw in {"dead", "offline"}:
+        swim_state_key = "error"
+    else:
+        swim_state_key = "unknown"
+    swim_row = {
+        "name": "Peer Membership",
+        "state_key": swim_state_key,
+        "state_text": swim_state_raw or "unknown",
+        "detail": f"incarnation {swim_member.get('incarnation', node_row['swim_incarnation'])} · peers {len(swim_peer_rows)}",
+    }
+
+    if role_actuation_rows:
+        has_error = any(row["apply_state"] == "error" for row in role_actuation_rows)
+        has_unknown = any(row["apply_state"] == "unknown" for row in role_actuation_rows)
+        if has_error:
+            role_state_key = "error"
+            role_state_text = "Error"
+        elif has_unknown:
+            role_state_key = "degraded"
+            role_state_text = "Partial"
+        else:
+            role_state_key = "healthy"
+            role_state_text = "Healthy"
+        role_detail = f"{len(role_actuation_rows)} runtime roles reported"
+    else:
+        role_state_key = "unknown"
+        role_state_text = "Unknown"
+        role_detail = "No runtime role actuation status yet."
+    role_runtime_row = {
+        "name": "Role Actuation",
+        "state_key": role_state_key,
+        "state_text": role_state_text,
+        "detail": role_detail,
+    }
+
+    if not node_endpoint_rows:
+        endpoint_state_key = "unknown"
+        endpoint_state_text = "No Endpoints"
+        endpoint_detail = "No endpoint checks reported on this node."
+    elif endpoint_state_counts["unhealthy"] > 0:
+        endpoint_state_key = "error"
+        endpoint_state_text = "Unhealthy"
+        endpoint_detail = (
+            f"{endpoint_state_counts['unhealthy']} unhealthy · "
+            f"{endpoint_state_counts['stale']} stale · {endpoint_state_counts['healthy']} healthy"
+        )
+    elif endpoint_state_counts["stale"] > 0:
+        endpoint_state_key = "degraded"
+        endpoint_state_text = "Stale"
+        endpoint_detail = (
+            f"{endpoint_state_counts['stale']} stale · {endpoint_state_counts['healthy']} healthy"
+        )
+    else:
+        endpoint_state_key = "healthy"
+        endpoint_state_text = "Healthy"
+        endpoint_detail = f"{endpoint_state_counts['healthy']} healthy endpoints"
+    subsystem_rows.append(
+        {
+            "name": "Service Endpoint Health",
+            "state_key": endpoint_state_key,
+            "state_text": endpoint_state_text,
+            "detail": endpoint_detail,
+        }
+    )
+
+    identity_state_key = {
+        "ok": "healthy",
+        "warning": "degraded",
+        "critical": "error",
+        "expired": "error",
+    }.get(node_row["identity_expiry_state"], "unknown")
+    identity_row = {
+        "name": "Identity Certificate",
+        "state_key": identity_state_key,
+        "state_text": node_row["identity_expiry_text"],
+        "detail": f"expires {node_row['identity_expires_in']} ({node_row['identity_expires_at']})",
+    }
+    subsystem_rows.extend([agent_runtime_row, swim_row, role_runtime_row, identity_row])
 
     context = {
         "request": request,
@@ -595,6 +912,11 @@ async def node_detail_page(
         "role_actuation_rows": role_actuation_rows,
         "swim_member": swim_member if isinstance(swim_member, dict) else {},
         "swim_peer_rows": swim_peer_rows,
+        "subsystem_rows": subsystem_rows,
+        "node_event_rows": node_event_rows,
+        "node_event_warning_count": node_event_warning_count,
+        "node_endpoint_rows": node_endpoint_rows,
+        "endpoint_state_counts": endpoint_state_counts,
     }
     context.update(await _base_context(request, session))
     return templates.TemplateResponse("node_detail.html", context)
@@ -618,6 +940,7 @@ async def roles_page(request: Request, session: AsyncSession = Depends(get_db_se
             {
                 "name": role_name,
                 "kind": spec.get("kind", "replicated"),
+                "enabled": bool(spec.get("enabled", True)),
                 "priority": spec.get("priority", 0),
                 "ratio": spec.get("ratio", 0.0),
                 "min_replicas": spec.get("min_replicas", 0),
@@ -681,7 +1004,7 @@ async def role_detail_page(
 @router.get("/workloads")
 async def workloads_page(request: Request, session: AsyncSession = Depends(get_db_session)) -> Any:
     subtab = (request.query_params.get("tab") or "services").strip().lower()
-    if subtab not in {"services", "replicas", "scheduler"}:
+    if subtab not in {"services", "replicas", "scheduler", "rollouts"}:
         subtab = "services"
 
     services = await service_service.list_services(session, limit=2000)
@@ -715,6 +1038,43 @@ async def workloads_page(request: Request, session: AsyncSession = Depends(get_d
             }
         )
     replica_rows.sort(key=lambda row: (row["service_name"].lower(), row["id"]))
+    replica_rows_by_service: dict[str, list[dict[str, Any]]] = {}
+    for row in replica_rows:
+        replica_rows_by_service.setdefault(row["service_id"], []).append(row)
+
+    rollout_watch_rows: list[dict[str, Any]] = []
+    pending_states = {"pending", "queued", "in_progress", "updating", "rolling", "restarting"}
+    failed_states = {"failed", "error", "stalled"}
+    for row in rollout_rows:
+        blocking = []
+        for replica in replica_rows_by_service.get(row["service_id"], []):
+            is_outdated = replica["target_generation"] > replica["applied_generation"]
+            is_non_healthy_state = replica["update_state"] in pending_states or replica["update_state"] in failed_states
+            if is_outdated or is_non_healthy_state:
+                blocking.append(replica)
+        if row["state_key"] == "complete" and not blocking:
+            continue
+        rollout_watch_rows.append(
+            {
+                **row,
+                "blocking_count": len(blocking),
+                "blocking_preview": blocking[:6],
+            }
+        )
+    severity_rank = {"error": 0, "stalled": 1, "rolling": 2, "outdated": 3, "no_replicas": 4, "complete": 5}
+    rollout_watch_rows.sort(
+        key=lambda item: (
+            severity_rank.get(item["state_key"], 9),
+            item["progress_pct"],
+            item["service_name"].lower(),
+        )
+    )
+    rollout_watch_errors = sum(1 for row in rollout_watch_rows if row["state_key"] == "error")
+    rollout_watch_stalled = sum(1 for row in rollout_watch_rows if row["state_key"] == "stalled")
+    rollout_watch_active = sum(
+        1 for row in rollout_watch_rows if row["state_key"] in {"rolling", "outdated"}
+    )
+    rollout_watch_blocked_replicas = sum(int(row["blocking_count"]) for row in rollout_watch_rows)
     plan = await scheduler_service.get_cached_plan(session)
 
     context = {
@@ -727,6 +1087,11 @@ async def workloads_page(request: Request, session: AsyncSession = Depends(get_d
         "stalled_rollouts": stalled_rollouts,
         "error_rollouts": error_rollouts,
         "replica_rows": replica_rows,
+        "rollout_watch_rows": rollout_watch_rows,
+        "rollout_watch_errors": rollout_watch_errors,
+        "rollout_watch_stalled": rollout_watch_stalled,
+        "rollout_watch_active": rollout_watch_active,
+        "rollout_watch_blocked_replicas": rollout_watch_blocked_replicas,
         "plan": plan,
     }
     context.update(await _base_context(request, session))
@@ -764,11 +1129,12 @@ async def events_page(request: Request, session: AsyncSession = Depends(get_db_s
 @router.get("/infrastructure")
 async def infrastructure_page(request: Request, session: AsyncSession = Depends(get_db_session)) -> Any:
     subtab = (request.query_params.get("tab") or "wireguard").strip().lower()
-    if subtab not in {"wireguard", "discovery", "gateway", "monitoring", "cdn"}:
+    if subtab not in {"wireguard", "discovery", "gateway", "monitoring", "cdn", "etcd", "swim"}:
         subtab = "wireguard"
 
     settings_map = await cluster_settings.get_settings_map(session)
     nodes = await node_service.list_nodes(session, limit=500)
+    swim_members = await cluster_service.list_swim_members(session)
     wireguard_rows = []
     for node in nodes:
         status = node.status or {}
@@ -787,6 +1153,72 @@ async def infrastructure_page(request: Request, session: AsyncSession = Depends(
                 "secondary_peer_endpoint": status.get("wg_secondary_peer_endpoint"),
             }
         )
+    swim_state_counts = {"healthy": 0, "degraded": 0, "dead": 0, "unknown": 0}
+    swim_rows: list[dict[str, Any]] = []
+    known_node_ids = {node.id for node in nodes}
+    for node in nodes:
+        member = swim_members.get(node.id, {})
+        if not isinstance(member, dict):
+            member = {}
+        member_state = str(
+            member.get("state")
+            or (node.status or {}).get("swim_state")
+            or "unknown"
+        ).strip().lower()
+        if member_state not in swim_state_counts:
+            member_state = "unknown"
+        swim_state_counts[member_state] += 1
+        member_peers = member.get("peers") if isinstance(member.get("peers"), dict) else {}
+        suspect_count = 0
+        dead_count = 0
+        for peer_payload in member_peers.values():
+            if not isinstance(peer_payload, dict):
+                continue
+            peer_state = str(peer_payload.get("state") or "unknown").strip().lower()
+            if peer_state in {"degraded", "suspect"}:
+                suspect_count += 1
+            elif peer_state == "dead":
+                dead_count += 1
+        member_flags = member.get("flags") if isinstance(member.get("flags"), dict) else {}
+        interesting_flags = []
+        for key in sorted(member_flags.keys()):
+            if len(interesting_flags) >= 4:
+                break
+            interesting_flags.append(f"{key}={_format_value(member_flags.get(key))}")
+        swim_rows.append(
+            {
+                "node_id": node.id,
+                "state": member_state,
+                "incarnation": int(member.get("incarnation") or 0),
+                "updated_at": str(member.get("updated_at") or ""),
+                "peer_count": len(member_peers),
+                "suspect_peers": suspect_count,
+                "dead_peers": dead_count,
+                "flags_preview": " | ".join(interesting_flags) if interesting_flags else "-",
+            }
+        )
+    for node_id, member in swim_members.items():
+        if node_id in known_node_ids or not isinstance(member, dict):
+            continue
+        member_state = str(member.get("state") or "unknown").strip().lower()
+        if member_state not in swim_state_counts:
+            member_state = "unknown"
+        swim_state_counts[member_state] += 1
+        member_peers = member.get("peers") if isinstance(member.get("peers"), dict) else {}
+        swim_rows.append(
+            {
+                "node_id": node_id,
+                "state": member_state,
+                "incarnation": int(member.get("incarnation") or 0),
+                "updated_at": str(member.get("updated_at") or ""),
+                "peer_count": len(member_peers),
+                "suspect_peers": 0,
+                "dead_peers": 0,
+                "flags_preview": "-",
+            }
+        )
+    swim_rows.sort(key=lambda row: row["node_id"])
+    swim_peer_total = sum(int(row["peer_count"]) for row in swim_rows)
 
     records = await discovery_service.list_discovery_services(
         session,
@@ -842,6 +1274,64 @@ async def infrastructure_page(request: Request, session: AsyncSession = Depends(
     alertmanager_targets = split_csv(settings_map.get("monitoring_alertmanager_targets", ""))
     content = await cluster_service.get_active_content(session)
     cdn_seeded_at = settings_map.get("internal_cdn_seeded_at", "")
+    etcd_context: dict[str, Any] = {
+        "enabled": settings.etcd_enabled,
+        "configured": bool(settings.etcd_endpoints.strip()),
+        "error": "",
+        "members": [],
+        "member_count": 0,
+        "endpoint_health_rows": [],
+        "endpoint_status_rows": [],
+        "endpoint_count": 0,
+        "healthy_endpoint_count": 0,
+        "quorum_required": 0,
+        "has_quorum": False,
+        "leader_endpoint_count": 0,
+        "alarm_rows": [],
+    }
+    if etcd_context["enabled"] and etcd_context["configured"]:
+        try:
+            member_rows = await etcd_service.member_list()
+            health_rows = await etcd_service.endpoint_health()
+            status_rows = await etcd_service.endpoint_status()
+            alarm_rows = await etcd_service.alarm_list()
+            etcd_context["members"] = member_rows
+            etcd_context["member_count"] = len(member_rows)
+            etcd_context["endpoint_health_rows"] = health_rows
+            status_by_endpoint = {
+                str(item.endpoint): item for item in health_rows if isinstance(item.endpoint, str)
+            }
+            display_rows: list[dict[str, Any]] = []
+            for item in status_rows:
+                endpoint = str(item.get("endpoint") or "")
+                health = status_by_endpoint.get(endpoint)
+                db_size = _safe_int(item.get("db_size"), default=0)
+                display_rows.append(
+                    {
+                        **item,
+                        "healthy": bool(health.healthy) if health else bool(item.get("healthy")),
+                        "error": (health.error if health else str(item.get("error") or "")),
+                        "took_seconds": (health.took_seconds if health else 0.0),
+                        "db_size_text": _format_bytes(db_size),
+                        "revision_text": f"{_safe_int(item.get('revision'), default=0):,}",
+                        "raft_term_text": f"{_safe_int(item.get('raft_term'), default=0):,}",
+                        "raft_index_text": f"{_safe_int(item.get('raft_index'), default=0):,}",
+                    }
+                )
+            etcd_context["endpoint_status_rows"] = display_rows
+            etcd_context["endpoint_count"] = len(health_rows)
+            etcd_context["healthy_endpoint_count"] = sum(
+                1 for item in health_rows if item.healthy
+            )
+            quorum_required = (max(etcd_context["member_count"], 1) // 2) + 1
+            etcd_context["quorum_required"] = quorum_required
+            etcd_context["has_quorum"] = etcd_context["healthy_endpoint_count"] >= quorum_required
+            etcd_context["leader_endpoint_count"] = sum(
+                1 for item in status_rows if bool(item.get("is_leader"))
+            )
+            etcd_context["alarm_rows"] = alarm_rows
+        except Exception as exc:  # noqa: BLE001
+            etcd_context["error"] = f"{type(exc).__name__}: {exc}"
 
     context = {
         "request": request,
@@ -899,6 +1389,10 @@ async def infrastructure_page(request: Request, session: AsyncSession = Depends(
         "cdn_hash_sha256": str(content.get("hash_sha256") or ""),
         "cdn_size_bytes": _safe_int(content.get("size_bytes"), default=0),
         "cdn_seeded_at": cdn_seeded_at,
+        "etcd_runtime": etcd_context,
+        "swim_rows": swim_rows,
+        "swim_peer_total": swim_peer_total,
+        "swim_state_counts": swim_state_counts,
     }
     context.update(await _base_context(request, session))
     return templates.TemplateResponse("infrastructure.html", context)
@@ -929,31 +1423,137 @@ async def support_page() -> Any:
     return RedirectResponse(url="/ui/settings?section=support", status_code=status.HTTP_303_SEE_OTHER)
 
 
-@router.get("/settings")
-async def settings_page(request: Request, session: AsyncSession = Depends(get_db_session)) -> Any:
-    password_updated = request.query_params.get("password_updated") == "1"
-    repo_updated = request.query_params.get("repo_updated") == "1"
-    active_section = (request.query_params.get("section") or "auth").strip().lower()
-    if active_section not in {"auth", "support"}:
-        active_section = "auth"
+async def _build_settings_context(
+    request: Request,
+    session: AsyncSession,
+    *,
+    active_section: str,
+    password_success: str = "",
+    password_error: str = "",
+    repo_success: str = "",
+    repo_error: str = "",
+    routing_success: str = "",
+    routing_error: str = "",
+    provider_success: str = "",
+    provider_error: str = "",
+    github_repo_url_override: str | None = None,
+) -> dict[str, Any]:
     settings_map = await cluster_settings.get_settings_map(session)
-    snapshots = await snapshot_service.list_snapshots(session)
-    bundles = await support_bundle_service.list_support_bundles(session)
+    username = await auth_service.get_username(session)
+    applications, domain_routes = await applications_service.ensure_catalog_defaults(session)
+    domain_bindings = applications_service.build_domain_bindings(
+        applications=applications,
+        domain_routes=domain_routes,
+    )
+    services = await service_service.list_services(session, limit=2000)
+    service_options = [
+        {"id": str(service.id), "name": str(service.name)}
+        for service in sorted(services, key=lambda item: str(item.name).lower())
+    ]
+    ingress_target = str(settings_map.get("domain_ingress_target", "")).strip()
+    dns_record_rows = []
+    for binding in domain_bindings:
+        domain = str(binding.get("domain") or "").strip().lower()
+        if not domain:
+            continue
+        suggestion = _dns_record_suggestion(domain, ingress_target)
+        dns_record_rows.append(
+            {
+                "domain": domain,
+                "application_id": str(binding.get("application_id") or ""),
+                "application_name": str(binding.get("application_name") or "-"),
+                "application_target_service_id": str(
+                    binding.get("application_target_service_id") or ""
+                ),
+                "route_enabled": bool(binding.get("route_enabled", False)),
+                "application_enabled": bool(binding.get("application_enabled", False)),
+                "routing_ready": bool(binding.get("routing_ready", False)),
+                "record_type": suggestion["record_type"],
+                "record_value": suggestion["record_value"],
+                "instructions": suggestion["instructions"],
+            }
+        )
+    dns_record_rows.sort(key=lambda row: row["domain"])
+
+    snapshots: list[Any] = []
+    bundles: list[Any] = []
+    if active_section == "support":
+        snapshots = await snapshot_service.list_snapshots(session)
+        bundles = await support_bundle_service.list_support_bundles(session)
+
+    provider_secret_keys = [
+        "provider_openai_api_key",
+        "provider_cloudflare_api_token",
+        "provider_hetzner_api_token",
+        "provider_scaleway_api_token",
+        "provider_online_api_token",
+    ]
+    provider_configured = {
+        key: bool(str(settings_map.get(key, "")).strip()) for key in provider_secret_keys
+    }
+
     context = {
         "request": request,
         "title": "Settings",
-        "subtitle": "Authentication, preferences, snapshots, and support bundles",
+        "subtitle": "Authentication, routing, provider integrations, and support tools",
         "settings_section": active_section,
-        "username": await auth_service.get_username(session),
-        "password_success": "Password updated successfully." if password_updated else "",
-        "password_error": "",
-        "repo_success": "Repository URL updated successfully." if repo_updated else "",
-        "repo_error": "",
-        "github_repo_url": settings_map.get("github_repo_url", "https://github.com/Dinkum/uptime-mesh"),
+        "username": username,
+        "password_success": password_success,
+        "password_error": password_error,
+        "repo_success": repo_success,
+        "repo_error": repo_error,
+        "routing_success": routing_success,
+        "routing_error": routing_error,
+        "provider_success": provider_success,
+        "provider_error": provider_error,
+        "github_repo_url": (
+            github_repo_url_override
+            if github_repo_url_override is not None
+            else settings_map.get("github_repo_url", "https://github.com/Dinkum/uptime-mesh")
+        ),
+        "applications": applications,
+        "domain_routes": domain_routes,
+        "domain_bindings": domain_bindings,
+        "service_options": service_options,
+        "domain_ingress_target": ingress_target,
+        "dns_record_rows": dns_record_rows,
+        "provider_configured": provider_configured,
+        "provider_cloudflare_zone_id": settings_map.get("provider_cloudflare_zone_id", ""),
         "snapshots": snapshots,
         "bundles": bundles,
     }
     context.update(await _base_context(request, session))
+    return context
+
+
+@router.get("/settings")
+async def settings_page(request: Request, session: AsyncSession = Depends(get_db_session)) -> Any:
+    password_updated = request.query_params.get("password_updated") == "1"
+    repo_updated = request.query_params.get("repo_updated") == "1"
+    application_updated = request.query_params.get("application_updated") == "1"
+    domain_updated = request.query_params.get("domain_updated") == "1"
+    domain_deleted = request.query_params.get("domain_deleted") == "1"
+    provider_updated = request.query_params.get("provider_updated") == "1"
+    active_section = (request.query_params.get("section") or "auth").strip().lower()
+    if active_section not in {"auth", "routing", "providers", "support"}:
+        active_section = "auth"
+    routing_messages: list[str] = []
+    if application_updated:
+        routing_messages.append("Application saved.")
+    if domain_updated:
+        routing_messages.append("Domain route saved.")
+    if domain_deleted:
+        routing_messages.append("Domain route removed.")
+
+    context = await _build_settings_context(
+        request,
+        session,
+        active_section=active_section,
+        password_success="Password updated successfully." if password_updated else "",
+        repo_success="Repository URL updated successfully." if repo_updated else "",
+        routing_success=" ".join(routing_messages),
+        provider_success="Provider settings updated." if provider_updated else "",
+    )
     return templates.TemplateResponse("settings.html", context)
 
 
@@ -965,12 +1565,7 @@ async def change_password(
     new_password: str = Form(default=""),
     confirm_password: str = Form(default=""),
 ) -> Any:
-    username = await auth_service.get_username(session)
-    settings_map = await cluster_settings.get_settings_map(session)
-    snapshots = await snapshot_service.list_snapshots(session)
-    bundles = await support_bundle_service.list_support_bundles(session)
     error = ""
-    success = ""
     status_code = status.HTTP_200_OK
 
     if not current_password or not new_password or not confirm_password:
@@ -991,7 +1586,6 @@ async def change_password(
             new_password=new_password,
         )
         if changed:
-            success = "Password updated successfully."
             session_token = create_session_token(
                 username=auth_user,
                 secret_key=settings.auth_secret_key,
@@ -1015,23 +1609,15 @@ async def change_password(
         status_code = status.HTTP_400_BAD_REQUEST
 
     context = {
-        "request": request,
-        "title": "Settings",
-        "subtitle": "Authentication, preferences, snapshots, and support bundles",
-        "settings_section": "auth",
-        "username": username,
-        "password_success": success,
-        "password_error": error,
-        "repo_success": "",
-        "repo_error": "",
-        "github_repo_url": settings_map.get(
-            "github_repo_url",
-            "https://github.com/Dinkum/uptime-mesh",
+        **(
+            await _build_settings_context(
+                request,
+                session,
+                active_section="auth",
+                password_error=error,
+            )
         ),
-        "snapshots": snapshots,
-        "bundles": bundles,
     }
-    context.update(await _base_context(request, session))
     return templates.TemplateResponse("settings.html", context, status_code=status_code)
 
 
@@ -1043,7 +1629,6 @@ async def update_repo_url(
 ) -> Any:
     clean_url = github_repo_url.strip()
     error = ""
-    success = ""
     status_code = status.HTTP_200_OK
     if not clean_url:
         error = "Repository URL is required."
@@ -1053,23 +1638,147 @@ async def update_repo_url(
         status_code = status.HTTP_400_BAD_REQUEST
     else:
         await cluster_settings.set_setting(session, "github_repo_url", clean_url)
-        success = "Repository URL updated successfully."
         response = RedirectResponse(url="/ui/settings?repo_updated=1", status_code=status.HTTP_303_SEE_OTHER)
         return response
 
-    context = {
-        "request": request,
-        "title": "Settings",
-        "subtitle": "Authentication, preferences, snapshots, and support bundles",
-        "settings_section": "auth",
-        "username": await auth_service.get_username(session),
-        "password_success": "",
-        "password_error": "",
-        "repo_success": success,
-        "repo_error": error,
-        "github_repo_url": clean_url or "https://github.com/Dinkum/uptime-mesh",
-        "snapshots": await snapshot_service.list_snapshots(session),
-        "bundles": await support_bundle_service.list_support_bundles(session),
-    }
-    context.update(await _base_context(request, session))
+    context = await _build_settings_context(
+        request,
+        session,
+        active_section="auth",
+        repo_error=error,
+        github_repo_url_override=clean_url or "https://github.com/Dinkum/uptime-mesh",
+    )
     return templates.TemplateResponse("settings.html", context, status_code=status_code)
+
+
+@router.post("/settings/routing/application")
+async def upsert_application(
+    request: Request,
+    session: AsyncSession = Depends(get_db_session),
+    app_id: str = Form(default=""),
+    name: str = Form(default=""),
+    description: str = Form(default=""),
+    target_service_id: str = Form(default=""),
+    default_path: str = Form(default="/"),
+    enabled: str = Form(default="off"),
+) -> Any:
+    ok, message = await applications_service.upsert_application(
+        session,
+        app_id=app_id,
+        name=name,
+        description=description,
+        target_service_id=target_service_id,
+        default_path=default_path,
+        enabled=_as_form_bool(enabled),
+    )
+    if ok:
+        return RedirectResponse(
+            url="/ui/settings?section=routing&application_updated=1",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    context = await _build_settings_context(
+        request,
+        session,
+        active_section="routing",
+        routing_error=message or "Failed to save application.",
+    )
+    return templates.TemplateResponse("settings.html", context, status_code=status.HTTP_400_BAD_REQUEST)
+
+
+@router.post("/settings/routing/domain")
+async def upsert_domain_route(
+    request: Request,
+    session: AsyncSession = Depends(get_db_session),
+    route_id: str = Form(default=""),
+    domain: str = Form(default=""),
+    application_id: str = Form(default=""),
+    path: str = Form(default="/"),
+    enabled: str = Form(default="off"),
+) -> Any:
+    ok, message = await applications_service.upsert_domain_route(
+        session,
+        route_id=route_id,
+        domain=domain,
+        application_id=application_id,
+        path=path,
+        enabled=_as_form_bool(enabled),
+    )
+    if ok:
+        return RedirectResponse(
+            url="/ui/settings?section=routing&domain_updated=1",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    context = await _build_settings_context(
+        request,
+        session,
+        active_section="routing",
+        routing_error=message or "Failed to save domain route.",
+    )
+    return templates.TemplateResponse("settings.html", context, status_code=status.HTTP_400_BAD_REQUEST)
+
+
+@router.post("/settings/routing/domain/delete")
+async def delete_domain_route(
+    request: Request,
+    session: AsyncSession = Depends(get_db_session),
+    route_id: str = Form(default=""),
+) -> Any:
+    clean_route_id = route_id.strip()
+    if not clean_route_id:
+        context = await _build_settings_context(
+            request,
+            session,
+            active_section="routing",
+            routing_error="Domain route id is required.",
+        )
+        return templates.TemplateResponse(
+            "settings.html",
+            context,
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+    deleted = await applications_service.delete_domain_route(session, route_id=clean_route_id)
+    if deleted:
+        return RedirectResponse(
+            url="/ui/settings?section=routing&domain_deleted=1",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    context = await _build_settings_context(
+        request,
+        session,
+        active_section="routing",
+        routing_error="Domain route was not found.",
+    )
+    return templates.TemplateResponse("settings.html", context, status_code=status.HTTP_404_NOT_FOUND)
+
+
+@router.post("/settings/providers")
+async def update_provider_settings(
+    request: Request,
+    session: AsyncSession = Depends(get_db_session),
+    provider_openai_api_key: str = Form(default=""),
+    provider_cloudflare_api_token: str = Form(default=""),
+    provider_cloudflare_zone_id: str = Form(default=""),
+    provider_hetzner_api_token: str = Form(default=""),
+    provider_scaleway_api_token: str = Form(default=""),
+    provider_online_api_token: str = Form(default=""),
+    domain_ingress_target: str = Form(default=""),
+) -> Any:
+    updates: dict[str, str] = {
+        "provider_cloudflare_zone_id": provider_cloudflare_zone_id.strip(),
+        "domain_ingress_target": domain_ingress_target.strip(),
+    }
+    token_values = {
+        "provider_openai_api_key": provider_openai_api_key.strip(),
+        "provider_cloudflare_api_token": provider_cloudflare_api_token.strip(),
+        "provider_hetzner_api_token": provider_hetzner_api_token.strip(),
+        "provider_scaleway_api_token": provider_scaleway_api_token.strip(),
+        "provider_online_api_token": provider_online_api_token.strip(),
+    }
+    for key, value in token_values.items():
+        if value:
+            updates[key] = value
+    await cluster_settings.upsert_settings(session, updates, sync_file=True)
+    return RedirectResponse(
+        url="/ui/settings?section=providers&provider_updated=1",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )

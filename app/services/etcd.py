@@ -192,6 +192,82 @@ async def endpoint_health() -> list[EtcdHealth]:
     return rows
 
 
+def _coerce_int(value: object, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return default
+        try:
+            return int(raw, 0)
+        except Exception:  # noqa: BLE001
+            return default
+    return default
+
+
+async def endpoint_status() -> list[dict[str, object]]:
+    out = await _run_checked(
+        args=("endpoint", "status", "-w", "json"),
+        action="endpoint.status",
+        timeout_seconds=20,
+    )
+    parsed = _parse_json_payload(out)
+    rows: list[dict[str, object]] = []
+    if not isinstance(parsed, list):
+        return rows
+    health_by_endpoint = {item.endpoint: item for item in await endpoint_health()}
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        endpoint = str(item.get("Endpoint") or "")
+        status = item.get("Status") if isinstance(item.get("Status"), dict) else {}
+        leader = _coerce_int(status.get("leader"), default=0)
+        header = status.get("header") if isinstance(status.get("header"), dict) else {}
+        health_row = health_by_endpoint.get(endpoint)
+        rows.append(
+            {
+                "endpoint": endpoint,
+                "member_id": str(status.get("header", {}).get("member_id") or ""),
+                "healthy": bool(health_row.healthy) if health_row else False,
+                "error": health_row.error if health_row else "",
+                "is_leader": leader != 0 and _coerce_int(status.get("header", {}).get("member_id"), default=0) == leader,
+                "db_size": _coerce_int(status.get("dbSize"), default=0),
+                "revision": _coerce_int(header.get("revision"), default=0),
+                "raft_term": _coerce_int(status.get("raftTerm"), default=0),
+                "raft_index": _coerce_int(status.get("raftIndex"), default=0),
+            }
+        )
+    return rows
+
+
+async def alarm_list() -> list[dict[str, str]]:
+    out = await _run_checked(
+        args=("alarm", "list", "-w", "json"),
+        action="alarm.list",
+        timeout_seconds=15,
+    )
+    parsed = _parse_json_payload(out)
+    alarms: list[dict[str, str]] = []
+    if isinstance(parsed, dict):
+        raw = parsed.get("alarms")
+        if isinstance(raw, list):
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                alarms.append(
+                    {
+                        "member_id": str(item.get("memberID") or item.get("memberId") or ""),
+                        "alarm": str(item.get("alarm") or "unknown"),
+                    }
+                )
+    return alarms
+
+
 async def member_list() -> list[EtcdMember]:
     out = await _run_checked(
         args=("member", "list", "-w", "json"),

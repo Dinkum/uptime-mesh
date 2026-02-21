@@ -24,13 +24,18 @@
     </div>
   </section>
 
-  <div class="flex flex-wrap gap-3 mb-6">
-    <a class="btn btn-sm {% if infra_subtab == 'wireguard' %}btn-primary{% else %}btn-outline{% endif %}" href="{{ ui_prefix }}/infrastructure?tab=wireguard">WireGuard</a>
-    <a class="btn btn-sm {% if infra_subtab == 'discovery' %}btn-primary{% else %}btn-outline{% endif %}" href="{{ ui_prefix }}/infrastructure?tab=discovery">Discovery</a>
-    <a class="btn btn-sm {% if infra_subtab == 'gateway' %}btn-primary{% else %}btn-outline{% endif %}" href="{{ ui_prefix }}/infrastructure?tab=gateway">Gateway</a>
-    <a class="btn btn-sm {% if infra_subtab == 'monitoring' %}btn-primary{% else %}btn-outline{% endif %}" href="{{ ui_prefix }}/infrastructure?tab=monitoring">Monitoring</a>
-    <a class="btn btn-sm {% if infra_subtab == 'cdn' %}btn-primary{% else %}btn-outline{% endif %}" href="{{ ui_prefix }}/infrastructure?tab=cdn">CDN</a>
-  </div>
+  <section class="mesh-subtabs-shell mb-6" aria-label="Infrastructure sections">
+    <p class="mesh-subtabs-label">Infrastructure Sections</p>
+    <nav class="mesh-subtabs">
+      <a class="mesh-subtab{% if infra_subtab == 'wireguard' %} active{% endif %}" href="{{ ui_prefix }}/infrastructure?tab=wireguard">WireGuard</a>
+      <a class="mesh-subtab{% if infra_subtab == 'etcd' %} active{% endif %}" href="{{ ui_prefix }}/infrastructure?tab=etcd">Control Plane</a>
+      <a class="mesh-subtab{% if infra_subtab == 'swim' %} active{% endif %}" href="{{ ui_prefix }}/infrastructure?tab=swim">Membership</a>
+      <a class="mesh-subtab{% if infra_subtab == 'discovery' %} active{% endif %}" href="{{ ui_prefix }}/infrastructure?tab=discovery">Discovery</a>
+      <a class="mesh-subtab{% if infra_subtab == 'gateway' %} active{% endif %}" href="{{ ui_prefix }}/infrastructure?tab=gateway">Gateway</a>
+      <a class="mesh-subtab{% if infra_subtab == 'monitoring' %} active{% endif %}" href="{{ ui_prefix }}/infrastructure?tab=monitoring">Monitoring</a>
+      <a class="mesh-subtab{% if infra_subtab == 'cdn' %} active{% endif %}" href="{{ ui_prefix }}/infrastructure?tab=cdn">CDN</a>
+    </nav>
+  </section>
 
   {% if infra_subtab == "wireguard" %}
     <section class="mesh-card rounded-2xl p-6">
@@ -72,6 +77,215 @@
           </tbody>
         </table>
       </div>
+    </section>
+
+  {% elif infra_subtab == "etcd" %}
+    <section class="grid gap-4">
+      <article class="mesh-card rounded-2xl p-6">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <h2 class="text-lg font-semibold">Control Plane Health (etcd)</h2>
+          {% if not etcd_runtime.enabled %}
+            <span class="badge badge-outline mono">disabled</span>
+          {% elif not etcd_runtime.configured %}
+            <span class="badge badge-outline mono">unconfigured</span>
+          {% elif etcd_runtime.has_quorum %}
+            <span class="badge badge-success badge-outline mono">quorum ok</span>
+          {% else %}
+            <span class="badge badge-warning badge-outline mono">quorum at risk</span>
+          {% endif %}
+        </div>
+        {% if etcd_runtime.error %}
+          <div class="alert alert-warning text-sm mt-4">
+            <span class="mono">{{ etcd_runtime.error }}</span>
+          </div>
+        {% endif %}
+        <div class="grid grid-cols-2 md:grid-cols-6 gap-3 mt-4 text-sm">
+          <div class="rounded-xl border border-slate-700/40 p-3">
+            <p class="text-slate-500">Members</p>
+            <p class="mono mt-1">{{ etcd_runtime.member_count }}</p>
+          </div>
+          <div class="rounded-xl border border-slate-700/40 p-3">
+            <p class="text-slate-500">Endpoints</p>
+            <p class="mono mt-1">{{ etcd_runtime.endpoint_count }}</p>
+          </div>
+          <div class="rounded-xl border border-slate-700/40 p-3">
+            <p class="text-slate-500">Healthy Endpoints</p>
+            <p class="mono mt-1">{{ etcd_runtime.healthy_endpoint_count }}</p>
+          </div>
+          <div class="rounded-xl border border-slate-700/40 p-3">
+            <p class="text-slate-500">Quorum Required</p>
+            <p class="mono mt-1">{{ etcd_runtime.quorum_required }}</p>
+          </div>
+          <div class="rounded-xl border border-slate-700/40 p-3">
+            <p class="text-slate-500">Leader Endpoints</p>
+            <p class="mono mt-1">{{ etcd_runtime.leader_endpoint_count }}</p>
+          </div>
+          <div class="rounded-xl border border-slate-700/40 p-3">
+            <p class="text-slate-500">Alarms</p>
+            <p class="mono mt-1">{{ etcd_runtime.alarm_rows|length }}</p>
+          </div>
+        </div>
+      </article>
+
+      <article class="mesh-card rounded-2xl p-6">
+        <h3 class="text-base font-semibold">Members</h3>
+        <div class="overflow-x-auto mt-3">
+          <table class="table w-full">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Member ID</th>
+                <th>Peer URLs</th>
+                <th>Client URLs</th>
+                <th>Learner</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for member in etcd_runtime.members %}
+                <tr>
+                  <td class="mono text-xs">{{ member.name or "-" }}</td>
+                  <td class="mono text-xs">{{ member.member_id }}</td>
+                  <td class="mono text-xs">{{ member.peer_urls | join(", ") if member.peer_urls else "-" }}</td>
+                  <td class="mono text-xs">{{ member.client_urls | join(", ") if member.client_urls else "-" }}</td>
+                  <td>{{ "yes" if member.is_learner else "no" }}</td>
+                </tr>
+              {% else %}
+                <tr>
+                  <td colspan="5" class="text-slate-500">No etcd member data available.</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </article>
+
+      <article class="mesh-card rounded-2xl p-6">
+        <h3 class="text-base font-semibold">Endpoint Status</h3>
+        <div class="overflow-x-auto mt-3">
+          <table class="table w-full">
+            <thead>
+              <tr>
+                <th>Endpoint</th>
+                <th>Health</th>
+                <th>Leader</th>
+                <th>DB Size</th>
+                <th>Revision</th>
+                <th>Raft Term</th>
+                <th>Raft Index</th>
+                <th>Error</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in etcd_runtime.endpoint_status_rows %}
+                <tr>
+                  <td class="mono text-xs">{{ row.endpoint }}</td>
+                  <td>
+                    {% if row.healthy %}
+                      <span class="badge badge-success badge-outline">healthy</span>
+                    {% else %}
+                      <span class="badge badge-error badge-outline">unhealthy</span>
+                    {% endif %}
+                  </td>
+                  <td>{{ "yes" if row.is_leader else "no" }}</td>
+                  <td class="mono text-xs">{{ row.db_size_text }}</td>
+                  <td class="mono text-xs">{{ row.revision_text }}</td>
+                  <td class="mono text-xs">{{ row.raft_term_text }}</td>
+                  <td class="mono text-xs">{{ row.raft_index_text }}</td>
+                  <td class="mono text-xs">{{ row.error or "-" }}</td>
+                </tr>
+              {% else %}
+                <tr>
+                  <td colspan="8" class="text-slate-500">No endpoint status rows available.</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </article>
+
+      <article class="mesh-card rounded-2xl p-6">
+        <h3 class="text-base font-semibold">Active Alarms</h3>
+        <div class="mt-3 space-y-2">
+          {% for alarm in etcd_runtime.alarm_rows %}
+            <div class="rounded-lg border border-slate-700/40 p-3 flex flex-wrap items-center justify-between gap-2">
+              <span class="mono text-xs">member {{ alarm.member_id }}</span>
+              <span class="badge badge-warning badge-outline">{{ alarm.alarm }}</span>
+            </div>
+          {% else %}
+            <p class="text-sm text-slate-500">No active etcd alarms.</p>
+          {% endfor %}
+        </div>
+      </article>
+    </section>
+
+  {% elif infra_subtab == "swim" %}
+    <section class="grid gap-4">
+      <article class="mesh-card rounded-2xl p-6">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <h2 class="text-lg font-semibold">Node Membership Health (SWIM)</h2>
+          <span class="text-xs text-slate-500">Live peer membership, suspect/dead tracking, and gossip state</span>
+        </div>
+        <div class="grid grid-cols-2 md:grid-cols-5 gap-3 mt-4 text-sm">
+          <div class="rounded-xl border border-slate-700/40 p-3">
+            <p class="text-slate-500">Members</p>
+            <p class="mono mt-1">{{ swim_rows|length }}</p>
+          </div>
+          <div class="rounded-xl border border-slate-700/40 p-3">
+            <p class="text-slate-500">Healthy</p>
+            <p class="mono mt-1">{{ swim_state_counts.healthy }}</p>
+          </div>
+          <div class="rounded-xl border border-slate-700/40 p-3">
+            <p class="text-slate-500">Degraded</p>
+            <p class="mono mt-1">{{ swim_state_counts.degraded }}</p>
+          </div>
+          <div class="rounded-xl border border-slate-700/40 p-3">
+            <p class="text-slate-500">Dead</p>
+            <p class="mono mt-1">{{ swim_state_counts.dead }}</p>
+          </div>
+          <div class="rounded-xl border border-slate-700/40 p-3">
+            <p class="text-slate-500">Peers Observed</p>
+            <p class="mono mt-1">{{ swim_peer_total }}</p>
+          </div>
+        </div>
+      </article>
+
+      <article class="mesh-card rounded-2xl p-6">
+        <h3 class="text-base font-semibold">Membership Table</h3>
+        <div class="overflow-x-auto mt-3">
+          <table class="table w-full">
+            <thead>
+              <tr>
+                <th>Node</th>
+                <th>State</th>
+                <th>Incarnation</th>
+                <th>Peers</th>
+                <th>Suspect Peers</th>
+                <th>Dead Peers</th>
+                <th>Updated</th>
+                <th>Flags</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in swim_rows %}
+                <tr>
+                  <td class="mono text-xs">{{ row.node_id }}</td>
+                  <td class="mono text-xs">{{ row.state }}</td>
+                  <td class="mono text-xs">{{ row.incarnation }}</td>
+                  <td class="mono text-xs">{{ row.peer_count }}</td>
+                  <td class="mono text-xs">{{ row.suspect_peers }}</td>
+                  <td class="mono text-xs">{{ row.dead_peers }}</td>
+                  <td class="mono text-xs">{{ row.updated_at or "-" }}</td>
+                  <td class="mono text-xs break-all">{{ row.flags_preview }}</td>
+                </tr>
+              {% else %}
+                <tr>
+                  <td colspan="8" class="text-slate-500">No SWIM member records available.</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </article>
     </section>
 
   {% elif infra_subtab == "discovery" %}

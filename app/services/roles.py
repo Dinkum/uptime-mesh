@@ -23,6 +23,7 @@ SWIM_MEMBERSHIP_KEY = "swim_membership_json"
 DEFAULT_ROLE_SPECS: dict[str, dict[str, object]] = {
     "backend_server": {
         "kind": "replicated",
+        "enabled": True,
         "min_replicas": 1,
         "max_replicas": 0,
         "ratio": 0.5,
@@ -34,6 +35,7 @@ DEFAULT_ROLE_SPECS: dict[str, dict[str, object]] = {
     },
     "reverse_proxy": {
         "kind": "replicated",
+        "enabled": True,
         "min_replicas": 1,
         "max_replicas": 0,
         "ratio": 0.5,
@@ -43,12 +45,25 @@ DEFAULT_ROLE_SPECS: dict[str, dict[str, object]] = {
         "slot_count": 0,
         "runtime_template": "caddy_reverse_proxy",
     },
+    "dns_server": {
+        "kind": "replicated",
+        "enabled": False,
+        "min_replicas": 0,
+        "max_replicas": 2,
+        "ratio": 0.0,
+        "priority": 70,
+        "strict_separation_with": [],
+        "cooldown_seconds": 30,
+        "slot_count": 0,
+        "runtime_template": "unbound_dns",
+    },
 }
 
 
 @dataclass(frozen=True)
 class RolePlanRow:
     name: str
+    enabled: bool
     desired: int
     assigned: int
     deficit: int
@@ -86,6 +101,20 @@ def _to_float(raw: object, default: float = 0.0) -> float:
         return default
 
 
+def _to_bool(raw: object, default: bool = True) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    if isinstance(raw, str):
+        value = raw.strip().lower()
+        if value in {"1", "true", "yes", "on"}:
+            return True
+        if value in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -105,6 +134,7 @@ def _normalize_role_spec(name: str, payload: dict[str, object]) -> dict[str, obj
     if kind not in {"replicated", "scalable"}:
         kind = "replicated"
 
+    enabled = _to_bool(payload.get("enabled"), default=True)
     min_replicas = max(_to_int(payload.get("min_replicas"), 1), 0)
     max_replicas = max(_to_int(payload.get("max_replicas"), 0), 0)
     ratio = min(max(_to_float(payload.get("ratio"), 0.5), 0.0), 1.0)
@@ -122,6 +152,7 @@ def _normalize_role_spec(name: str, payload: dict[str, object]) -> dict[str, obj
 
     return {
         "kind": kind,
+        "enabled": enabled,
         "min_replicas": min_replicas,
         "max_replicas": max_replicas,
         "ratio": ratio,
@@ -283,6 +314,7 @@ def _serialize_placement(
         "roles": [
             {
                 "name": row.name,
+                "enabled": row.enabled,
                 "desired": row.desired,
                 "assigned": row.assigned,
                 "deficit": row.deficit,
@@ -333,15 +365,24 @@ async def reconcile_placement(
         warnings: list[str] = []
 
         for role_name, spec in role_order:
+            enabled = _to_bool(spec.get("enabled"), default=True)
             ratio = _to_float(spec.get("ratio"), 0.5)
             min_replicas = max(_to_int(spec.get("min_replicas"), 1), 0)
             max_replicas = max(_to_int(spec.get("max_replicas"), 0), 0)
-            desired = _clamp_desired(
-                healthy_nodes=len(healthy_nodes),
-                ratio=ratio,
-                min_replicas=min_replicas,
-                max_replicas=max_replicas,
-            )
+            desired = 0
+            if enabled:
+                if role_name == "dns_server":
+                    # Stock DNS role is either disabled (0) or a resilient pair (2).
+                    desired = 2 if len(healthy_nodes) >= 2 else 0
+                    if len(healthy_nodes) < 2:
+                        warnings.append("role dns_server enabled but requires at least 2 healthy nodes")
+                else:
+                    desired = _clamp_desired(
+                        healthy_nodes=len(healthy_nodes),
+                        ratio=ratio,
+                        min_replicas=min_replicas,
+                        max_replicas=max_replicas,
+                    )
 
             incumbents = [item for item in previous_map.get(role_name, []) if item in healthy_nodes]
             holders: list[str] = []
@@ -374,6 +415,7 @@ async def reconcile_placement(
 
             row = RolePlanRow(
                 name=role_name,
+                enabled=enabled,
                 desired=desired,
                 assigned=len(holders),
                 deficit=deficit,
@@ -388,6 +430,7 @@ async def reconcile_placement(
                 "role.assign",
                 role_name,
                 "Assigned role holders",
+                enabled=enabled,
                 desired=desired,
                 assigned=len(holders),
                 deficit=deficit,

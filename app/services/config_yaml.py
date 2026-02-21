@@ -84,7 +84,7 @@ _FIELDS: tuple[_ConfigField, ...] = (
     _ConfigField(
         section="ROLES",
         key="role_specs_json",
-        default='{"backend_server":{"kind":"replicated","min_replicas":1,"max_replicas":0,"ratio":0.5,"priority":100,"strict_separation_with":["reverse_proxy"],"cooldown_seconds":30,"slot_count":0,"runtime_template":"nginx_backend"},"reverse_proxy":{"kind":"replicated","min_replicas":1,"max_replicas":0,"ratio":0.5,"priority":80,"strict_separation_with":["backend_server"],"cooldown_seconds":30,"slot_count":0,"runtime_template":"caddy_reverse_proxy"}}',
+        default='{"backend_server":{"kind":"replicated","enabled":true,"min_replicas":1,"max_replicas":0,"ratio":0.5,"priority":100,"strict_separation_with":["reverse_proxy"],"cooldown_seconds":30,"slot_count":0,"runtime_template":"nginx_backend"},"reverse_proxy":{"kind":"replicated","enabled":true,"min_replicas":1,"max_replicas":0,"ratio":0.5,"priority":80,"strict_separation_with":["backend_server"],"cooldown_seconds":30,"slot_count":0,"runtime_template":"caddy_reverse_proxy"},"dns_server":{"kind":"replicated","enabled":false,"min_replicas":0,"max_replicas":2,"ratio":0.0,"priority":70,"strict_separation_with":[],"cooldown_seconds":30,"slot_count":0,"runtime_template":"unbound_dns"}}',
         description="Role specification registry for deterministic placement.",
         possible_values="JSON object map keyed by role name.",
     ),
@@ -94,6 +94,28 @@ _FIELDS: tuple[_ConfigField, ...] = (
         default="{}",
         description="Latest computed role placement snapshot.",
         possible_values="JSON object containing role holder assignments.",
+    ),
+    _ConfigField(
+        section="ROUTING",
+        key="applications_json",
+        default='[{"id":"hello-world","name":"Hello World","description":"Default bundled hello-world application.","target_service_id":"","default_path":"/","enabled":true}]',
+        description="Application catalog used for external domain routing.",
+        possible_values="JSON array of application objects.",
+    ),
+    _ConfigField(
+        section="ROUTING",
+        key="domain_routes_json",
+        default="[]",
+        description="Domain to application routing map for ingress.",
+        possible_values="JSON array of domain route objects.",
+    ),
+    _ConfigField(
+        section="ROUTING",
+        key="domain_ingress_target",
+        default="",
+        description="Public ingress target used for DNS record suggestions (IP or hostname).",
+        possible_values="IPv4/IPv6 address, hostname, or empty.",
+        import_from_yaml=True,
     ),
     _ConfigField(
         section="CONTENT",
@@ -153,10 +175,66 @@ _FIELDS: tuple[_ConfigField, ...] = (
         description="UTC timestamp of the latest password update.",
         possible_values="ISO-8601 UTC timestamp or empty string.",
     ),
+    _ConfigField(
+        section="PROVIDERS",
+        key="provider_openai_api_key",
+        default="",
+        description="OpenAI API key for Codex/OpenAPI-assisted error handling flows.",
+        possible_values="OpenAI API key string or empty.",
+        import_from_yaml=True,
+    ),
+    _ConfigField(
+        section="PROVIDERS",
+        key="provider_cloudflare_api_token",
+        default="",
+        description="Cloudflare API token used for managed DNS record updates.",
+        possible_values="Cloudflare API token string or empty.",
+        import_from_yaml=True,
+    ),
+    _ConfigField(
+        section="PROVIDERS",
+        key="provider_cloudflare_zone_id",
+        default="",
+        description="Cloudflare Zone ID used with managed DNS routes.",
+        possible_values="Cloudflare zone id string or empty.",
+        import_from_yaml=True,
+    ),
+    _ConfigField(
+        section="PROVIDERS",
+        key="provider_hetzner_api_token",
+        default="",
+        description="Hetzner Cloud API token for VPS automation hooks.",
+        possible_values="Hetzner API token string or empty.",
+        import_from_yaml=True,
+    ),
+    _ConfigField(
+        section="PROVIDERS",
+        key="provider_scaleway_api_token",
+        default="",
+        description="Scaleway/Online API token for VPS automation hooks.",
+        possible_values="Scaleway API token string or empty.",
+        import_from_yaml=True,
+    ),
+    _ConfigField(
+        section="PROVIDERS",
+        key="provider_online_api_token",
+        default="",
+        description="Online.net API token for legacy VPS automation hooks.",
+        possible_values="Online.net API token string or empty.",
+        import_from_yaml=True,
+    ),
 )
 
 _FIELD_KEYS = {item.key for item in _FIELDS}
-_SENSITIVE_KEYS = {"auth_secret_key", "cluster_signing_key"}
+_SENSITIVE_KEYS = {
+    "auth_secret_key",
+    "cluster_signing_key",
+    "provider_openai_api_key",
+    "provider_cloudflare_api_token",
+    "provider_hetzner_api_token",
+    "provider_scaleway_api_token",
+    "provider_online_api_token",
+}
 
 
 def _config_path() -> Path:

@@ -27,12 +27,13 @@ from uuid import uuid4
 router = APIRouter(prefix="/etcd", tags=["etcd"])
 
 
-def _is_worker_node(node: Node) -> bool:
+def _is_etcd_eligible_node(node: Node) -> bool:
     roles = node.roles if isinstance(node.roles, list) else []
-    normalized = {str(role).strip().lower() for role in roles}
-    if "gateway" in normalized and len(normalized) == 1:
-        return False
-    return bool(normalized)
+    normalized = {str(role).strip().lower() for role in roles if str(role).strip()}
+    if not normalized:
+        return True
+    # Legacy role labels are treated as auto/eligible to keep old nodes operable.
+    return bool(normalized & {"backend_server", "reverse_proxy", "auto", "worker", "gateway", "general", "node"})
 
 
 def _node_peer_url(node: Node) -> str:
@@ -163,7 +164,7 @@ async def etcd_quorum(
     configured = bool(endpoints)
     result = await session.execute(select(Node))
     nodes = list(result.scalars().all())
-    desired_member_ids = [node.id for node in nodes if _is_worker_node(node)]
+    desired_member_ids = [node.id for node in nodes if _is_etcd_eligible_node(node)]
 
     if not settings.etcd_enabled or not configured:
         return _build_quorum_payload(
@@ -207,7 +208,10 @@ async def reconcile_etcd_quorum(
 
     result = await session.execute(select(Node))
     nodes = list(result.scalars().all())
-    workers = sorted((node for node in nodes if _is_worker_node(node)), key=lambda item: item.id)
+    eligible_nodes = sorted(
+        (node for node in nodes if _is_etcd_eligible_node(node)),
+        key=lambda item: item.id,
+    )
 
     try:
         members = await etcd_service.member_list()
@@ -220,7 +224,7 @@ async def reconcile_etcd_quorum(
     skipped_count = 0
     failed_count = 0
 
-    for node in workers:
+    for node in eligible_nodes:
         existing = by_name.get(node.id)
         if existing is not None:
             candidates.append(
@@ -305,7 +309,7 @@ async def reconcile_etcd_quorum(
 
     return EtcdQuorumReconcileOut(
         dry_run=dry_run,
-        desired_member_count=len(workers),
+        desired_member_count=len(eligible_nodes),
         current_member_count=len(by_name),
         added_count=added_count,
         skipped_count=skipped_count,

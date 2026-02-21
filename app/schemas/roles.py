@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 class RoleSpecUpsert(BaseModel):
     kind: str = Field(default="replicated")
+    enabled: bool = Field(default=True)
     min_replicas: int = Field(default=1, ge=0)
     max_replicas: int = Field(default=0, ge=0)
     ratio: float = Field(default=0.5, ge=0.0, le=1.0)
@@ -23,6 +24,7 @@ class RoleSpecOut(RoleSpecUpsert):
 
 class RolePlacementRoleOut(BaseModel):
     name: str
+    enabled: bool = True
     desired: int
     assigned: int
     deficit: int

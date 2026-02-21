@@ -63,7 +63,7 @@ class Settings(BaseSettings):
     runtime_enable: bool = Field(default=False)
     runtime_node_id: str = Field(default="")
     runtime_node_name: str = Field(default="")
-    runtime_node_role: str = Field(default="worker")
+    runtime_node_role: str = Field(default="auto")
     runtime_api_base_url: str = Field(default="http://127.0.0.1:8000")
     runtime_identity_dir: str = Field(default="data/identities")
     runtime_heartbeat_interval_seconds: int = Field(default=15, ge=5, le=300)
