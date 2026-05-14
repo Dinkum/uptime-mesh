@@ -90,6 +90,7 @@ async def create_replica(session: AsyncSession, payload: ReplicaCreate) -> Repli
         )
         status = dict(payload.status or {})
 
+        spec: lxd_service.LXDContainerSpec | None = None
         if _settings.lxd_enabled:
             spec = lxd_service.build_container_spec(
                 service_name=service.name,
@@ -149,7 +150,31 @@ async def create_replica(session: AsyncSession, payload: ReplicaCreate) -> Repli
                 "lxd_enabled": _settings.lxd_enabled,
             },
         )
-        await session.commit()
+        try:
+            await session.commit()
+        except Exception as exc:
+            if _settings.lxd_enabled and spec is not None:
+                try:
+                    await lxd_service.delete_container(name=spec.name, project=spec.project)
+                    _logger.warning(
+                        "replicas.create.compensate",
+                        "Deleted LXD container after replica DB commit failed",
+                        replica_id=payload.id,
+                        container=spec.name,
+                        project=spec.project,
+                        error_type=type(exc).__name__,
+                    )
+                except lxd_service.LXDOperationError as cleanup_exc:
+                    _logger.error(
+                        "replicas.create.compensate_failed",
+                        "Failed to delete LXD container after replica DB commit failed",
+                        replica_id=payload.id,
+                        container=spec.name,
+                        project=spec.project,
+                        error_type=type(cleanup_exc).__name__,
+                        error=cleanup_exc.detail,
+                    )
+            raise
         await session.refresh(replica)
         _logger.info("replicas.create", "Created replica", replica_id=replica.id)
         return replica
@@ -247,6 +272,7 @@ async def move_replica(
             source_exists = await lxd_service.container_exists(name=container_name, project=project)
             temp_created = False
             cutover_started = False
+            cutover_recovered = False
 
             try:
                 spec = lxd_service.build_container_spec(
@@ -303,7 +329,65 @@ async def move_replica(
                     source_container=temp_name,
                     target_container=container_name,
                 )
-            except lxd_service.LXDOperationError:
+            except lxd_service.LXDOperationError as exc:
+                if temp_created and cutover_started:
+                    canonical_exists = await lxd_service.container_exists(
+                        name=container_name,
+                        project=project,
+                    )
+                    staged_exists = await lxd_service.container_exists(
+                        name=temp_name,
+                        project=project,
+                    )
+                    if staged_exists and not canonical_exists:
+                        try:
+                            await lxd_service.rename_container(
+                                source_name=temp_name,
+                                target_name=container_name,
+                                project=project,
+                            )
+                            cutover_recovered = True
+                            op.step_warning(
+                                "lxd.cutover.recover",
+                                "Completed staged rename after cutover failure",
+                                staged_container=temp_name,
+                                target_container=container_name,
+                                original_error=exc.detail,
+                            )
+                        except lxd_service.LXDOperationError as recover_exc:
+                            op.step_warning(
+                                "lxd.cutover.recover",
+                                "Failed to recover staged rename after cutover failure",
+                                staged_container=temp_name,
+                                target_container=container_name,
+                                error_type=type(recover_exc).__name__,
+                                error=recover_exc.detail,
+                            )
+                    elif canonical_exists:
+                        cutover_recovered = True
+                        op.step_warning(
+                            "lxd.cutover.recover",
+                            "Canonical container exists after cutover failure",
+                            target_container=container_name,
+                            staged_container=temp_name,
+                            staged_exists=staged_exists,
+                            original_error=exc.detail,
+                        )
+                    if not cutover_recovered:
+                        replica.status = _merge_lxd_status(
+                            status,
+                            lxd_container_name=temp_name if staged_exists else container_name,
+                            lxd_project=project,
+                            lxd_target_node=target_node.name,
+                            lxd_state="move_cutover_failed",
+                            lxd_move_strategy="staged",
+                            lxd_last_move_source_node=replica.node_id,
+                            lxd_last_move_target_node=target_node_id,
+                            lxd_last_error=exc.detail,
+                            lxd_last_action="move.cutover_failed",
+                            lxd_last_action_at=_utcnow_iso(),
+                        )
+                        await session.commit()
                 if temp_created and not cutover_started:
                     try:
                         await lxd_service.delete_container(name=temp_name, project=project)
@@ -320,7 +404,8 @@ async def move_replica(
                             error_type=type(cleanup_exc).__name__,
                             error=cleanup_exc.detail,
                         )
-                raise
+                if not cutover_recovered:
+                    raise
 
             runtime_state = await lxd_service.container_status(name=container_name, project=project)
             status = _merge_lxd_status(
@@ -574,6 +659,28 @@ async def delete_replica(session: AsyncSession, replica: Replica) -> None:
         )
         op.step("event.record", "Recorded replica delete event")
         await session.delete(replica)
-        await session.commit()
+        try:
+            await session.commit()
+        except Exception as exc:
+            await session.rollback()
+            stale_replica = await session.get(Replica, replica_id)
+            if stale_replica is not None:
+                stale_replica.status = _merge_lxd_status(
+                    dict(stale_replica.status or {}),
+                    lxd_state="deleted",
+                    lxd_last_error=f"DB delete commit failed after LXD delete: {type(exc).__name__}: {exc}",
+                    lxd_last_action="delete.db_commit_failed",
+                    lxd_last_action_at=_utcnow_iso(),
+                )
+                await session.commit()
+            _logger.error(
+                "replicas.delete.drift",
+                "Replica DB delete failed after LXD container delete",
+                replica_id=replica_id,
+                service_id=service_id,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            raise
         op.step("db.commit", "Committed replica delete transaction")
         _logger.info("replicas.delete", "Deleted replica", replica_id=replica_id)

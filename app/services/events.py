@@ -41,6 +41,21 @@ def _event_matches_node(event: Event, node_id: str) -> bool:
     return False
 
 
+def _extract_node_id(fields: Optional[Dict[str, Any]]) -> str | None:
+    payload = fields if isinstance(fields, dict) else {}
+    for key in (
+        "node_id",
+        "target_node_id",
+        "source_node_id",
+        "peer_node_id",
+        "member_name",
+    ):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 async def list_events_for_node(
     session: AsyncSession,
     *,
@@ -50,13 +65,31 @@ async def list_events_for_node(
 ) -> List[Event]:
     if not node_id.strip():
         return []
+    clean_node_id = node_id.strip()
+    result = await session.execute(
+        select(Event)
+        .where(Event.node_id == clean_node_id)
+        .order_by(Event.created_at.desc())
+        .limit(limit)
+    )
+    indexed_rows = list(result.scalars().all())
     rows = await list_events(session, limit=max(limit, search_limit))
     matched: list[Event] = []
+    seen_ids = set()
+    for row in indexed_rows:
+        matched.append(row)
+        seen_ids.add(row.id)
+        if len(matched) >= limit:
+            return matched
     for row in rows:
-        if _event_matches_node(row, node_id):
+        if row.id in seen_ids:
+            continue
+        if row.node_id == clean_node_id or _event_matches_node(row, clean_node_id):
             matched.append(row)
+            seen_ids.add(row.id)
             if len(matched) >= limit:
                 break
+    matched.sort(key=lambda item: item.created_at, reverse=True)
     return matched
 
 
@@ -78,6 +111,7 @@ async def record_event(
         category=category,
         name=name,
         level=level,
+        node_id=_extract_node_id(fields),
         fields=fields or {},
     )
     session.add(event)
@@ -120,7 +154,7 @@ async def prune_old_events(
         result = await session.execute(
             delete(Event).where(Event.id.in_(ids)).execution_options(synchronize_session=False)
         )
-        deleted = int(result.rowcount or 0)
+        deleted = int(getattr(result, "rowcount", 0) or 0)
         if deleted <= 0:
             deleted = len(ids)
         total_deleted += deleted

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
@@ -12,6 +12,10 @@ from app.models.base import Base, TimestampMixin
 
 class Endpoint(TimestampMixin, Base):
     __tablename__ = "endpoints"
+    __table_args__ = (
+        Index("ix_endpoints_replica_id", "replica_id"),
+        Index("ix_endpoints_healthy_replica_id", "healthy", "replica_id"),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     replica_id: Mapped[str] = mapped_column(String(64), ForeignKey("replicas.id"))

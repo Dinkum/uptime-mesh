@@ -16,8 +16,11 @@ Thumbs.db
 config.yaml
 test_servers.txt
 AGENTS.md
-ARCHITECTURE.md
-ROADMAP.MD
+/*.[mM][dD]
+!/README.md
+!/README.MD
+!/RELEASE_NOTES.md
+architecture/
 
 # Keep template env files tracked
 !.env.example

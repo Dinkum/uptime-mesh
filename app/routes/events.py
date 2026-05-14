@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import AsyncIterator, List, Optional
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -60,12 +60,20 @@ async def stream_events(
     sessionmaker = get_sessionmaker(settings.database_url)
 
     async def event_generator() -> AsyncIterator[str]:
-        last_seen = since
+        last_seen = since or datetime.now(timezone.utc)
+        last_seen_id = ""
+        idle_sleep_seconds = 1.5
         while True:
             async with sessionmaker() as session:
-                query = select(Event).order_by(Event.created_at.asc()).limit(200)
+                query = select(Event)
                 if last_seen is not None:
-                    query = query.where(Event.created_at > last_seen)
+                    query = query.where(
+                        or_(
+                            Event.created_at > last_seen,
+                            (Event.created_at == last_seen) & (Event.id > last_seen_id),
+                        )
+                    )
+                query = query.order_by(Event.created_at.asc(), Event.id.asc()).limit(200)
                 result = await session.execute(query)
                 events = list(result.scalars().all())
 
@@ -74,8 +82,15 @@ async def stream_events(
                 payload_json = json.dumps(payload, default=str)
                 yield f"event: event\ndata: {payload_json}\n\n"
                 last_seen = event.created_at
+                last_seen_id = event.id
 
-            await asyncio.sleep(1.5)
+            if events:
+                idle_sleep_seconds = 1.5
+            else:
+                yield ": keepalive\n\n"
+                idle_sleep_seconds = min(idle_sleep_seconds * 1.5, 10.0)
+
+            await asyncio.sleep(idle_sleep_seconds)
 
     stream_response = StreamingResponse(event_generator(), media_type="text/event-stream")
     stream_response.headers["Cache-Control"] = "no-cache"

@@ -105,6 +105,14 @@ app = FastAPI(
 )
 
 
+def _metrics_route_path(request: Request) -> str:
+    route = request.scope.get("route")
+    path = getattr(route, "path", None)
+    if isinstance(path, str) and path:
+        return path
+    return "unmatched"
+
+
 @app.middleware("http")
 async def auth_guard(
     request: Request,
@@ -171,7 +179,7 @@ async def request_logging(
             duration_ms = (perf_counter() - start) * 1000
             observe_http_request(
                 method=request.method,
-                path=request.url.path,
+                path=_metrics_route_path(request),
                 status=500,
                 duration_seconds=duration_ms / 1000,
             )
@@ -196,7 +204,7 @@ async def request_logging(
         )
         observe_http_request(
             method=request.method,
-            path=request.url.path,
+            path=_metrics_route_path(request),
             status=response.status_code,
             duration_seconds=duration_ms / 1000,
         )

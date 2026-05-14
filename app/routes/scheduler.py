@@ -4,10 +4,24 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import get_db_session, get_writable_db_session
+from app.logger import get_logger
 from app.schemas.scheduler import SchedulerBulkResultOut, SchedulerResultOut
 from app.services import scheduler as scheduler_service
 
 router = APIRouter(prefix="/scheduler", tags=["scheduler"])
+_logger = get_logger("routes.scheduler")
+
+
+async def _refresh_cached_plan_best_effort(session: AsyncSession) -> None:
+    try:
+        await scheduler_service.refresh_cached_plan(session)
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning(
+            "scheduler.cache.refresh_failed",
+            "Scheduler cache refresh failed after reconcile",
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
 
 
 @router.get("/plan/services/{service_id}", response_model=SchedulerResultOut)
@@ -32,7 +46,7 @@ async def reconcile_service(
         result = await scheduler_service.reconcile_service(
             session, service_id=service_id, dry_run=False
         )
-        await scheduler_service.refresh_cached_plan(session)
+        await _refresh_cached_plan_best_effort(session)
         return result
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -43,7 +57,7 @@ async def reconcile_all_services(
     session: AsyncSession = Depends(get_writable_db_session),
 ) -> SchedulerBulkResultOut:
     result = await scheduler_service.reconcile_all_services(session, dry_run=False)
-    await scheduler_service.refresh_cached_plan(session)
+    await _refresh_cached_plan_best_effort(session)
     return result
 
 

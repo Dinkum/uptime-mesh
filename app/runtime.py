@@ -23,6 +23,7 @@ from app.services import gateway as gateway_service
 from app.services import monitoring as monitoring_service
 from app.services import scheduler as scheduler_service
 from app.services import snapshots as snapshot_service
+from app.services import support_bundles as support_bundle_service
 from app.schemas.snapshots import SnapshotRunCreate
 
 _logger = get_logger("runtime")
@@ -43,18 +44,37 @@ def _parse_bool_health(payload: object) -> bool:
     return False
 
 
-def _run_command(cmd: Sequence[str]) -> tuple[int, str, str]:
+def _run_command(cmd: Sequence[str], *, timeout_seconds: int = 5) -> tuple[int, str, str]:
     try:
         process = subprocess.run(
             list(cmd),
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=timeout_seconds,
             check=False,
         )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else exc.stdout
+        stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else exc.stderr
+        return 124, (stdout or "").strip(), (stderr or f"timed out after {timeout_seconds}s").strip()
     except FileNotFoundError as exc:
         return 127, "", str(exc)
     return process.returncode, process.stdout.strip(), process.stderr.strip()
+
+
+def _path_sha256(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return ""
+
+
+async def _run_command_async(
+    cmd: Sequence[str],
+    *,
+    timeout_seconds: int = 5,
+) -> tuple[int, str, str]:
+    return await asyncio.to_thread(_run_command, cmd, timeout_seconds=timeout_seconds)
 
 
 def _http_json(
@@ -114,6 +134,7 @@ class RuntimeController:
             or self._settings.runtime_monitoring_enable
             or self._settings.runtime_scheduler_plan_cache_enable
             or self._settings.runtime_events_prune_enable
+            or self._settings.runtime_artifact_job_recovery_enable
             or (
                 self._settings.etcd_snapshot_schedule_enabled
                 and self._settings.etcd_enabled
@@ -190,6 +211,15 @@ class RuntimeController:
                 batch_size=self._settings.runtime_events_prune_batch_size,
             )
 
+        if self._settings.runtime_artifact_job_recovery_enable:
+            self._tasks.append(asyncio.create_task(self._artifact_job_recovery_loop()))
+            _logger.info(
+                "runtime.artifact_jobs.start",
+                "Started artifact job recovery loop",
+                interval_seconds=self._settings.runtime_artifact_job_recovery_interval_seconds,
+                stale_seconds=self._settings.runtime_artifact_job_stale_seconds,
+            )
+
         if self._settings.runtime_scheduler_plan_cache_enable:
             self._tasks.append(asyncio.create_task(self._scheduler_plan_cache_loop()))
             _logger.info(
@@ -227,36 +257,49 @@ class RuntimeController:
     async def _etcd_probe_loop(self, endpoints: list[str]) -> None:
         interval = self._settings.runtime_etcd_probe_interval_seconds
         while not self._stop.is_set():
-            status = "down"
-            healthy_endpoint = ""
-            error_detail = ""
-            for endpoint in endpoints:
-                ok, detail = await asyncio.to_thread(self._probe_etcd_endpoint, endpoint)
-                if ok:
-                    status = "ok"
-                    healthy_endpoint = endpoint
-                    break
-                error_detail = detail
-
-            updates: dict[str, str] = {"etcd_status": status}
-            if status == "ok":
-                updates["etcd_last_sync_at"] = _utcnow_iso()
-            changed = await self._upsert_cluster_settings(updates)
-            if changed:
-                if status == "ok":
-                    _logger.info(
-                        "runtime.etcd.ok",
-                        "Updated etcd status to ok",
-                        endpoint=healthy_endpoint,
-                    )
-                else:
-                    _logger.warning(
-                        "runtime.etcd.down",
-                        "Updated etcd status to down",
-                        detail=error_detail,
-                    )
             try:
+                status = "down"
+                healthy_endpoint = ""
+                error_detail = ""
+                probe_results = await asyncio.gather(
+                    *(asyncio.to_thread(self._probe_etcd_endpoint, endpoint) for endpoint in endpoints)
+                )
+                for endpoint, (ok, detail) in zip(endpoints, probe_results):
+                    if ok:
+                        status = "ok"
+                        healthy_endpoint = endpoint
+                        break
+                    error_detail = detail
+
+                updates: dict[str, str] = {"etcd_status": status}
+                if status == "ok":
+                    updates["etcd_last_sync_at"] = _utcnow_iso()
+                changed = await self._upsert_cluster_settings(updates, sync_file=False)
+                if changed:
+                    if status == "ok":
+                        _logger.info(
+                            "runtime.etcd.ok",
+                            "Updated etcd status to ok",
+                            endpoint=healthy_endpoint,
+                        )
+                    else:
+                        _logger.warning(
+                            "runtime.etcd.down",
+                            "Updated etcd status to down",
+                            detail=error_detail,
+                        )
                 record_runtime_loop(loop="etcd_probe", ok=status == "ok")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                record_runtime_loop(loop="etcd_probe", ok=False)
+                _logger.exception(
+                    "runtime.etcd.error",
+                    "Etcd probe loop failed",
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+            try:
                 await asyncio.wait_for(self._stop.wait(), timeout=interval)
             except TimeoutError:
                 continue
@@ -308,7 +351,7 @@ class RuntimeController:
     def _write_discovery_text(self, *, path: Path, text: str, previous_sha: str) -> tuple[bool, str]:
         data = text.encode("utf-8")
         digest = hashlib.sha256(data).hexdigest()
-        if digest == previous_sha and path.exists():
+        if path.exists() and (digest == previous_sha or _path_sha256(path) == digest):
             return False, digest
 
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -364,7 +407,10 @@ class RuntimeController:
 
             reload_cmd = self._settings.runtime_discovery_reload_command.strip()
             if reload_cmd:
-                code, out, err = _run_command(("sh", "-c", reload_cmd))
+                code, out, err = await _run_command_async(
+                    ("sh", "-c", reload_cmd),
+                    timeout_seconds=self._settings.runtime_command_timeout_seconds,
+                )
                 if code != 0:
                     _logger.warning(
                         "runtime.discovery.reload_error",
@@ -386,6 +432,23 @@ class RuntimeController:
         tmp_path.write_bytes(data)
         os.replace(tmp_path, path)
 
+    async def _restore_or_remove_config(
+        self,
+        *,
+        path: Path,
+        previous_config: bytes | None,
+        reload_command: str,
+    ) -> None:
+        if previous_config is not None:
+            self._write_bytes_atomic(path=path, data=previous_config)
+        elif path.exists():
+            path.unlink()
+        if reload_command:
+            await _run_command_async(
+                ("sh", "-c", reload_command),
+                timeout_seconds=self._settings.runtime_command_timeout_seconds,
+            )
+
     def _gateway_healthcheck_urls(self) -> list[str]:
         return [
             item.strip()
@@ -393,7 +456,7 @@ class RuntimeController:
             if item.strip()
         ]
 
-    def _format_gateway_command(
+    def _format_config_command(
         self,
         template: str,
         *,
@@ -428,7 +491,8 @@ class RuntimeController:
                 "gateway_upstream_count": str(upstream_count),
                 "gateway_config_sha256": digest,
                 "gateway_config_path": self._settings.runtime_gateway_config_path,
-            }
+            },
+            sync_file=False,
         )
 
     async def _mark_monitoring_status(
@@ -454,7 +518,8 @@ class RuntimeController:
                 "monitoring_api_targets": ",".join(api_targets),
                 "monitoring_node_exporter_targets": ",".join(node_exporter_targets),
                 "monitoring_alertmanager_targets": ",".join(alertmanager_targets),
-            }
+            },
+            sync_file=False,
         )
 
     async def _gateway_config_loop(self) -> None:
@@ -506,7 +571,10 @@ class RuntimeController:
             backup_path=self._settings.runtime_gateway_backup_path,
         )
 
-        if digest == self._gateway_config_sha and config_path.exists():
+        if config_path.exists() and (
+            digest == self._gateway_config_sha or _path_sha256(config_path) == digest
+        ):
+            self._gateway_config_sha = digest
             return False, route_count, upstream_count
 
         self._write_bytes_atomic(path=candidate_path, data=config_data)
@@ -519,14 +587,17 @@ class RuntimeController:
         )
 
         validate_template = self._settings.runtime_gateway_validate_command
-        validate_command = self._format_gateway_command(
+        validate_command = self._format_config_command(
             validate_template,
             config_path=candidate_path,
             candidate_path=candidate_path,
             backup_path=backup_path,
         )
         if validate_command:
-            code, out, err = _run_command(("sh", "-c", validate_command))
+            code, out, err = await _run_command_async(
+                ("sh", "-c", validate_command),
+                timeout_seconds=self._settings.runtime_command_timeout_seconds,
+            )
             if code != 0:
                 error_text = err or out or f"exit_{code}"
                 await self._mark_gateway_status(
@@ -546,19 +617,24 @@ class RuntimeController:
         self._write_bytes_atomic(path=config_path, data=config_data)
 
         reload_template = self._settings.runtime_gateway_reload_command
-        reload_command = self._format_gateway_command(
+        reload_command = self._format_config_command(
             reload_template,
             config_path=config_path,
             candidate_path=candidate_path,
             backup_path=backup_path,
         )
         if reload_command:
-            code, out, err = _run_command(("sh", "-c", reload_command))
+            code, out, err = await _run_command_async(
+                ("sh", "-c", reload_command),
+                timeout_seconds=self._settings.runtime_command_timeout_seconds,
+            )
             if code != 0:
                 error_text = err or out or f"exit_{code}"
-                if previous_config is not None:
-                    self._write_bytes_atomic(path=config_path, data=previous_config)
-                    _run_command(("sh", "-c", reload_command))
+                await self._restore_or_remove_config(
+                    path=config_path,
+                    previous_config=previous_config,
+                    reload_command=reload_command,
+                )
                 await self._mark_gateway_status(
                     status="reload_failed",
                     error_text=error_text,
@@ -580,10 +656,11 @@ class RuntimeController:
                 )
             except Exception as exc:  # noqa: BLE001
                 error_text = f"healthcheck exception for {url}: {type(exc).__name__}: {exc}"
-                if previous_config is not None:
-                    self._write_bytes_atomic(path=config_path, data=previous_config)
-                    if reload_command:
-                        _run_command(("sh", "-c", reload_command))
+                await self._restore_or_remove_config(
+                    path=config_path,
+                    previous_config=previous_config,
+                    reload_command=reload_command,
+                )
                 await self._mark_gateway_status(
                     status="healthcheck_failed",
                     error_text=error_text,
@@ -595,10 +672,11 @@ class RuntimeController:
 
             if status_code != expected_status:
                 error_text = f"healthcheck status {status_code} for {url} (expected {expected_status})"
-                if previous_config is not None:
-                    self._write_bytes_atomic(path=config_path, data=previous_config)
-                    if reload_command:
-                        _run_command(("sh", "-c", reload_command))
+                await self._restore_or_remove_config(
+                    path=config_path,
+                    previous_config=previous_config,
+                    reload_command=reload_command,
+                )
                 await self._mark_gateway_status(
                     status="healthcheck_failed",
                     error_text=error_text,
@@ -672,7 +750,10 @@ class RuntimeController:
             backup_path=self._settings.runtime_monitoring_prometheus_backup_path,
         )
 
-        if digest == self._monitoring_config_sha and paths.config_path.exists():
+        if paths.config_path.exists() and (
+            digest == self._monitoring_config_sha or _path_sha256(paths.config_path) == digest
+        ):
+            self._monitoring_config_sha = digest
             return (
                 False,
                 len(rendered.api_targets),
@@ -690,14 +771,17 @@ class RuntimeController:
             alertmanager_targets=len(rendered.alertmanager_targets),
         )
 
-        validate_command = self._format_gateway_command(
+        validate_command = self._format_config_command(
             self._settings.runtime_monitoring_validate_command,
-            config_path=paths.config_path,
+            config_path=paths.candidate_path,
             candidate_path=paths.candidate_path,
             backup_path=paths.backup_path,
         )
         if validate_command:
-            code, out, err = _run_command(("sh", "-c", validate_command))
+            code, out, err = await _run_command_async(
+                ("sh", "-c", validate_command),
+                timeout_seconds=self._settings.runtime_command_timeout_seconds,
+            )
             if code != 0:
                 error_text = err or out or f"exit_{code}"
                 await self._mark_monitoring_status(
@@ -716,19 +800,24 @@ class RuntimeController:
             self._write_bytes_atomic(path=paths.backup_path, data=previous_config)
         self._write_bytes_atomic(path=paths.config_path, data=config_data)
 
-        reload_command = self._format_gateway_command(
+        reload_command = self._format_config_command(
             self._settings.runtime_monitoring_reload_command,
             config_path=paths.config_path,
             candidate_path=paths.candidate_path,
             backup_path=paths.backup_path,
         )
         if reload_command:
-            code, out, err = _run_command(("sh", "-c", reload_command))
+            code, out, err = await _run_command_async(
+                ("sh", "-c", reload_command),
+                timeout_seconds=self._settings.runtime_command_timeout_seconds,
+            )
             if code != 0:
                 error_text = err or out or f"exit_{code}"
-                if previous_config is not None:
-                    self._write_bytes_atomic(path=paths.config_path, data=previous_config)
-                    _run_command(("sh", "-c", reload_command))
+                await self._restore_or_remove_config(
+                    path=paths.config_path,
+                    previous_config=previous_config,
+                    reload_command=reload_command,
+                )
                 await self._mark_monitoring_status(
                     status="reload_failed",
                     error_text=error_text,
@@ -853,6 +942,43 @@ class RuntimeController:
             except TimeoutError:
                 continue
 
+    async def _artifact_job_recovery_loop(self) -> None:
+        interval = self._settings.runtime_artifact_job_recovery_interval_seconds
+        stale_seconds = self._settings.runtime_artifact_job_stale_seconds
+        while not self._stop.is_set():
+            try:
+                async with self._sessionmaker() as session:
+                    snapshots = await snapshot_service.recover_snapshot_jobs(
+                        session,
+                        stale_after_seconds=stale_seconds,
+                    )
+                    support_bundles = await support_bundle_service.recover_support_bundle_jobs(
+                        session,
+                        stale_after_seconds=stale_seconds,
+                    )
+                record_runtime_loop(loop="artifact_job_recovery", ok=True)
+                if snapshots or support_bundles:
+                    _logger.info(
+                        "runtime.artifact_jobs.recovered",
+                        "Recovered persisted artifact jobs",
+                        snapshots=snapshots,
+                        support_bundles=support_bundles,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                record_runtime_loop(loop="artifact_job_recovery", ok=False)
+                _logger.exception(
+                    "runtime.artifact_jobs.error",
+                    "Artifact job recovery failed",
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=interval)
+            except TimeoutError:
+                continue
+
     async def _events_prune_loop(self) -> None:
         interval = self._settings.runtime_events_prune_interval_seconds
         retention_days = self._settings.events_retention_days
@@ -888,10 +1014,10 @@ class RuntimeController:
             except TimeoutError:
                 continue
 
-    async def _upsert_cluster_settings(self, updates: Dict[str, str]) -> bool:
+    async def _upsert_cluster_settings(self, updates: Dict[str, str], *, sync_file: bool = True) -> bool:
         async with self._sessionmaker() as session:
             return await cluster_settings_service.upsert_settings(
                 session,
                 updates,
-                sync_file=True,
+                sync_file=sync_file,
             )

@@ -12,7 +12,7 @@ from typing import List, Optional, Tuple
 from urllib.parse import urlparse
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import update, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -677,6 +677,27 @@ async def _get_join_token_for_use(
     return join_token
 
 
+async def _claim_join_token_for_use(
+    session: AsyncSession,
+    *,
+    join_token: JoinToken,
+    claimed_at: datetime,
+) -> bool:
+    result = await session.execute(
+        update(JoinToken)
+        .where(
+            JoinToken.id == join_token.id,
+            JoinToken.used_at.is_(None),
+            JoinToken.expires_at > claimed_at,
+        )
+        .values(used_at=claimed_at)
+    )
+    if int(getattr(result, "rowcount", 0) or 0) != 1:
+        return False
+    join_token.used_at = claimed_at
+    return True
+
+
 async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional[NodeJoinOut]:
     requested_role = _canonical_role(payload.role)
     async with _logger.operation(
@@ -766,9 +787,28 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
             cert_validity_days=settings.node_cert_validity_days,
         )
 
-        join_token.used_at = _utcnow()
         node = await session.get(Node, payload.node_id)
         now = _utcnow()
+        if not await _claim_join_token_for_use(session, join_token=join_token, claimed_at=now):
+            await _record_node_event(
+                session,
+                node_id=payload.node_id,
+                name="node.join.reject.token_race",
+                level="WARNING",
+                fields={
+                    "resolved_role": resolved_role,
+                    "token_id": join_token.id,
+                },
+            )
+            await session.commit()
+            _logger.warning(
+                "node.join.reject",
+                "Rejected node join because token was already claimed",
+                node_id=payload.node_id,
+                role=resolved_role,
+                token_id=join_token.id,
+            )
+            return None
         lease_expires_at = now + timedelta(seconds=payload.lease_ttl_seconds)
         lease_token = create_lease_token(
             node_id=payload.node_id,

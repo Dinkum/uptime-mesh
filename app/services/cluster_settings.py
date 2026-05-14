@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional, overload
 
 from sqlalchemy import select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -62,12 +62,11 @@ async def upsert_settings(
     *,
     sync_file: bool = True,
 ) -> bool:
-    return_rows = False
     return await _upsert_settings_internal(
         session,
         updates,
         sync_file=sync_file,
-        return_rows=return_rows,
+        return_rows=False,
     )
 
 
@@ -83,6 +82,26 @@ async def upsert_settings_with_rows(
         sync_file=sync_file,
         return_rows=True,
     )
+
+
+@overload
+async def _upsert_settings_internal(
+    session: AsyncSession,
+    updates: Dict[str, str],
+    *,
+    sync_file: bool,
+    return_rows: Literal[False],
+) -> bool: ...
+
+
+@overload
+async def _upsert_settings_internal(
+    session: AsyncSession,
+    updates: Dict[str, str],
+    *,
+    sync_file: bool,
+    return_rows: Literal[True],
+) -> Dict[str, ClusterSetting]: ...
 
 
 async def _upsert_settings_internal(

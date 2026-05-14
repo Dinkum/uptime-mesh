@@ -39,7 +39,7 @@ async def create_node(session: AsyncSession, payload: NodeCreate) -> Node:
         "node.create",
         "Creating node",
         node_id=payload.id,
-        name=payload.name,
+        node_name=payload.name,
     ) as op:
         node = Node(
             id=payload.id,
@@ -64,7 +64,7 @@ async def create_node(session: AsyncSession, payload: NodeCreate) -> Node:
         await session.commit()
         await session.refresh(node)
         op.step("db.commit", "Committed node create transaction")
-        _logger.info("nodes.create", "Created node", node_id=node.id, name=node.name)
+        _logger.info("nodes.create", "Created node", node_id=node.id, node_name=node.name)
         return node
 
 
@@ -82,7 +82,7 @@ async def update_node(
         if payload.name is not None:
             node.name = payload.name
             changed = True
-            op.step("name.update", "Updated node name", name=node.name)
+            op.step("name.update", "Updated node name", node_name=node.name)
         if payload.roles is not None:
             node.roles = payload.roles
             changed = True

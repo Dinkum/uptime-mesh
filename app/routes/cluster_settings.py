@@ -5,7 +5,7 @@ from typing import List
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.dependencies import get_db_session
+from app.dependencies import get_db_session, get_writable_db_session
 from app.schemas.cluster_settings import ClusterSettingOut, ClusterSettingUpsert
 from app.services import cluster_settings as cluster_settings_service
 
@@ -39,7 +39,7 @@ async def get_cluster_setting(
 async def put_cluster_setting(
     key: str,
     payload: ClusterSettingUpsert,
-    session: AsyncSession = Depends(get_db_session),
+    session: AsyncSession = Depends(get_writable_db_session),
 ) -> ClusterSettingOut:
     if key in _SENSITIVE_CLUSTER_SETTINGS:
         raise HTTPException(status_code=403, detail="Cluster setting key is internal and read-only")

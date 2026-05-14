@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import NoReturn
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -7,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import get_db_session, get_writable_db_session
 from app.logger import get_logger
+from app.routes.errors import raise_lxd_http_error
 from app.schemas.services import ServiceCreate, ServiceOut, ServiceRollback, ServiceUpdate
 from app.services import lxd as lxd_service
 from app.services import services as service_service
@@ -15,19 +17,13 @@ router = APIRouter(prefix="/services", tags=["services"])
 _logger = get_logger("api.services")
 
 
-def _raise_lxd_http_error(exc: lxd_service.LXDOperationError) -> None:
-    status_code = 503 if isinstance(exc, lxd_service.LXDUnavailableError) else 409
-    _logger.warning(
-        "service.lxd_error",
-        "Service action failed due to LXD operation error",
-        action=exc.action,
-        detail=exc.detail,
-        status_code=status_code,
+def _raise_service_lxd_http_error(exc: lxd_service.LXDOperationError) -> NoReturn:
+    raise_lxd_http_error(
+        exc,
+        logger=_logger,
+        event="service.lxd_error",
+        message="Service action failed due to LXD operation error",
     )
-    raise HTTPException(
-        status_code=status_code,
-        detail=f"LXD operation failed ({exc.action}): {exc.detail}",
-    ) from exc
 
 
 @router.get("", response_model=List[ServiceOut])
@@ -86,7 +82,7 @@ async def rollout_service(
     try:
         updated = await service_service.rollout_service(session, service)
     except lxd_service.LXDOperationError as exc:
-        _raise_lxd_http_error(exc)
+        _raise_service_lxd_http_error(exc)
     return ServiceOut.model_validate(updated)
 
 
@@ -103,7 +99,7 @@ async def rollback_service(
     try:
         updated = await service_service.rollback_service(session, service, target_generation)
     except lxd_service.LXDOperationError as exc:
-        _raise_lxd_http_error(exc)
+        _raise_service_lxd_http_error(exc)
     return ServiceOut.model_validate(updated)
 
 
@@ -118,5 +114,5 @@ async def apply_pinned_service_placement(
     try:
         updated = await service_service.apply_pinned_placement(session, service)
     except lxd_service.LXDOperationError as exc:
-        _raise_lxd_http_error(exc)
+        _raise_service_lxd_http_error(exc)
     return ServiceOut.model_validate(updated)

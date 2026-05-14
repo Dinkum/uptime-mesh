@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import shlex
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
 
@@ -12,7 +13,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.dependencies import get_db_session
+from app.dependencies import get_db_session, get_writable_db_session
 from app.models.event import Event
 from app.security import SESSION_COOKIE_NAME, create_session_token
 from app.services import (
@@ -24,7 +25,6 @@ from app.services import (
     etcd as etcd_service,
     events as event_service,
     gateway as gateway_service,
-    monitoring as monitoring_service,
     nodes as node_service,
     replicas as replica_service,
     roles as role_service,
@@ -40,7 +40,7 @@ templates = Jinja2Templates(directory="app/templates")
 settings = get_settings()
 
 
-def _safe_int(value: str, default: int = 0) -> int:
+def _safe_int(value: Any, default: int = 0) -> int:
     try:
         return int(value)
     except Exception:  # noqa: BLE001
@@ -119,6 +119,50 @@ def _dns_record_suggestion(domain: str, ingress_target: str) -> dict[str, str]:
                 "If your DNS provider forbids root CNAMEs, use an A/AAAA flattening option."
             ),
         }
+
+
+def _install_script_url(repo_url: str) -> str:
+    clean = repo_url.strip().removesuffix(".git")
+    if clean.startswith("https://github.com/"):
+        slug = clean.removeprefix("https://github.com/").strip("/")
+        if slug.count("/") >= 1:
+            owner, repo, *_ = slug.split("/")
+            return f"https://raw.githubusercontent.com/{owner}/{repo}/main/install.sh"
+    return "https://raw.githubusercontent.com/Dinkum/uptime-mesh/main/install.sh"
+
+
+def _install_join_command(peer: str, token: str, role: str, join_port: int, repo_url: str) -> str:
+    install_url = _install_script_url(repo_url)
+    command = (
+        f"curl -fsSL {shlex.quote(install_url)} | "
+        f"sudo UPTIMEMESH_REPO_URL={shlex.quote(repo_url)} bash -s -- --join {shlex.quote(peer)} --token {shlex.quote(token)}"
+    )
+    if role and role != "auto":
+        command = f"{command} --role {role}"
+    if join_port != 8010:
+        command = f"{command} --join-port {join_port}"
+    return command
+
+
+async def _not_found_response(
+    request: Request,
+    session: AsyncSession,
+    *,
+    title: str,
+    message: str,
+    back_url: str,
+    back_label: str,
+) -> Any:
+    context = {
+        "request": request,
+        "title": title,
+        "subtitle": "",
+        "message": message,
+        "back_url": back_url,
+        "back_label": back_label,
+    }
+    context.update(await _base_context(request, session))
+    return templates.TemplateResponse("not_found.html", context, status_code=status.HTTP_404_NOT_FOUND)
 
 
 async def _base_context(request: Request, session: AsyncSession) -> Dict[str, Any]:
@@ -282,6 +326,10 @@ def _build_node_summary(node: Any, now: datetime) -> dict[str, Any]:
     load_total = _safe_float(node_status.get("load_total_score"), default=None)
     swim_state = str(node_status.get("swim_state", "unknown")).strip().lower() or "unknown"
     swim_incarnation = _safe_int(str(node_status.get("swim_incarnation", "0")), default=0)
+    schedulable = _as_bool(node_status.get("schedulable"))
+    if schedulable is None:
+        schedulable = True
+    draining = bool(_as_bool(node_status.get("draining")) or False)
     identity_expires = _as_utc(node.identity_expires_at)
     if identity_expires is None:
         identity_expiry_state = "unknown"
@@ -339,6 +387,9 @@ def _build_node_summary(node: Any, now: datetime) -> dict[str, Any]:
         "load_total": load_total,
         "swim_state": swim_state,
         "swim_incarnation": swim_incarnation,
+        "schedulable": schedulable,
+        "draining": draining,
+        "maintenance_text": "Draining" if draining else "Schedulable" if schedulable else "Cordoned",
         "status": node_status,
     }
 
@@ -495,44 +546,52 @@ async def nodes_page(request: Request, session: AsyncSession = Depends(get_db_se
     cert_critical = sum(1 for row in node_rows if row["identity_expiry_state"] == "critical")
     cert_warning = sum(1 for row in node_rows if row["identity_expiry_state"] == "warning")
 
-    swim_members = await cluster_service.list_swim_members(session)
-    placement = await role_service.get_latest_placement(session)
+    swim_members: dict[str, Any] = {}
+    placement: dict[str, Any] = {}
+    if view_mode == "map":
+        swim_members = await cluster_service.list_swim_members(session)
+        placement = await role_service.get_latest_placement(session)
     placement_rows = placement.get("roles", []) if isinstance(placement, dict) else []
     node_assignments = placement.get("node_assignments", {}) if isinstance(placement, dict) else {}
 
-    links_set: set[tuple[str, str]] = set()
-    for source_node_id, swim_row in swim_members.items():
-        peers = swim_row.get("peers") if isinstance(swim_row, dict) else {}
-        if not isinstance(peers, dict):
-            continue
-        for peer_node_id in peers.keys():
-            if not isinstance(peer_node_id, str) or peer_node_id == source_node_id:
+    links: list[dict[str, str]] = []
+    node_map_rows: list[dict[str, Any]] = []
+    if view_mode == "map":
+        links_set: set[tuple[str, str]] = set()
+        for source_node_id, swim_row in swim_members.items():
+            peers = swim_row.get("peers") if isinstance(swim_row, dict) else {}
+            if not isinstance(peers, dict):
                 continue
-            links_set.add(tuple(sorted((source_node_id, peer_node_id))))
-    links = [{"source": source, "target": target} for source, target in sorted(links_set)]
+            for peer_node_id in peers.keys():
+                if not isinstance(peer_node_id, str) or peer_node_id == source_node_id:
+                    continue
+                source, target = sorted((source_node_id, peer_node_id))
+                links_set.add((source, target))
+        links = [{"source": source, "target": target} for source, target in sorted(links_set)]
 
-    node_map_rows = []
-    for row in node_rows:
-        node_id = row["id"]
-        swim_row = swim_members.get(node_id, {})
-        placement_roles = node_assignments.get(node_id, []) if isinstance(node_assignments, dict) else []
-        normalized_roles = [str(item) for item in placement_roles if isinstance(item, str)] or row["roles"]
-        node_map_rows.append(
-            {
-                "id": node_id,
-                "name": row["name"],
-                "health": row["health_key"],
-                "swim_state": str(swim_row.get("state") or row["swim_state"] or "unknown"),
-                "swim_incarnation": int(swim_row.get("incarnation") or row["swim_incarnation"] or 0),
-                "swim_updated_at": str(swim_row.get("updated_at") or ""),
-                "role_text": ", ".join(normalized_roles) if normalized_roles else "-",
-                "load_total": row["load_total"],
-                "load_cpu": row["load_cpu"],
-                "load_ram": row["load_ram"],
-                "load_disk": row["load_disk"],
-                "load_network": row["load_network"],
-            }
-        )
+        for row in node_rows:
+            node_id = row["id"]
+            swim_row = swim_members.get(node_id, {})
+            if not isinstance(swim_row, dict):
+                swim_row = {}
+            placement_roles = node_assignments.get(node_id, []) if isinstance(node_assignments, dict) else []
+            normalized_roles = [str(item) for item in placement_roles if isinstance(item, str)] or row["roles"]
+            node_map_rows.append(
+                {
+                    "id": node_id,
+                    "name": row["name"],
+                    "health": row["health_key"],
+                    "swim_state": str(swim_row.get("state") or row["swim_state"] or "unknown"),
+                    "swim_incarnation": int(swim_row.get("incarnation") or row["swim_incarnation"] or 0),
+                    "swim_updated_at": str(swim_row.get("updated_at") or ""),
+                    "role_text": ", ".join(normalized_roles) if normalized_roles else "-",
+                    "load_total": row["load_total"],
+                    "load_cpu": row["load_cpu"],
+                    "load_ram": row["load_ram"],
+                    "load_disk": row["load_disk"],
+                    "load_network": row["load_network"],
+                }
+            )
 
     role_rows = []
     if isinstance(placement_rows, list):
@@ -556,6 +615,7 @@ async def nodes_page(request: Request, session: AsyncSession = Depends(get_db_se
     etcd_context = {
         "enabled": settings.etcd_enabled,
         "configured": bool(settings.etcd_endpoints.strip()),
+        "summary_only": True,
         "member_count": 0,
         "healthy_endpoint_count": 0,
         "endpoint_count": 0,
@@ -564,17 +624,14 @@ async def nodes_page(request: Request, session: AsyncSession = Depends(get_db_se
         "error": "",
     }
     if etcd_context["enabled"] and etcd_context["configured"]:
-        try:
-            members = await etcd_service.member_list()
-            endpoint_health = await etcd_service.endpoint_health()
-            etcd_context["member_count"] = len(members)
-            etcd_context["endpoint_count"] = len(endpoint_health)
-            etcd_context["healthy_endpoint_count"] = sum(1 for item in endpoint_health if item.healthy)
-            quorum_required = (max(etcd_context["member_count"], 1) // 2) + 1
-            etcd_context["quorum_required"] = quorum_required
-            etcd_context["has_quorum"] = etcd_context["healthy_endpoint_count"] >= quorum_required
-        except Exception as exc:  # noqa: BLE001
-            etcd_context["error"] = f"{type(exc).__name__}: {exc}"
+        settings_map = await cluster_settings.get_settings_map(session)
+        etcd_status = settings_map.get("etcd_status", "unknown")
+        etcd_context["has_quorum"] = etcd_status == "ok"
+        etcd_context["healthy_endpoint_count"] = 1 if etcd_status == "ok" else 0
+        etcd_context["endpoint_count"] = 1
+        etcd_context["quorum_required"] = 1
+        if etcd_status != "ok":
+            etcd_context["error"] = f"Runtime etcd status: {etcd_status}"
 
     context = {
         "request": request,
@@ -599,6 +656,49 @@ async def nodes_page(request: Request, session: AsyncSession = Depends(get_db_se
     return templates.TemplateResponse("nodes.html", context)
 
 
+@router.post("/nodes/join-command")
+async def create_node_join_command(
+    peer: str = Form(default=""),
+    role: str = Form(default="auto"),
+    ttl_seconds: int = Form(default=1800),
+    join_port: int = Form(default=8010),
+    session: AsyncSession = Depends(get_writable_db_session),
+) -> dict[str, Any]:
+    clean_peer = peer.strip()
+    if not clean_peer:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Peer host or IP is required.")
+    if role not in {"auto", "backend_server", "reverse_proxy"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Role is invalid.")
+    if ttl_seconds < 60 or ttl_seconds > 86400:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Token lifetime must be between 60 and 86400 seconds.",
+        )
+    if join_port < 1 or join_port > 65535:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Join port is invalid.")
+
+    token = await cluster_service.create_join_token(
+        session,
+        role=role,
+        ttl_seconds=ttl_seconds,
+        issued_by="ui.nodes.add_node",
+    )
+    settings_map = await cluster_settings.get_settings_map(session)
+    repo_url = settings_map.get("github_repo_url", "https://github.com/Dinkum/uptime-mesh")
+    return {
+        "token_id": token.id,
+        "role": token.role,
+        "expires_at": token.expires_at.isoformat(),
+        "install_command": _install_join_command(
+            clean_peer,
+            token.token,
+            token.role,
+            join_port,
+            repo_url,
+        ),
+    }
+
+
 @router.get("/nodes/{node_id}")
 async def node_detail_page(
     node_id: str,
@@ -607,7 +707,14 @@ async def node_detail_page(
 ) -> Any:
     node = await node_service.get_node(session, node_id)
     if node is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Node not found")
+        return await _not_found_response(
+            request,
+            session,
+            title="Node Not Found",
+            message=f"No node is registered with id {node_id}.",
+            back_url="/ui/nodes",
+            back_label="Back to Nodes",
+        )
 
     now = datetime.now(timezone.utc)
     node_row = _build_node_summary(node, now)
@@ -713,12 +820,11 @@ async def node_detail_page(
     endpoint_registry = await discovery_service.list_endpoint_registry(
         session,
         stale_after_seconds=stale_after_seconds,
+        node_id=node.id,
     )
     node_endpoint_rows: list[dict[str, Any]] = []
     endpoint_state_counts = {"healthy": 0, "unhealthy": 0, "stale": 0}
     for endpoint in endpoint_registry:
-        if str(endpoint.get("node_id") or "") != node.id:
-            continue
         health_state = str(endpoint.get("health_state") or "unknown")
         if health_state in endpoint_state_counts:
             endpoint_state_counts[health_state] += 1
@@ -734,7 +840,7 @@ async def node_detail_page(
                 "address": str(endpoint.get("address") or ""),
                 "port": endpoint.get("port"),
                 "health_state": health_state,
-                "last_checked_at": _format_timestamp(_as_utc(endpoint.get("last_checked_at"))),
+                "last_checked_at": _format_timestamp(_parse_datetime(endpoint.get("last_checked_at"))),
                 "age_text": age_text,
             }
         )
@@ -927,6 +1033,8 @@ async def roles_page(request: Request, session: AsyncSession = Depends(get_db_se
     specs = await role_service.get_role_specs(session)
     placement = await role_service.get_latest_placement(session)
     placement_rows = placement.get("roles", []) if isinstance(placement, dict) else []
+    if not isinstance(placement_rows, list):
+        placement_rows = []
     by_role_name = {
         str(item.get("name")): item for item in placement_rows if isinstance(item, dict)
     }
@@ -971,10 +1079,19 @@ async def role_detail_page(
 ) -> Any:
     specs = await role_service.get_role_specs(session)
     if role_name not in specs:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Role not found")
+        return await _not_found_response(
+            request,
+            session,
+            title="Role Not Found",
+            message=f"No role spec is registered for {role_name}.",
+            back_url="/ui/roles",
+            back_label="Back to Roles",
+        )
 
     placement = await role_service.get_latest_placement(session)
     placement_rows = placement.get("roles", []) if isinstance(placement, dict) else []
+    if not isinstance(placement_rows, list):
+        placement_rows = []
     placement_map = placement.get("placement_map", {}) if isinstance(placement, dict) else {}
     role_row = next(
         (item for item in placement_rows if isinstance(item, dict) and item.get("name") == role_name),
@@ -1008,9 +1125,15 @@ async def workloads_page(request: Request, session: AsyncSession = Depends(get_d
         subtab = "services"
 
     services = await service_service.list_services(session, limit=2000)
-    replicas = await replica_service.list_replicas(session, limit=2000)
     now = datetime.now(timezone.utc)
-    rollout_rows = service_service.build_rollout_rows(services, replicas, now=now)
+    replicas = []
+    if subtab in {"services", "replicas", "rollouts"}:
+        replicas = await replica_service.list_replicas(session, limit=2000)
+    rollout_rows = (
+        service_service.build_rollout_rows(services, replicas, now=now)
+        if subtab in {"services", "rollouts"}
+        else []
+    )
     stalled_rollouts = sum(1 for row in rollout_rows if row["state_key"] == "stalled")
     error_rollouts = sum(1 for row in rollout_rows if row["state_key"] == "error")
     service_name_by_id = {str(service.id): str(service.name) for service in services}
@@ -1018,25 +1141,26 @@ async def workloads_page(request: Request, session: AsyncSession = Depends(get_d
         str(service.id): int(getattr(service, "generation", 0) or 0) for service in services
     }
     replica_rows: list[dict[str, Any]] = []
-    for replica in replicas:
-        status = replica.status if isinstance(replica.status, dict) else {}
-        service_id = str(replica.service_id)
-        current_generation = service_generation_by_id.get(service_id, 0)
-        applied_generation = _safe_int(str(status.get("applied_generation", "0")), default=0)
-        update_state = str(status.get("update_state", "unknown")).strip().lower() or "unknown"
-        replica_rows.append(
-            {
-                "id": replica.id,
-                "service_id": service_id,
-                "service_name": service_name_by_id.get(service_id, service_id),
-                "node_id": replica.node_id,
-                "desired_state": replica.desired_state,
-                "update_state": update_state,
-                "applied_generation": applied_generation,
-                "target_generation": current_generation,
-                "updated_at": _format_timestamp(_as_utc(getattr(replica, "updated_at", None))),
-            }
-        )
+    if subtab in {"replicas", "rollouts"}:
+        for replica in replicas:
+            status = replica.status if isinstance(replica.status, dict) else {}
+            service_id = str(replica.service_id)
+            current_generation = service_generation_by_id.get(service_id, 0)
+            applied_generation = _safe_int(str(status.get("applied_generation", "0")), default=0)
+            update_state = str(status.get("update_state", "unknown")).strip().lower() or "unknown"
+            replica_rows.append(
+                {
+                    "id": replica.id,
+                    "service_id": service_id,
+                    "service_name": service_name_by_id.get(service_id, service_id),
+                    "node_id": replica.node_id,
+                    "desired_state": replica.desired_state,
+                    "update_state": update_state,
+                    "applied_generation": applied_generation,
+                    "target_generation": current_generation,
+                    "updated_at": _format_timestamp(_as_utc(getattr(replica, "updated_at", None))),
+                }
+            )
     replica_rows.sort(key=lambda row: (row["service_name"].lower(), row["id"]))
     replica_rows_by_service: dict[str, list[dict[str, Any]]] = {}
     for row in replica_rows:
@@ -1045,22 +1169,23 @@ async def workloads_page(request: Request, session: AsyncSession = Depends(get_d
     rollout_watch_rows: list[dict[str, Any]] = []
     pending_states = {"pending", "queued", "in_progress", "updating", "rolling", "restarting"}
     failed_states = {"failed", "error", "stalled"}
-    for row in rollout_rows:
-        blocking = []
-        for replica in replica_rows_by_service.get(row["service_id"], []):
-            is_outdated = replica["target_generation"] > replica["applied_generation"]
-            is_non_healthy_state = replica["update_state"] in pending_states or replica["update_state"] in failed_states
-            if is_outdated or is_non_healthy_state:
-                blocking.append(replica)
-        if row["state_key"] == "complete" and not blocking:
-            continue
-        rollout_watch_rows.append(
-            {
-                **row,
-                "blocking_count": len(blocking),
-                "blocking_preview": blocking[:6],
-            }
-        )
+    if subtab == "rollouts":
+        for row in rollout_rows:
+            blocking = []
+            for replica in replica_rows_by_service.get(row["service_id"], []):
+                is_outdated = replica["target_generation"] > replica["applied_generation"]
+                is_non_healthy_state = replica["update_state"] in pending_states or replica["update_state"] in failed_states
+                if is_outdated or is_non_healthy_state:
+                    blocking.append(replica)
+            if row["state_key"] == "complete" and not blocking:
+                continue
+            rollout_watch_rows.append(
+                {
+                    **row,
+                    "blocking_count": len(blocking),
+                    "blocking_preview": blocking[:6],
+                }
+            )
     severity_rank = {"error": 0, "stalled": 1, "rolling": 2, "outdated": 3, "no_replicas": 4, "complete": 5}
     rollout_watch_rows.sort(
         key=lambda item: (
@@ -1075,7 +1200,7 @@ async def workloads_page(request: Request, session: AsyncSession = Depends(get_d
         1 for row in rollout_watch_rows if row["state_key"] in {"rolling", "outdated"}
     )
     rollout_watch_blocked_replicas = sum(int(row["blocking_count"]) for row in rollout_watch_rows)
-    plan = await scheduler_service.get_cached_plan(session)
+    plan = await scheduler_service.get_cached_plan(session) if subtab == "scheduler" else None
 
     context = {
         "request": request,
@@ -1116,11 +1241,13 @@ async def scheduler_page() -> Any:
 @router.get("/events")
 async def events_page(request: Request, session: AsyncSession = Depends(get_db_session)) -> Any:
     events = await event_service.list_events(session, limit=50)
+    stream_since = events[0].created_at.isoformat() if events else ""
     context = {
         "request": request,
         "title": "Events",
         "subtitle": "Audit timeline and live stream",
         "events": events,
+        "events_stream_since": stream_since,
     }
     context.update(await _base_context(request, session))
     return templates.TemplateResponse("events.html", context)
@@ -1134,7 +1261,6 @@ async def infrastructure_page(request: Request, session: AsyncSession = Depends(
 
     settings_map = await cluster_settings.get_settings_map(session)
     nodes = await node_service.list_nodes(session, limit=500)
-    swim_members = await cluster_service.list_swim_members(session)
     wireguard_rows = []
     for node in nodes:
         status = node.status or {}
@@ -1155,124 +1281,136 @@ async def infrastructure_page(request: Request, session: AsyncSession = Depends(
         )
     swim_state_counts = {"healthy": 0, "degraded": 0, "dead": 0, "unknown": 0}
     swim_rows: list[dict[str, Any]] = []
-    known_node_ids = {node.id for node in nodes}
-    for node in nodes:
-        member = swim_members.get(node.id, {})
-        if not isinstance(member, dict):
-            member = {}
-        member_state = str(
-            member.get("state")
-            or (node.status or {}).get("swim_state")
-            or "unknown"
-        ).strip().lower()
-        if member_state not in swim_state_counts:
-            member_state = "unknown"
-        swim_state_counts[member_state] += 1
-        member_peers = member.get("peers") if isinstance(member.get("peers"), dict) else {}
-        suspect_count = 0
-        dead_count = 0
-        for peer_payload in member_peers.values():
-            if not isinstance(peer_payload, dict):
+    swim_peer_total = 0
+    if subtab == "swim":
+        swim_members = await cluster_service.list_swim_members(session)
+        known_node_ids = {node.id for node in nodes}
+        for node in nodes:
+            member = swim_members.get(node.id, {})
+            if not isinstance(member, dict):
+                member = {}
+            member_state = str(
+                member.get("state")
+                or (node.status or {}).get("swim_state")
+                or "unknown"
+            ).strip().lower()
+            if member_state not in swim_state_counts:
+                member_state = "unknown"
+            swim_state_counts[member_state] += 1
+            raw_member_peers = member.get("peers")
+            member_peers = raw_member_peers if isinstance(raw_member_peers, dict) else {}
+            suspect_count = 0
+            dead_count = 0
+            for peer_payload in member_peers.values():
+                if not isinstance(peer_payload, dict):
+                    continue
+                peer_state = str(peer_payload.get("state") or "unknown").strip().lower()
+                if peer_state in {"degraded", "suspect"}:
+                    suspect_count += 1
+                elif peer_state == "dead":
+                    dead_count += 1
+            raw_member_flags = member.get("flags")
+            member_flags = raw_member_flags if isinstance(raw_member_flags, dict) else {}
+            interesting_flags = []
+            for key in sorted(member_flags.keys()):
+                if len(interesting_flags) >= 4:
+                    break
+                interesting_flags.append(f"{key}={_format_value(member_flags.get(key))}")
+            swim_rows.append(
+                {
+                    "node_id": node.id,
+                    "state": member_state,
+                    "incarnation": _safe_int(member.get("incarnation"), default=0),
+                    "updated_at": str(member.get("updated_at") or ""),
+                    "peer_count": len(member_peers),
+                    "suspect_peers": suspect_count,
+                    "dead_peers": dead_count,
+                    "flags_preview": " | ".join(interesting_flags) if interesting_flags else "-",
+                }
+            )
+        for node_id, member in swim_members.items():
+            if node_id in known_node_ids or not isinstance(member, dict):
                 continue
-            peer_state = str(peer_payload.get("state") or "unknown").strip().lower()
-            if peer_state in {"degraded", "suspect"}:
-                suspect_count += 1
-            elif peer_state == "dead":
-                dead_count += 1
-        member_flags = member.get("flags") if isinstance(member.get("flags"), dict) else {}
-        interesting_flags = []
-        for key in sorted(member_flags.keys()):
-            if len(interesting_flags) >= 4:
-                break
-            interesting_flags.append(f"{key}={_format_value(member_flags.get(key))}")
-        swim_rows.append(
-            {
-                "node_id": node.id,
-                "state": member_state,
-                "incarnation": int(member.get("incarnation") or 0),
-                "updated_at": str(member.get("updated_at") or ""),
-                "peer_count": len(member_peers),
-                "suspect_peers": suspect_count,
-                "dead_peers": dead_count,
-                "flags_preview": " | ".join(interesting_flags) if interesting_flags else "-",
-            }
-        )
-    for node_id, member in swim_members.items():
-        if node_id in known_node_ids or not isinstance(member, dict):
-            continue
-        member_state = str(member.get("state") or "unknown").strip().lower()
-        if member_state not in swim_state_counts:
-            member_state = "unknown"
-        swim_state_counts[member_state] += 1
-        member_peers = member.get("peers") if isinstance(member.get("peers"), dict) else {}
-        swim_rows.append(
-            {
-                "node_id": node_id,
-                "state": member_state,
-                "incarnation": int(member.get("incarnation") or 0),
-                "updated_at": str(member.get("updated_at") or ""),
-                "peer_count": len(member_peers),
-                "suspect_peers": 0,
-                "dead_peers": 0,
-                "flags_preview": "-",
-            }
-        )
-    swim_rows.sort(key=lambda row: row["node_id"])
-    swim_peer_total = sum(int(row["peer_count"]) for row in swim_rows)
+            member_state = str(member.get("state") or "unknown").strip().lower()
+            if member_state not in swim_state_counts:
+                member_state = "unknown"
+            swim_state_counts[member_state] += 1
+            raw_member_peers = member.get("peers")
+            member_peers = raw_member_peers if isinstance(raw_member_peers, dict) else {}
+            swim_rows.append(
+                {
+                    "node_id": node_id,
+                    "state": member_state,
+                    "incarnation": _safe_int(member.get("incarnation"), default=0),
+                    "updated_at": str(member.get("updated_at") or ""),
+                    "peer_count": len(member_peers),
+                    "suspect_peers": 0,
+                    "dead_peers": 0,
+                    "flags_preview": "-",
+                }
+            )
+        swim_rows.sort(key=lambda row: row["node_id"])
+        swim_peer_total = sum(int(row["peer_count"]) for row in swim_rows)
 
-    records = await discovery_service.list_discovery_services(
-        session,
-        domain=settings.runtime_discovery_domain,
-    )
+    records: list[Any] = []
     stale_after_seconds = max(settings.runtime_discovery_interval_seconds * 3, 90)
-    endpoint_registry = await discovery_service.list_endpoint_registry(
-        session,
-        stale_after_seconds=stale_after_seconds,
-    )
     endpoint_rows: list[dict[str, Any]] = []
-    for endpoint in endpoint_registry:
-        age_seconds = endpoint.get("age_seconds")
-        age_text = "-"
-        if isinstance(age_seconds, int) and age_seconds >= 0:
-            age_text = _format_duration(age_seconds)
-        endpoint_rows.append(
-            {
-                "endpoint_id": endpoint.get("endpoint_id", ""),
-                "service_name": endpoint.get("service_name", ""),
-                "service_id": endpoint.get("service_id", ""),
-                "replica_id": endpoint.get("replica_id", ""),
-                "node_id": endpoint.get("node_id", ""),
-                "address": endpoint.get("address", ""),
-                "port": endpoint.get("port", ""),
-                "health_state": endpoint.get("health_state", "unknown"),
-                "last_checked_at": _format_timestamp(_as_utc(endpoint.get("last_checked_at"))),
-                "age_text": age_text,
-            }
+    if subtab == "discovery":
+        records = await discovery_service.list_discovery_services(
+            session,
+            domain=settings.runtime_discovery_domain,
         )
+        endpoint_registry = await discovery_service.list_endpoint_registry(
+            session,
+            stale_after_seconds=stale_after_seconds,
+        )
+        for endpoint in endpoint_registry:
+            age_seconds = endpoint.get("age_seconds")
+            age_text = "-"
+            if isinstance(age_seconds, int) and age_seconds >= 0:
+                age_text = _format_duration(age_seconds)
+            endpoint_rows.append(
+                {
+                    "endpoint_id": endpoint.get("endpoint_id", ""),
+                    "service_name": endpoint.get("service_name", ""),
+                    "service_id": endpoint.get("service_id", ""),
+                    "replica_id": endpoint.get("replica_id", ""),
+                    "node_id": endpoint.get("node_id", ""),
+                    "address": endpoint.get("address", ""),
+                    "port": endpoint.get("port", ""),
+                    "health_state": endpoint.get("health_state", "unknown"),
+                    "last_checked_at": _format_timestamp(_parse_datetime(endpoint.get("last_checked_at"))),
+                    "age_text": age_text,
+                }
+            )
     healthy_total = sum(1 for item in endpoint_rows if item["health_state"] == "healthy")
     unhealthy_total = sum(1 for item in endpoint_rows if item["health_state"] == "unhealthy")
     stale_total = sum(1 for item in endpoint_rows if item["health_state"] == "stale")
 
-    routes = await gateway_service.list_gateway_routes(session)
-    healthcheck_urls = [
-        item.strip()
-        for item in settings.runtime_gateway_healthcheck_urls.split(",")
-        if item.strip()
-    ]
-
-    paths = monitoring_service.resolve_monitoring_paths(
-        config_path=settings.runtime_monitoring_prometheus_config_path,
-        candidate_path=settings.runtime_monitoring_prometheus_candidate_path,
-        backup_path=settings.runtime_monitoring_prometheus_backup_path,
-    )
+    routes: list[Any] = []
+    if subtab == "gateway":
+        routes = await gateway_service.list_gateway_routes(session)
+    healthcheck_urls = []
+    if subtab == "gateway":
+        healthcheck_urls = [
+            item.strip()
+            for item in settings.runtime_gateway_healthcheck_urls.split(",")
+            if item.strip()
+        ]
 
     def split_csv(raw: str) -> list[str]:
         return [item.strip() for item in raw.split(",") if item.strip()]
 
-    api_targets = split_csv(settings_map.get("monitoring_api_targets", ""))
-    node_exporter_targets = split_csv(settings_map.get("monitoring_node_exporter_targets", ""))
-    alertmanager_targets = split_csv(settings_map.get("monitoring_alertmanager_targets", ""))
-    content = await cluster_service.get_active_content(session)
+    api_targets: list[str] = []
+    node_exporter_targets: list[str] = []
+    alertmanager_targets: list[str] = []
+    if subtab == "monitoring":
+        api_targets = split_csv(settings_map.get("monitoring_api_targets", ""))
+        node_exporter_targets = split_csv(settings_map.get("monitoring_node_exporter_targets", ""))
+        alertmanager_targets = split_csv(settings_map.get("monitoring_alertmanager_targets", ""))
+    content: dict[str, Any] = {}
+    if subtab == "cdn":
+        content = await cluster_service.get_active_content(session)
     cdn_seeded_at = settings_map.get("internal_cdn_seeded_at", "")
     etcd_context: dict[str, Any] = {
         "enabled": settings.etcd_enabled,
@@ -1289,11 +1427,11 @@ async def infrastructure_page(request: Request, session: AsyncSession = Depends(
         "leader_endpoint_count": 0,
         "alarm_rows": [],
     }
-    if etcd_context["enabled"] and etcd_context["configured"]:
+    if subtab == "etcd" and etcd_context["enabled"] and etcd_context["configured"]:
         try:
             member_rows = await etcd_service.member_list()
             health_rows = await etcd_service.endpoint_health()
-            status_rows = await etcd_service.endpoint_status()
+            status_rows = await etcd_service.endpoint_status(health_rows=health_rows)
             alarm_rows = await etcd_service.alarm_list()
             etcd_context["members"] = member_rows
             etcd_context["member_count"] = len(member_rows)
@@ -1365,7 +1503,7 @@ async def infrastructure_page(request: Request, session: AsyncSession = Depends(
         "healthcheck_urls": healthcheck_urls,
         "monitoring_enabled": settings.runtime_monitoring_enable,
         "monitoring_config_endpoint": "/monitoring/prometheus/config",
-        "monitoring_config_path": str(paths.config_path),
+        "monitoring_config_path": settings.runtime_monitoring_prometheus_config_path,
         "monitoring_config_sha256": settings_map.get("monitoring_config_sha256", ""),
         "api_targets": api_targets,
         "node_exporter_targets": node_exporter_targets,
@@ -1434,46 +1572,52 @@ async def _build_settings_context(
     repo_error: str = "",
     routing_success: str = "",
     routing_error: str = "",
+    routing_form: dict[str, Any] | None = None,
     provider_success: str = "",
     provider_error: str = "",
     github_repo_url_override: str | None = None,
 ) -> dict[str, Any]:
     settings_map = await cluster_settings.get_settings_map(session)
     username = await auth_service.get_username(session)
-    applications, domain_routes = await applications_service.ensure_catalog_defaults(session)
-    domain_bindings = applications_service.build_domain_bindings(
-        applications=applications,
-        domain_routes=domain_routes,
-    )
-    services = await service_service.list_services(session, limit=2000)
-    service_options = [
-        {"id": str(service.id), "name": str(service.name)}
-        for service in sorted(services, key=lambda item: str(item.name).lower())
-    ]
+    applications: list[Any] = []
+    domain_routes: list[Any] = []
+    domain_bindings: list[dict[str, Any]] = []
+    service_options: list[dict[str, str]] = []
     ingress_target = str(settings_map.get("domain_ingress_target", "")).strip()
-    dns_record_rows = []
-    for binding in domain_bindings:
-        domain = str(binding.get("domain") or "").strip().lower()
-        if not domain:
-            continue
-        suggestion = _dns_record_suggestion(domain, ingress_target)
-        dns_record_rows.append(
-            {
-                "domain": domain,
-                "application_id": str(binding.get("application_id") or ""),
-                "application_name": str(binding.get("application_name") or "-"),
-                "application_target_service_id": str(
-                    binding.get("application_target_service_id") or ""
-                ),
-                "route_enabled": bool(binding.get("route_enabled", False)),
-                "application_enabled": bool(binding.get("application_enabled", False)),
-                "routing_ready": bool(binding.get("routing_ready", False)),
-                "record_type": suggestion["record_type"],
-                "record_value": suggestion["record_value"],
-                "instructions": suggestion["instructions"],
-            }
+    dns_record_rows: list[dict[str, Any]] = []
+    if active_section == "routing":
+        applications, domain_routes = await applications_service.ensure_catalog_defaults(session)
+        domain_bindings = applications_service.build_domain_bindings(
+            applications=applications,
+            domain_routes=domain_routes,
         )
-    dns_record_rows.sort(key=lambda row: row["domain"])
+        services = await service_service.list_services(session, limit=2000)
+        service_options = [
+            {"id": str(service.id), "name": str(service.name)}
+            for service in sorted(services, key=lambda item: str(item.name).lower())
+        ]
+        for binding in domain_bindings:
+            domain = str(binding.get("domain") or "").strip().lower()
+            if not domain:
+                continue
+            suggestion = _dns_record_suggestion(domain, ingress_target)
+            dns_record_rows.append(
+                {
+                    "domain": domain,
+                    "application_id": str(binding.get("application_id") or ""),
+                    "application_name": str(binding.get("application_name") or "-"),
+                    "application_target_service_id": str(
+                        binding.get("application_target_service_id") or ""
+                    ),
+                    "route_enabled": bool(binding.get("route_enabled", False)),
+                    "application_enabled": bool(binding.get("application_enabled", False)),
+                    "routing_ready": bool(binding.get("routing_ready", False)),
+                    "record_type": suggestion["record_type"],
+                    "record_value": suggestion["record_value"],
+                    "instructions": suggestion["instructions"],
+                }
+            )
+        dns_record_rows.sort(key=lambda row: row["domain"])
 
     snapshots: list[Any] = []
     bundles: list[Any] = []
@@ -1504,6 +1648,7 @@ async def _build_settings_context(
         "repo_error": repo_error,
         "routing_success": routing_success,
         "routing_error": routing_error,
+        "routing_form": routing_form or {},
         "provider_success": provider_success,
         "provider_error": provider_error,
         "github_repo_url": (
@@ -1560,7 +1705,7 @@ async def settings_page(request: Request, session: AsyncSession = Depends(get_db
 @router.post("/settings/password")
 async def change_password(
     request: Request,
-    session: AsyncSession = Depends(get_db_session),
+    session: AsyncSession = Depends(get_writable_db_session),
     current_password: str = Form(default=""),
     new_password: str = Form(default=""),
     confirm_password: str = Form(default=""),
@@ -1624,7 +1769,7 @@ async def change_password(
 @router.post("/settings/repo")
 async def update_repo_url(
     request: Request,
-    session: AsyncSession = Depends(get_db_session),
+    session: AsyncSession = Depends(get_writable_db_session),
     github_repo_url: str = Form(default=""),
 ) -> Any:
     clean_url = github_repo_url.strip()
@@ -1654,7 +1799,7 @@ async def update_repo_url(
 @router.post("/settings/routing/application")
 async def upsert_application(
     request: Request,
-    session: AsyncSession = Depends(get_db_session),
+    session: AsyncSession = Depends(get_writable_db_session),
     app_id: str = Form(default=""),
     name: str = Form(default=""),
     description: str = Form(default=""),
@@ -1681,6 +1826,14 @@ async def upsert_application(
         session,
         active_section="routing",
         routing_error=message or "Failed to save application.",
+        routing_form={
+            "app_id": app_id,
+            "name": name,
+            "description": description,
+            "target_service_id": target_service_id,
+            "default_path": default_path,
+            "application_enabled": _as_form_bool(enabled),
+        },
     )
     return templates.TemplateResponse("settings.html", context, status_code=status.HTTP_400_BAD_REQUEST)
 
@@ -1688,7 +1841,7 @@ async def upsert_application(
 @router.post("/settings/routing/domain")
 async def upsert_domain_route(
     request: Request,
-    session: AsyncSession = Depends(get_db_session),
+    session: AsyncSession = Depends(get_writable_db_session),
     route_id: str = Form(default=""),
     domain: str = Form(default=""),
     application_id: str = Form(default=""),
@@ -1713,6 +1866,13 @@ async def upsert_domain_route(
         session,
         active_section="routing",
         routing_error=message or "Failed to save domain route.",
+        routing_form={
+            "route_id": route_id,
+            "domain": domain,
+            "application_id": application_id,
+            "path": path,
+            "domain_enabled": _as_form_bool(enabled),
+        },
     )
     return templates.TemplateResponse("settings.html", context, status_code=status.HTTP_400_BAD_REQUEST)
 
@@ -1720,7 +1880,7 @@ async def upsert_domain_route(
 @router.post("/settings/routing/domain/delete")
 async def delete_domain_route(
     request: Request,
-    session: AsyncSession = Depends(get_db_session),
+    session: AsyncSession = Depends(get_writable_db_session),
     route_id: str = Form(default=""),
 ) -> Any:
     clean_route_id = route_id.strip()
@@ -1754,7 +1914,7 @@ async def delete_domain_route(
 @router.post("/settings/providers")
 async def update_provider_settings(
     request: Request,
-    session: AsyncSession = Depends(get_db_session),
+    session: AsyncSession = Depends(get_writable_db_session),
     provider_openai_api_key: str = Form(default=""),
     provider_cloudflare_api_token: str = Form(default=""),
     provider_cloudflare_zone_id: str = Form(default=""),
@@ -1762,6 +1922,11 @@ async def update_provider_settings(
     provider_scaleway_api_token: str = Form(default=""),
     provider_online_api_token: str = Form(default=""),
     domain_ingress_target: str = Form(default=""),
+    clear_provider_openai_api_key: str = Form(default="off"),
+    clear_provider_cloudflare_api_token: str = Form(default="off"),
+    clear_provider_hetzner_api_token: str = Form(default="off"),
+    clear_provider_scaleway_api_token: str = Form(default="off"),
+    clear_provider_online_api_token: str = Form(default="off"),
 ) -> Any:
     updates: dict[str, str] = {
         "provider_cloudflare_zone_id": provider_cloudflare_zone_id.strip(),
@@ -1774,11 +1939,36 @@ async def update_provider_settings(
         "provider_scaleway_api_token": provider_scaleway_api_token.strip(),
         "provider_online_api_token": provider_online_api_token.strip(),
     }
+    clear_flags = {
+        "provider_openai_api_key": _as_form_bool(clear_provider_openai_api_key),
+        "provider_cloudflare_api_token": _as_form_bool(clear_provider_cloudflare_api_token),
+        "provider_hetzner_api_token": _as_form_bool(clear_provider_hetzner_api_token),
+        "provider_scaleway_api_token": _as_form_bool(clear_provider_scaleway_api_token),
+        "provider_online_api_token": _as_form_bool(clear_provider_online_api_token),
+    }
     for key, value in token_values.items():
-        if value:
+        if clear_flags.get(key):
+            updates[key] = ""
+        elif value:
             updates[key] = value
     await cluster_settings.upsert_settings(session, updates, sync_file=True)
     return RedirectResponse(
         url="/ui/settings?section=providers&provider_updated=1",
         status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@router.get("/{path:path}")
+async def ui_not_found(
+    path: str,
+    request: Request,
+    session: AsyncSession = Depends(get_db_session),
+) -> Any:
+    return await _not_found_response(
+        request,
+        session,
+        title="Page Not Found",
+        message=f"No console page exists at /ui/{path}.",
+        back_url="/ui",
+        back_label="Back to Overview",
     )

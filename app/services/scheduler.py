@@ -2,13 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 from typing import Dict, List, Optional
 from uuid import uuid4
 
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
 from app.logger import get_logger
+from app.models.service import Service
 from app.models.node import Node
 from app.models.replica import Replica
 from app.schemas.replicas import ReplicaCreate, ReplicaUpdate
@@ -22,6 +25,7 @@ from app.services import services as service_service
 _logger = get_logger("services.scheduler")
 _SCHEDULER_PLAN_CACHE_KEY = "scheduler_plan_cache_json"
 _SCHEDULER_PLAN_CACHE_GENERATED_AT_KEY = "scheduler_plan_cache_generated_at"
+_SCHEDULER_PLAN_CACHE_HASH_KEY = "scheduler_plan_cache_hash"
 
 
 @dataclass(frozen=True)
@@ -154,14 +158,40 @@ def _empty_plan() -> SchedulerBulkResultOut:
     )
 
 
+def _strip_generated_at(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            key: _strip_generated_at(item)
+            for key, item in value.items()
+            if key != "generated_at"
+        }
+    if isinstance(value, list):
+        return [_strip_generated_at(item) for item in value]
+    return value
+
+
 async def cache_plan(
     session: AsyncSession,
     plan: SchedulerBulkResultOut,
 ) -> None:
-    payload = json.dumps(plan.model_dump(mode="json"), separators=(",", ":"))
+    plan_data = plan.model_dump(mode="json")
+    payload = json.dumps(plan_data, separators=(",", ":"))
+    stable_payload = json.dumps(
+        _strip_generated_at(plan_data),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    stable_hash = hashlib.sha256(stable_payload.encode("utf-8")).hexdigest()
+    existing_hash = await cluster_settings_service.get_setting(
+        session,
+        _SCHEDULER_PLAN_CACHE_HASH_KEY,
+    )
+    if existing_hash is not None and existing_hash.value == stable_hash:
+        return
     updates = {
         _SCHEDULER_PLAN_CACHE_KEY: payload,
         _SCHEDULER_PLAN_CACHE_GENERATED_AT_KEY: plan.generated_at.isoformat(),
+        _SCHEDULER_PLAN_CACHE_HASH_KEY: stable_hash,
     }
     await cluster_settings_service.upsert_settings(
         session,
@@ -221,7 +251,23 @@ async def reconcile_service(
 
     replicas = await replica_service.list_replicas_for_service(session, service_id)
     nodes = await node_service.list_nodes(session, limit=1000)
+    return await _reconcile_loaded_service(
+        session,
+        service=service,
+        replicas=replicas,
+        nodes=nodes,
+        dry_run=dry_run,
+    )
 
+
+async def _reconcile_loaded_service(
+    session: AsyncSession,
+    *,
+    service: Service,
+    replicas: list[Replica],
+    nodes: list[Node],
+    dry_run: bool,
+) -> SchedulerResultOut:
     spec = dict(service.spec or {})
     policy = _extract_policy(spec, current_replicas=len(replicas))
 
@@ -269,7 +315,8 @@ async def reconcile_service(
 
         replica_counts[source_node_id] = max(0, replica_counts.get(source_node_id, 0) - 1)
         replica_counts[target_node.id] = replica_counts.get(target_node.id, 0) + 1
-        replica.node_id = target_node.id
+        if not dry_run:
+            replica.node_id = target_node.id
 
         actions.append(
             SchedulerActionOut(
@@ -369,7 +416,8 @@ async def reconcile_service(
                 ReplicaUpdate(status=status),
             )
 
-        replica.status = status
+        if not dry_run:
+            replica.status = status
         actions.append(
             SchedulerActionOut(
                 action="queue_rolling_update",
@@ -418,22 +466,23 @@ async def reconcile_all_services(
     limit: int = 200,
 ) -> SchedulerBulkResultOut:
     services = await service_service.list_services(session, limit=limit)
+    service_ids = [service.id for service in services]
+    nodes = await node_service.list_nodes(session, limit=1000)
+    replicas_by_service: dict[str, list[Replica]] = {service_id: [] for service_id in service_ids}
+    if service_ids:
+        rows = await session.execute(select(Replica).where(Replica.service_id.in_(service_ids)))
+        for replica in rows.scalars().all():
+            replicas_by_service.setdefault(replica.service_id, []).append(replica)
     results: List[SchedulerResultOut] = []
 
     for service in services:
-        try:
-            result = await reconcile_service(session, service.id, dry_run=dry_run)
-        except ValueError as exc:
-            result = SchedulerResultOut(
-                service_id=service.id,
-                desired_replicas=0,
-                actual_replicas=0,
-                eligible_nodes=0,
-                dry_run=dry_run,
-                warnings=[str(exc)],
-                actions=[],
-                generated_at=datetime.now(timezone.utc),
-            )
+        result = await _reconcile_loaded_service(
+            session,
+            service=service,
+            replicas=replicas_by_service.get(service.id, []),
+            nodes=nodes,
+            dry_run=dry_run,
+        )
         results.append(result)
 
     return SchedulerBulkResultOut(

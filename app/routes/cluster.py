@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import get_db_session, get_writable_db_session
-from app.security import LoginRateLimiter
+from app.security import AttemptRateLimiter
 from app.schemas.cluster import (
     ClusterPeerOut,
     ClusterBootstrapOut,
@@ -30,18 +30,18 @@ router = APIRouter(prefix="/cluster", tags=["cluster"])
 _JOIN_RATE_LIMIT_PER_MINUTE = 10
 _HEARTBEAT_RATE_LIMIT_PER_MINUTE = 60
 _HEARTBEAT_IP_RATE_LIMIT_PER_MINUTE = 120
-_JOIN_LIMITER = LoginRateLimiter(
-    max_failures=_JOIN_RATE_LIMIT_PER_MINUTE,
+_JOIN_LIMITER = AttemptRateLimiter(
+    max_attempts=_JOIN_RATE_LIMIT_PER_MINUTE,
     window_seconds=60,
     lockout_seconds=60,
 )
-_HEARTBEAT_NODE_LIMITER = LoginRateLimiter(
-    max_failures=_HEARTBEAT_RATE_LIMIT_PER_MINUTE,
+_HEARTBEAT_NODE_LIMITER = AttemptRateLimiter(
+    max_attempts=_HEARTBEAT_RATE_LIMIT_PER_MINUTE,
     window_seconds=60,
     lockout_seconds=60,
 )
-_HEARTBEAT_IP_LIMITER = LoginRateLimiter(
-    max_failures=_HEARTBEAT_IP_RATE_LIMIT_PER_MINUTE,
+_HEARTBEAT_IP_LIMITER = AttemptRateLimiter(
+    max_attempts=_HEARTBEAT_IP_RATE_LIMIT_PER_MINUTE,
     window_seconds=60,
     lockout_seconds=60,
 )
@@ -99,7 +99,7 @@ async def join_node(
             status_code=429,
             detail=f"Join rate limit exceeded for this IP. Retry in {retry_after}s.",
         )
-    _JOIN_LIMITER.record_failure(f"ip:{client_ip}")
+    _JOIN_LIMITER.record_attempt(f"ip:{client_ip}")
     joined = await cluster_service.join_node(session, payload)
     if joined is None:
         raise HTTPException(status_code=401, detail="Invalid, expired, or already-used join token.")
@@ -110,7 +110,7 @@ async def join_node(
 async def heartbeat(
     payload: HeartbeatRequest,
     request: Request,
-    session: AsyncSession = Depends(get_db_session),
+    session: AsyncSession = Depends(get_writable_db_session),
 ) -> HeartbeatOut:
     client_ip = _client_ip(request)
     allowed_ip, retry_after_ip = _HEARTBEAT_IP_LIMITER.check(f"ip:{client_ip}")
@@ -125,8 +125,8 @@ async def heartbeat(
             status_code=429,
             detail=f"Heartbeat rate limit exceeded for node ID. Retry in {retry_after_node}s.",
         )
-    _HEARTBEAT_IP_LIMITER.record_failure(f"ip:{client_ip}")
-    _HEARTBEAT_NODE_LIMITER.record_failure(f"node:{payload.node_id}")
+    _HEARTBEAT_IP_LIMITER.record_attempt(f"ip:{client_ip}")
+    _HEARTBEAT_NODE_LIMITER.record_attempt(f"node:{payload.node_id}")
     lease = await cluster_service.apply_heartbeat(
         session,
         node_id=payload.node_id,
@@ -172,7 +172,7 @@ async def list_peers(
 @router.post("/swim/report", response_model=SwimReportOut)
 async def report_swim(
     payload: SwimReportRequest,
-    session: AsyncSession = Depends(get_db_session),
+    session: AsyncSession = Depends(get_writable_db_session),
 ) -> SwimReportOut:
     accepted, updated_at = await cluster_service.record_swim_report(
         session,

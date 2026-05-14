@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import platform
+import re
 import tarfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import and_, insert, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.dependencies import get_sessionmaker
 from app.logger import get_logger
 from app.models.cluster_setting import ClusterSetting
 from app.models.endpoint import Endpoint
@@ -29,6 +32,9 @@ from app.services.events import record_event
 _logger = get_logger("services.support_bundles")
 _settings = get_settings()
 _SENSITIVE_KEY_PARTS = ("secret", "token", "password", "private_key", "auth_cookie", "signing_key")
+_ARTIFACT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_BUNDLE_ROW_LIMIT = 2000
+_LOG_TAIL_BYTES = 1024 * 1024
 
 
 async def list_support_bundles(session: AsyncSession, limit: int = 50) -> List[SupportBundle]:
@@ -48,6 +54,28 @@ async def list_support_bundles(session: AsyncSession, limit: int = 50) -> List[S
 async def get_support_bundle(session: AsyncSession, bundle_id: str) -> SupportBundle | None:
     result = await session.execute(select(SupportBundle).where(SupportBundle.id == bundle_id))
     return result.scalar_one_or_none()
+
+
+async def claim_support_bundle_job(
+    session: AsyncSession,
+    bundle_id: str,
+    *,
+    stale_after_seconds: int | None = None,
+) -> SupportBundle | None:
+    claimable = [SupportBundle.status == "pending"]
+    if stale_after_seconds is not None:
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=stale_after_seconds)
+        claimable.append(and_(SupportBundle.status == "running", SupportBundle.updated_at < cutoff))
+    result = await session.execute(
+        update(SupportBundle)
+        .where(SupportBundle.id == bundle_id, or_(*claimable))
+        .values(status="running", error=None)
+    )
+    if int(getattr(result, "rowcount", 0) or 0) != 1:
+        await session.rollback()
+        return None
+    await session.commit()
+    return await get_support_bundle(session, bundle_id)
 
 
 async def create_support_bundle(
@@ -79,7 +107,58 @@ async def create_support_bundle(
         await session.commit()
         await session.refresh(bundle)
         op.step("db.commit", "Committed support bundle request transaction")
+        return bundle
 
+
+async def create_support_bundle_during_incident(
+    session: AsyncSession, payload: SupportBundleCreate
+) -> SupportBundle:
+    bundle_id = payload.id or str(uuid4())
+    async with _logger.operation(
+        "support_bundle.request_incident",
+        "Requesting support bundle during incident",
+        bundle_id=bundle_id,
+        requested_by=payload.requested_by,
+    ) as op:
+        try:
+            await session.execute(
+                insert(SupportBundle).values(
+                    id=bundle_id,
+                    status="pending",
+                    requested_by=payload.requested_by,
+                )
+            )
+            await record_event(
+                session,
+                event_id=str(uuid4()),
+                category="support",
+                name="support_bundle.requested",
+                level="INFO",
+                fields={"bundle_id": bundle_id, "requested_by": payload.requested_by},
+            )
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+        op.step("db.commit", "Committed support bundle request transaction")
+        bundle = await get_support_bundle(session, bundle_id)
+        if bundle is None:
+            raise RuntimeError("Support bundle request disappeared after commit")
+        return bundle
+
+
+async def execute_support_bundle(session: AsyncSession, bundle: SupportBundle) -> SupportBundle:
+    async with _logger.operation(
+        "support_bundle.execute",
+        "Executing support bundle request",
+        bundle_id=bundle.id,
+        requested_by=bundle.requested_by,
+    ) as op:
+        bundle.status = "running"
+        bundle.error = None
+        await session.commit()
+        await session.refresh(bundle)
+        op.step("state.running", "Marked support bundle as running")
         try:
             output_path = await _generate_support_bundle(session, bundle.id)
             bundle.status = "completed"
@@ -127,6 +206,57 @@ async def create_support_bundle(
         return bundle
 
 
+async def run_support_bundle_job(bundle_id: str) -> None:
+    sessionmaker = get_sessionmaker(_settings.database_url)
+    async with sessionmaker() as session:
+        bundle = await claim_support_bundle_job(session, bundle_id)
+        if bundle is None:
+            _logger.warning(
+                "support_bundles.job.skip",
+                "Support bundle job skipped because row is missing or already claimed",
+                bundle_id=bundle_id,
+            )
+            return
+        await execute_support_bundle(session, bundle)
+
+
+async def recover_support_bundle_jobs(
+    session: AsyncSession,
+    *,
+    stale_after_seconds: int,
+    limit: int = 5,
+) -> int:
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=stale_after_seconds)
+    result = await session.execute(
+        select(SupportBundle)
+        .where(
+            or_(
+                SupportBundle.status == "pending",
+                and_(SupportBundle.status == "running", SupportBundle.updated_at < cutoff),
+            )
+        )
+        .order_by(SupportBundle.created_at.asc())
+        .limit(limit)
+    )
+    jobs = list(result.scalars().all())
+    for bundle in jobs:
+        _logger.warning(
+            "support_bundles.job.recover",
+            "Recovering persisted support bundle job",
+            bundle_id=bundle.id,
+            status=bundle.status,
+        )
+        claimed = await claim_support_bundle_job(
+            session,
+            bundle.id,
+            stale_after_seconds=stale_after_seconds,
+        )
+        if claimed is None:
+            continue
+        await execute_support_bundle(session, claimed)
+    return len(jobs)
+
+
 def _row_dict(row: object) -> dict[str, object]:
     if row is None:
         return {}
@@ -142,7 +272,12 @@ def _read_log_tail(path: str, max_lines: int = 2000) -> str:
     file_path = Path(path)
     if not file_path.exists():
         return ""
-    text = file_path.read_text(encoding="utf-8", errors="replace")
+    with file_path.open("rb") as handle:
+        handle.seek(0, 2)
+        size = handle.tell()
+        handle.seek(max(0, size - _LOG_TAIL_BYTES))
+        raw = handle.read()
+    text = raw.decode("utf-8", errors="replace")
     lines = text.splitlines()
     if len(lines) > max_lines:
         lines = lines[-max_lines:]
@@ -213,6 +348,56 @@ def _snapshot_inventory() -> list[dict[str, object]]:
     return rows
 
 
+def _cleanup_work_dir(work_dir: Path) -> None:
+    for item in sorted(work_dir.rglob("*"), reverse=True):
+        try:
+            if item.is_file():
+                item.unlink()
+            elif item.is_dir():
+                item.rmdir()
+        except OSError:
+            continue
+    try:
+        work_dir.rmdir()
+    except OSError:
+        pass
+
+
+def _write_support_bundle_files(
+    *,
+    work_dir: Path,
+    archive_path: Path,
+    bundle_id: str,
+    manifest: dict[str, object],
+    state: object,
+    etcd_details: dict[str, object],
+) -> str:
+    (work_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    (work_dir / "cluster_state.json").write_text(
+        json.dumps(state, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    (work_dir / "etcd_state.json").write_text(
+        json.dumps(etcd_details, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    (work_dir / "etcd_snapshots.json").write_text(
+        json.dumps({"snapshots": _snapshot_inventory()}, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    (work_dir / "app.log.tail").write_text(_read_log_tail(_settings.log_file), encoding="utf-8")
+    agent_log_tail = _read_log_tail(getattr(_settings, "agent_log_file", "data/logs/agent.log"))
+    (work_dir / "agent.log.tail").write_text(agent_log_tail, encoding="utf-8")
+    (work_dir / "restore_playbook.md").write_text(_render_restore_playbook(), encoding="utf-8")
+
+    with tarfile.open(archive_path, "w:gz") as tar:
+        tar.add(work_dir, arcname=bundle_id)
+    return str(archive_path)
+
+
 def _sanitize_cluster_settings_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
     sanitized: list[dict[str, object]] = []
     for row in rows:
@@ -226,17 +411,57 @@ def _sanitize_cluster_settings_rows(rows: list[dict[str, object]]) -> list[dict[
     return sanitized
 
 
+def _artifact_work_dir(base_dir: Path, bundle_id: str) -> Path:
+    clean_id = bundle_id.strip()
+    if not _ARTIFACT_ID_RE.fullmatch(clean_id):
+        raise ValueError("support bundle id must be a safe artifact slug")
+    base = base_dir.resolve()
+    path = (base / f"{clean_id}.tmp").resolve()
+    if not path.is_relative_to(base):
+        raise ValueError("support bundle path escapes bundle directory")
+    return path
+
+
+def _artifact_archive_path(base_dir: Path, bundle_id: str) -> Path:
+    clean_id = bundle_id.strip()
+    if not _ARTIFACT_ID_RE.fullmatch(clean_id):
+        raise ValueError("support bundle id must be a safe artifact slug")
+    base = base_dir.resolve()
+    path = (base / f"{clean_id}.tar.gz").resolve()
+    if not path.is_relative_to(base):
+        raise ValueError("support bundle archive path escapes bundle directory")
+    return path
+
+
+def support_bundle_artifact_path(bundle: SupportBundle) -> Path:
+    if not bundle.path:
+        raise ValueError("support bundle has no artifact path")
+    base = Path(_settings.support_bundle_dir).resolve()
+    path = Path(bundle.path).resolve()
+    if not path.is_relative_to(base):
+        raise ValueError("support bundle artifact path escapes bundle directory")
+    return path
+
+
 async def _generate_support_bundle(session: AsyncSession, bundle_id: str) -> str:
     out_dir = Path(_settings.support_bundle_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    work_dir = out_dir / f"{bundle_id}.tmp"
+    work_dir = _artifact_work_dir(out_dir, bundle_id)
     work_dir.mkdir(parents=True, exist_ok=True)
     try:
-        nodes = list((await session.execute(select(Node))).scalars().all())
-        services = list((await session.execute(select(Service))).scalars().all())
-        replicas = list((await session.execute(select(Replica))).scalars().all())
-        endpoints = list((await session.execute(select(Endpoint))).scalars().all())
-        assignments = list((await session.execute(select(RouterAssignment))).scalars().all())
+        nodes = list((await session.execute(select(Node).order_by(Node.id).limit(_BUNDLE_ROW_LIMIT))).scalars().all())
+        services = list((await session.execute(select(Service).order_by(Service.id).limit(_BUNDLE_ROW_LIMIT))).scalars().all())
+        replicas = list((await session.execute(select(Replica).order_by(Replica.id).limit(_BUNDLE_ROW_LIMIT))).scalars().all())
+        endpoints = list((await session.execute(select(Endpoint).order_by(Endpoint.id).limit(_BUNDLE_ROW_LIMIT))).scalars().all())
+        assignments = list(
+            (
+                await session.execute(
+                    select(RouterAssignment).order_by(RouterAssignment.id).limit(_BUNDLE_ROW_LIMIT)
+                )
+            )
+            .scalars()
+            .all()
+        )
         settings_rows = list((await session.execute(select(ClusterSetting))).scalars().all())
         events = list((await session.execute(select(Event).order_by(Event.created_at.desc()).limit(500))).scalars().all())
 
@@ -260,11 +485,13 @@ async def _generate_support_bundle(session: AsyncSession, bundle_id: str) -> str
                 "cluster_settings": len(settings_rows),
                 "events": len(events),
             },
+            "limits": {
+                "max_rows_per_table": _BUNDLE_ROW_LIMIT,
+                "max_log_tail_bytes": _LOG_TAIL_BYTES,
+                "max_log_tail_lines": 2000,
+                "max_events": 500,
+            },
         }
-        (work_dir / "manifest.json").write_text(
-            json.dumps(manifest, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
         cluster_settings_rows = _sanitize_cluster_settings_rows([_row_dict(item) for item in settings_rows])
         state = _sanitize_obj(
             {
@@ -276,10 +503,6 @@ async def _generate_support_bundle(session: AsyncSession, bundle_id: str) -> str
                 "cluster_settings": cluster_settings_rows,
                 "events": [_row_dict(item) for item in events],
             }
-        )
-        (work_dir / "cluster_state.json").write_text(
-            json.dumps(state, indent=2, sort_keys=True),
-            encoding="utf-8",
         )
 
         etcd_details = {
@@ -315,36 +538,16 @@ async def _generate_support_bundle(session: AsyncSession, bundle_id: str) -> str
                 ]
             except Exception as exc:  # noqa: BLE001
                 etcd_details["error"] = f"{type(exc).__name__}: {exc}"
-        (work_dir / "etcd_state.json").write_text(
-            json.dumps(etcd_details, indent=2, sort_keys=True),
-            encoding="utf-8",
+
+        archive_path = _artifact_archive_path(out_dir, bundle_id)
+        return await asyncio.to_thread(
+            _write_support_bundle_files,
+            work_dir=work_dir,
+            archive_path=archive_path,
+            bundle_id=bundle_id,
+            manifest=manifest,
+            state=state,
+            etcd_details=etcd_details,
         )
-
-        (work_dir / "etcd_snapshots.json").write_text(
-            json.dumps({"snapshots": _snapshot_inventory()}, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-
-        log_tail = _read_log_tail(_settings.log_file)
-        (work_dir / "app.log.tail").write_text(log_tail, encoding="utf-8")
-        agent_log_tail = _read_log_tail(getattr(_settings, "agent_log_file", "data/logs/agent.log"))
-        (work_dir / "agent.log.tail").write_text(agent_log_tail, encoding="utf-8")
-        (work_dir / "restore_playbook.md").write_text(_render_restore_playbook(), encoding="utf-8")
-
-        archive_path = out_dir / f"{bundle_id}.tar.gz"
-        with tarfile.open(archive_path, "w:gz") as tar:
-            tar.add(work_dir, arcname=bundle_id)
-        return str(archive_path)
     finally:
-        for item in sorted(work_dir.rglob("*"), reverse=True):
-            try:
-                if item.is_file():
-                    item.unlink()
-                elif item.is_dir():
-                    item.rmdir()
-            except OSError:
-                continue
-        try:
-            work_dir.rmdir()
-        except OSError:
-            pass
+        await asyncio.to_thread(_cleanup_work_dir, work_dir)

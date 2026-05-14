@@ -3,7 +3,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import getpass
 import json
+import os
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -139,8 +142,51 @@ def _identity_dir(root: str, node_id: str) -> Path:
 
 
 def _add_auth_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--username", "--login-id", dest="username", required=True)
-    parser.add_argument("--password", required=True)
+    _add_api_url_arg(parser)
+    parser.add_argument(
+        "--session-token",
+        default=None,
+        help="Session token. Defaults to UPTIMEMESH_SESSION_TOKEN.",
+    )
+    parser.add_argument(
+        "--username",
+        "--login-id",
+        dest="username",
+        default=None,
+        help="Login username. Defaults to UPTIMEMESH_USERNAME.",
+    )
+    parser.add_argument(
+        "--password",
+        default=None,
+        help="Login password. Defaults to UPTIMEMESH_PASSWORD, or prompts when a username is provided.",
+    )
+
+
+def _add_api_url_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--api-url",
+        default=argparse.SUPPRESS,
+        help="Cluster API URL. May also be placed before the subcommand.",
+    )
+
+
+def _resolve_session_token(args: argparse.Namespace) -> str:
+    token = str(getattr(args, "session_token", "") or os.getenv("UPTIMEMESH_SESSION_TOKEN", "")).strip()
+    if token:
+        return token
+
+    username = str(getattr(args, "username", "") or os.getenv("UPTIMEMESH_USERNAME", "")).strip()
+    password = str(getattr(args, "password", "") or os.getenv("UPTIMEMESH_PASSWORD", ""))
+    if not username:
+        raise RuntimeError(
+            "Authentication required: pass --session-token, set UPTIMEMESH_SESSION_TOKEN, "
+            "or provide --username/UPTIMEMESH_USERNAME."
+        )
+    if not password:
+        password = getpass.getpass(f"Password for {username}: ")
+    if not password:
+        raise RuntimeError("Authentication failed: password is empty.")
+    return _login(args.api_url, username, password)
 
 
 def _generate_key_and_csr(node_id: str) -> tuple[str, str]:
@@ -205,7 +251,7 @@ def _sign(private_key: ec.EllipticCurvePrivateKey | rsa.RSAPrivateKey, message: 
 
 
 def cmd_bootstrap(args: argparse.Namespace) -> int:
-    session_token = _login(args.api_url, args.username, args.password)
+    session_token = _resolve_session_token(args)
     response = _api_request(
         base_url=args.api_url,
         path="/cluster/bootstrap",
@@ -252,7 +298,7 @@ def cmd_prepare_bootstrap_admin(args: argparse.Namespace) -> int:
 
 
 def cmd_create_token(args: argparse.Namespace) -> int:
-    session_token = _login(args.api_url, args.username, args.password)
+    session_token = _resolve_session_token(args)
     response = _api_request(
         base_url=args.api_url,
         path="/cluster/join-tokens",
@@ -279,12 +325,24 @@ async def _create_join_token_local_async(
             ttl_seconds=ttl_seconds,
             issued_by=issued_by,
         )
+        settings_map = await cluster_settings.get_settings_map(session)
     return {
         "id": token.id,
         "role": token.role,
         "token": token.token,
         "expires_at": token.expires_at.isoformat(),
+        "github_repo_url": settings_map.get("github_repo_url", "https://github.com/Dinkum/uptime-mesh"),
     }
+
+
+def _install_script_url(repo_url: str) -> str:
+    clean = repo_url.strip().removesuffix(".git")
+    if clean.startswith("https://github.com/"):
+        slug = clean.removeprefix("https://github.com/").strip("/")
+        if slug.count("/") >= 1:
+            owner, repo, *_ = slug.split("/")
+            return f"https://raw.githubusercontent.com/{owner}/{repo}/main/install.sh"
+    return "https://raw.githubusercontent.com/Dinkum/uptime-mesh/main/install.sh"
 
 
 def cmd_join_command(args: argparse.Namespace) -> int:
@@ -303,9 +361,11 @@ def cmd_join_command(args: argparse.Namespace) -> int:
     peer = str(args.peer).strip()
     if not peer:
         raise RuntimeError("--peer is required")
+    repo_url = str(token_payload.get("github_repo_url") or "https://github.com/Dinkum/uptime-mesh")
+    install_url = _install_script_url(repo_url)
     install_command = (
-        "curl -fsSL https://raw.githubusercontent.com/Dinkum/uptime-mesh/main/install.sh | "
-        f"bash -s -- --join {peer} --token {token}"
+        f"curl -fsSL {shlex.quote(install_url)} | "
+        f"sudo UPTIMEMESH_REPO_URL={shlex.quote(repo_url)} bash -s -- --join {shlex.quote(peer)} --token {shlex.quote(token)}"
     )
     if args.role and args.role != "auto":
         install_command += f" --role {args.role}"
@@ -406,7 +466,7 @@ def cmd_heartbeat(args: argparse.Namespace) -> int:
 
 
 def cmd_nodes_status(args: argparse.Namespace) -> int:
-    session_token = _login(args.api_url, args.username, args.password)
+    session_token = _resolve_session_token(args)
     rows_any = _api_request(
         base_url=args.api_url,
         path="/cluster/leases",
@@ -430,7 +490,7 @@ def cmd_nodes_status(args: argparse.Namespace) -> int:
 
 
 def cmd_replica_move(args: argparse.Namespace) -> int:
-    session_token = _login(args.api_url, args.username, args.password)
+    session_token = _resolve_session_token(args)
     result = _api_request(
         base_url=args.api_url,
         path=f"/replicas/{args.replica_id}/move",
@@ -445,7 +505,7 @@ def cmd_replica_move(args: argparse.Namespace) -> int:
 
 
 def cmd_service_apply_pinned(args: argparse.Namespace) -> int:
-    session_token = _login(args.api_url, args.username, args.password)
+    session_token = _resolve_session_token(args)
     result = _api_request(
         base_url=args.api_url,
         path=f"/services/{args.service_id}/apply-pinned",
@@ -460,7 +520,7 @@ def cmd_service_apply_pinned(args: argparse.Namespace) -> int:
 
 
 def cmd_monitoring_status(args: argparse.Namespace) -> int:
-    session_token = _login(args.api_url, args.username, args.password)
+    session_token = _resolve_session_token(args)
     result = _api_request(
         base_url=args.api_url,
         path="/monitoring/status",
@@ -474,7 +534,7 @@ def cmd_monitoring_status(args: argparse.Namespace) -> int:
 
 
 def cmd_monitoring_config(args: argparse.Namespace) -> int:
-    session_token = _login(args.api_url, args.username, args.password)
+    session_token = _resolve_session_token(args)
     result = _api_text_request(
         base_url=args.api_url,
         path="/monitoring/prometheus/config",
@@ -485,7 +545,7 @@ def cmd_monitoring_config(args: argparse.Namespace) -> int:
 
 
 def cmd_etcd_status(args: argparse.Namespace) -> int:
-    session_token = _login(args.api_url, args.username, args.password)
+    session_token = _resolve_session_token(args)
     result = _api_request(
         base_url=args.api_url,
         path="/etcd/status",
@@ -499,7 +559,7 @@ def cmd_etcd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_etcd_members(args: argparse.Namespace) -> int:
-    session_token = _login(args.api_url, args.username, args.password)
+    session_token = _resolve_session_token(args)
     result = _api_request(
         base_url=args.api_url,
         path="/etcd/members",
@@ -513,7 +573,7 @@ def cmd_etcd_members(args: argparse.Namespace) -> int:
 
 
 def cmd_etcd_quorum(args: argparse.Namespace) -> int:
-    session_token = _login(args.api_url, args.username, args.password)
+    session_token = _resolve_session_token(args)
     result = _api_request(
         base_url=args.api_url,
         path="/etcd/quorum",
@@ -527,7 +587,7 @@ def cmd_etcd_quorum(args: argparse.Namespace) -> int:
 
 
 def cmd_etcd_reconcile(args: argparse.Namespace) -> int:
-    session_token = _login(args.api_url, args.username, args.password)
+    session_token = _resolve_session_token(args)
     path = "/etcd/quorum/reconcile"
     if args.dry_run:
         path = f"{path}?dry_run=true"
@@ -545,7 +605,7 @@ def cmd_etcd_reconcile(args: argparse.Namespace) -> int:
 
 
 def cmd_snapshot_run(args: argparse.Namespace) -> int:
-    session_token = _login(args.api_url, args.username, args.password)
+    session_token = _resolve_session_token(args)
     body: Dict[str, Any] = {}
     if args.id:
         body["id"] = args.id
@@ -565,7 +625,7 @@ def cmd_snapshot_run(args: argparse.Namespace) -> int:
 
 
 def cmd_snapshot_list(args: argparse.Namespace) -> int:
-    session_token = _login(args.api_url, args.username, args.password)
+    session_token = _resolve_session_token(args)
     result = _api_request(
         base_url=args.api_url,
         path="/etcd/snapshots",
@@ -579,7 +639,7 @@ def cmd_snapshot_list(args: argparse.Namespace) -> int:
 
 
 def cmd_snapshot_restore(args: argparse.Namespace) -> int:
-    session_token = _login(args.api_url, args.username, args.password)
+    session_token = _resolve_session_token(args)
     result = _api_request(
         base_url=args.api_url,
         path=f"/etcd/snapshots/{args.snapshot_id}/restore",
@@ -594,7 +654,7 @@ def cmd_snapshot_restore(args: argparse.Namespace) -> int:
 
 
 def cmd_snapshot_download(args: argparse.Namespace) -> int:
-    session_token = _login(args.api_url, args.username, args.password)
+    session_token = _resolve_session_token(args)
     output = _download_file(
         base_url=args.api_url,
         path=f"/etcd/snapshots/{args.snapshot_id}/download",
@@ -606,7 +666,7 @@ def cmd_snapshot_download(args: argparse.Namespace) -> int:
 
 
 def cmd_support_bundle_run(args: argparse.Namespace) -> int:
-    session_token = _login(args.api_url, args.username, args.password)
+    session_token = _resolve_session_token(args)
     body: Dict[str, Any] = {}
     if args.id:
         body["id"] = args.id
@@ -626,7 +686,7 @@ def cmd_support_bundle_run(args: argparse.Namespace) -> int:
 
 
 def cmd_support_bundle_list(args: argparse.Namespace) -> int:
-    session_token = _login(args.api_url, args.username, args.password)
+    session_token = _resolve_session_token(args)
     result = _api_request(
         base_url=args.api_url,
         path="/support-bundles",
@@ -640,7 +700,7 @@ def cmd_support_bundle_list(args: argparse.Namespace) -> int:
 
 
 def cmd_support_bundle_download(args: argparse.Namespace) -> int:
-    session_token = _login(args.api_url, args.username, args.password)
+    session_token = _resolve_session_token(args)
     output = _download_file(
         base_url=args.api_url,
         path=f"/support-bundles/{args.bundle_id}/download",
@@ -652,7 +712,7 @@ def cmd_support_bundle_download(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="uptimemesh", description="UptimeMesh ASCII-first CLI")
+    parser = argparse.ArgumentParser(prog="uptime-mesh", description="UptimeMesh CLI")
     parser.add_argument("--api-url", default="http://127.0.0.1:8010")
 
     sub = parser.add_subparsers(dest="command", required=True)
@@ -709,6 +769,7 @@ def build_parser() -> argparse.ArgumentParser:
     join.add_argument("--lease-ttl", type=int, default=45)
     join.add_argument("--identity-dir", default="data/identities")
     join.add_argument("--label", action="append", default=[])
+    _add_api_url_arg(join)
     join.set_defaults(func=cmd_join)
 
     heartbeat = sub.add_parser("heartbeat", help="Send signed node heartbeat")
@@ -717,11 +778,18 @@ def build_parser() -> argparse.ArgumentParser:
     heartbeat.add_argument("--lease-token")
     heartbeat.add_argument("--ttl", type=int, default=45)
     heartbeat.add_argument("--status-json", default="{}")
+    _add_api_url_arg(heartbeat)
     heartbeat.set_defaults(func=cmd_heartbeat)
 
     nodes_status = sub.add_parser("nodes-status", help="Show lease status for nodes")
     _add_auth_args(nodes_status)
     nodes_status.set_defaults(func=cmd_nodes_status)
+
+    nodes = sub.add_parser("nodes", help="Node operations")
+    nodes_sub = nodes.add_subparsers(dest="nodes_command", required=True)
+    nodes_status_group = nodes_sub.add_parser("status", help="Show lease status")
+    _add_auth_args(nodes_status_group)
+    nodes_status_group.set_defaults(func=cmd_nodes_status)
 
     replica_move = sub.add_parser("replica-move", help="Move replica to another node")
     _add_auth_args(replica_move)
@@ -751,6 +819,15 @@ def build_parser() -> argparse.ArgumentParser:
     _add_auth_args(monitoring_config)
     monitoring_config.set_defaults(func=cmd_monitoring_config)
 
+    monitoring = sub.add_parser("monitoring", help="Monitoring operations")
+    monitoring_sub = monitoring.add_subparsers(dest="monitoring_command", required=True)
+    monitoring_status_group = monitoring_sub.add_parser("status", help="Show reconciliation state")
+    _add_auth_args(monitoring_status_group)
+    monitoring_status_group.set_defaults(func=cmd_monitoring_status)
+    monitoring_config_group = monitoring_sub.add_parser("config", help="Render Prometheus config")
+    _add_auth_args(monitoring_config_group)
+    monitoring_config_group.set_defaults(func=cmd_monitoring_config)
+
     etcd_status = sub.add_parser("etcd-status", help="Show etcd endpoint health")
     _add_auth_args(etcd_status)
     etcd_status.set_defaults(func=cmd_etcd_status)
@@ -770,6 +847,22 @@ def build_parser() -> argparse.ArgumentParser:
     _add_auth_args(etcd_reconcile)
     etcd_reconcile.add_argument("--dry-run", action="store_true")
     etcd_reconcile.set_defaults(func=cmd_etcd_reconcile)
+
+    etcd = sub.add_parser("etcd", help="etcd operations")
+    etcd_sub = etcd.add_subparsers(dest="etcd_command", required=True)
+    etcd_status_group = etcd_sub.add_parser("status", help="Show endpoint health")
+    _add_auth_args(etcd_status_group)
+    etcd_status_group.set_defaults(func=cmd_etcd_status)
+    etcd_members_group = etcd_sub.add_parser("members", help="List members")
+    _add_auth_args(etcd_members_group)
+    etcd_members_group.set_defaults(func=cmd_etcd_members)
+    etcd_quorum_group = etcd_sub.add_parser("quorum", help="Show quorum state")
+    _add_auth_args(etcd_quorum_group)
+    etcd_quorum_group.set_defaults(func=cmd_etcd_quorum)
+    etcd_reconcile_group = etcd_sub.add_parser("reconcile", help="Reconcile membership")
+    _add_auth_args(etcd_reconcile_group)
+    etcd_reconcile_group.add_argument("--dry-run", action="store_true")
+    etcd_reconcile_group.set_defaults(func=cmd_etcd_reconcile)
 
     snapshot_run = sub.add_parser("snapshot-run", help="Run etcd snapshot now")
     _add_auth_args(snapshot_run)
@@ -792,6 +885,26 @@ def build_parser() -> argparse.ArgumentParser:
     _add_auth_args(snapshot_download)
     snapshot_download.set_defaults(func=cmd_snapshot_download)
 
+    snapshot = sub.add_parser("snapshot", help="Snapshot operations")
+    snapshot_sub = snapshot.add_subparsers(dest="snapshot_command", required=True)
+    snapshot_run_group = snapshot_sub.add_parser("run", help="Run etcd snapshot now")
+    _add_auth_args(snapshot_run_group)
+    snapshot_run_group.add_argument("--id")
+    snapshot_run_group.add_argument("--requested-by")
+    snapshot_run_group.set_defaults(func=cmd_snapshot_run)
+    snapshot_list_group = snapshot_sub.add_parser("list", help="List etcd snapshots")
+    _add_auth_args(snapshot_list_group)
+    snapshot_list_group.set_defaults(func=cmd_snapshot_list)
+    snapshot_restore_group = snapshot_sub.add_parser("restore", help="Restore etcd snapshot")
+    snapshot_restore_group.add_argument("snapshot_id")
+    _add_auth_args(snapshot_restore_group)
+    snapshot_restore_group.set_defaults(func=cmd_snapshot_restore)
+    snapshot_download_group = snapshot_sub.add_parser("download", help="Download snapshot artifact")
+    snapshot_download_group.add_argument("snapshot_id")
+    snapshot_download_group.add_argument("--output", required=True)
+    _add_auth_args(snapshot_download_group)
+    snapshot_download_group.set_defaults(func=cmd_snapshot_download)
+
     support_bundle_run = sub.add_parser("support-bundle-run", help="Generate support bundle")
     _add_auth_args(support_bundle_run)
     support_bundle_run.add_argument("--id")
@@ -810,13 +923,54 @@ def build_parser() -> argparse.ArgumentParser:
     _add_auth_args(support_bundle_download)
     support_bundle_download.set_defaults(func=cmd_support_bundle_download)
 
+    support = sub.add_parser("support", help="Support bundle operations")
+    support_sub = support.add_subparsers(dest="support_command", required=True)
+    support_bundle = support_sub.add_parser("bundle", help="Support bundle operations")
+    support_bundle_sub = support_bundle.add_subparsers(dest="bundle_command", required=True)
+    support_bundle_run_group = support_bundle_sub.add_parser("run", help="Generate support bundle")
+    _add_auth_args(support_bundle_run_group)
+    support_bundle_run_group.add_argument("--id")
+    support_bundle_run_group.add_argument("--requested-by")
+    support_bundle_run_group.set_defaults(func=cmd_support_bundle_run)
+    support_bundle_list_group = support_bundle_sub.add_parser("list", help="List support bundles")
+    _add_auth_args(support_bundle_list_group)
+    support_bundle_list_group.set_defaults(func=cmd_support_bundle_list)
+    support_bundle_download_group = support_bundle_sub.add_parser(
+        "download", help="Download support bundle artifact"
+    )
+    support_bundle_download_group.add_argument("bundle_id")
+    support_bundle_download_group.add_argument("--output", required=True)
+    _add_auth_args(support_bundle_download_group)
+    support_bundle_download_group.set_defaults(func=cmd_support_bundle_download)
+
     return parser
+
+
+def _normalize_global_args(argv: list[str]) -> list[str]:
+    extracted: list[str] = []
+    remaining: list[str] = []
+    index = 0
+    while index < len(argv):
+        item = argv[index]
+        if item == "--api-url":
+            if index + 1 >= len(argv):
+                raise RuntimeError("missing value for --api-url")
+            extracted.extend([item, argv[index + 1]])
+            index += 2
+            continue
+        if item.startswith("--api-url="):
+            extracted.append(item)
+            index += 1
+            continue
+        remaining.append(item)
+        index += 1
+    return extracted + remaining
 
 
 def main() -> None:
     parser = build_parser()
-    args = parser.parse_args()
     try:
+        args = parser.parse_args(_normalize_global_args(sys.argv[1:]))
         exit_code = args.func(args)
     except Exception as exc:  # noqa: BLE001
         print(f"error: {exc}", file=sys.stderr)

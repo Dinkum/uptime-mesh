@@ -183,7 +183,9 @@ def heartbeat_signing_message(
     ttl_seconds: int,
     status_patch: Dict[str, Any],
 ) -> bytes:
-    status_json = json.dumps(status_patch, sort_keys=True, separators=(",", ":"))
+    # Keep this byte contract in lockstep with the Go agent's heartbeatSigningMessage:
+    # newline-delimited fields plus canonical JSON for status_patch.
+    status_json = json.dumps(status_patch, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     raw = f"{node_id}\n{lease_token}\n{signed_at}\n{ttl_seconds}\n{status_json}"
     return raw.encode("utf-8")
 

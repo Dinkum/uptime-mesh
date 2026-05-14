@@ -4,6 +4,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import cast
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -32,6 +33,7 @@ DEFAULT_ROLE_SPECS: dict[str, dict[str, object]] = {
         "cooldown_seconds": 30,
         "slot_count": 0,
         "runtime_template": "nginx_backend",
+        "runtime_owner": "go-agent",
     },
     "reverse_proxy": {
         "kind": "replicated",
@@ -44,6 +46,7 @@ DEFAULT_ROLE_SPECS: dict[str, dict[str, object]] = {
         "cooldown_seconds": 30,
         "slot_count": 0,
         "runtime_template": "caddy_reverse_proxy",
+        "runtime_owner": "go-agent",
     },
     "dns_server": {
         "kind": "replicated",
@@ -56,6 +59,7 @@ DEFAULT_ROLE_SPECS: dict[str, dict[str, object]] = {
         "cooldown_seconds": 30,
         "slot_count": 0,
         "runtime_template": "unbound_dns",
+        "runtime_owner": "external",
     },
 }
 
@@ -189,18 +193,24 @@ def _conflicts(
         return False
 
     current_spec = role_specs.get(role_name, {})
+    raw_role_strict = current_spec.get("strict_separation_with", [])
+    if not isinstance(raw_role_strict, list):
+        raw_role_strict = []
     role_strict = {
         str(item)
-        for item in current_spec.get("strict_separation_with", [])
+        for item in raw_role_strict
         if isinstance(item, str) and item.strip()
     }
     for assigned_role in existing:
         if assigned_role in role_strict:
             return True
         assigned_spec = role_specs.get(assigned_role, {})
+        raw_assigned_strict = assigned_spec.get("strict_separation_with", [])
+        if not isinstance(raw_assigned_strict, list):
+            raw_assigned_strict = []
         assigned_strict = {
             str(item)
-            for item in assigned_spec.get("strict_separation_with", [])
+            for item in raw_assigned_strict
             if isinstance(item, str) and item.strip()
         }
         if role_name in assigned_strict:
@@ -215,8 +225,9 @@ async def get_role_specs(session: AsyncSession) -> dict[str, dict[str, object]]:
         merged: dict[str, dict[str, object]] = {}
         for name, default_payload in DEFAULT_ROLE_SPECS.items():
             payload = default_payload
-            if isinstance(existing.get(name), dict):
-                payload = {**default_payload, **existing.get(name, {})}
+            override = existing.get(name)
+            if isinstance(override, dict):
+                payload = {**default_payload, **cast(dict[str, object], override)}
             merged[name] = _normalize_role_spec(name, payload)
 
         for name, value in existing.items():

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 from collections import defaultdict
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -108,7 +109,7 @@ async def list_gateway_routes(
             domain_routes=domain_routes,
         )
 
-        grouped: dict[str, dict[str, object]] = {}
+        grouped: dict[str, dict[str, Any]] = {}
         collisions: set[tuple[str, str]] = set()
         seen_routes: set[tuple[str, str]] = set()
         service_endpoints: dict[str, set[tuple[str, int]]] = {}

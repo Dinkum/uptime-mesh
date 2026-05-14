@@ -222,9 +222,7 @@ async def get_db_session(
                 )
 
 
-async def get_writable_db_session(
-    session: AsyncSession = Depends(get_db_session),
-) -> AsyncSession:
+async def ensure_cluster_writable(session: AsyncSession) -> AsyncSession:
     etcd_status = await get_setting(session, "etcd_status")
     status_value = etcd_status.value.lower() if etcd_status is not None else "unknown"
     _DB_GUARD_LOGGER.info("write_guard.check", "Checked etcd write guard", etcd_status=status_value)
@@ -249,3 +247,9 @@ async def get_writable_db_session(
         etcd_status=etcd_status.value.lower(),
     )
     return session
+
+
+async def get_writable_db_session(
+    session: AsyncSession = Depends(get_db_session),
+) -> AsyncSession:
+    return await ensure_cluster_writable(session)

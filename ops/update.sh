@@ -13,33 +13,78 @@ VERSION_URL="${VERSION_URL:-$DEFAULT_VERSION_URL}"
 CHANNEL="${CHANNEL:-stable}"
 GITHUB_REPO="${GITHUB_REPO:-$DEFAULT_GITHUB_REPO}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/uptime-mesh}"
-BIN_PATH="${BIN_PATH:-/usr/local/bin/uptimemesh-agent}"
+BIN_PATH="${BIN_PATH:-$INSTALL_DIR/bin/uptimemesh-agent}"
 HEALTH_TIMEOUT_SECONDS="${HEALTH_TIMEOUT_SECONDS:-90}"
 HEALTH_INTERVAL_SECONDS="${HEALTH_INTERVAL_SECONDS:-3}"
 STATE_FILE=""
 FORCE=0
 
+usage() {
+  cat <<'USAGE'
+Usage:
+  sudo ops/update.sh [options]
+
+Options:
+  --version-url <url>       Manifest URL (default: stable GitHub manifest)
+  --channel <name>          Manifest channel (default: stable)
+  --github-repo <slug>      GitHub repo slug for release metadata
+  --install-dir <path>      Install directory (default: /opt/uptime-mesh)
+  --health-url <url>        Health check URL
+  --agent-socket <path>     Agent control socket path
+  --force                   Re-run even when already current or last retry failed
+  -h, --help                Show help
+USAGE
+}
+
+require_arg_value() {
+  local flag="$1"
+  local value="${2:-}"
+  if [[ -z "$value" || "$value" == --* ]]; then
+    echo "missing value for ${flag}" >&2
+    usage
+    exit 1
+  fi
+}
+
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
     --version-url)
+      require_arg_value "$1" "${2:-}"
       VERSION_URL="$2"
       shift 2
       ;;
     --channel)
+      require_arg_value "$1" "${2:-}"
       CHANNEL="$2"
       shift 2
       ;;
     --github-repo)
+      require_arg_value "$1" "${2:-}"
       GITHUB_REPO="$2"
       shift 2
       ;;
     --install-dir)
+      require_arg_value "$1" "${2:-}"
       INSTALL_DIR="$2"
+      shift 2
+      ;;
+    --health-url)
+      require_arg_value "$1" "${2:-}"
+      HEALTH_URL="$2"
+      shift 2
+      ;;
+    --agent-socket)
+      require_arg_value "$1" "${2:-}"
+      AGENT_SOCKET="$2"
       shift 2
       ;;
     --force)
       FORCE=1
       shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
       ;;
     *)
       echo "unknown argument: $1" >&2
@@ -51,6 +96,7 @@ done
 STATE_FILE="${STATE_FILE:-$INSTALL_DIR/data/update-state.json}"
 LOCK_DIR="${LOCK_DIR:-/tmp/uptimemesh-update.lock}"
 UPDATE_LOG="${UPDATE_LOG:-$INSTALL_DIR/data/logs/update.log}"
+AGENT_SOCKET="${AGENT_SOCKET:-$INSTALL_DIR/data/agent.sock}"
 
 mkdir -p "$(dirname "$UPDATE_LOG")" >/dev/null 2>&1 || true
 mkdir -p "$INSTALL_DIR/data" >/dev/null 2>&1 || true
@@ -114,7 +160,7 @@ download_file() {
         return 0
       fi
     elif command -v wget >/dev/null 2>&1; then
-      if wget -qO "$dst" "$src"; then
+      if wget -qO "$dst" --timeout=45 --tries=1 "$src"; then
         return 0
       fi
     else
@@ -145,11 +191,11 @@ is_github_generated_tarball_url() {
 http_get() {
   local url="$1"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsS "$url" >/dev/null 2>&1
+    curl -fsS --connect-timeout 3 --max-time 8 "$url" >/dev/null 2>&1
     return $?
   fi
   if command -v wget >/dev/null 2>&1; then
-    wget -qO - "$url" >/dev/null 2>&1
+    wget -qO - --timeout=8 --tries=1 "$url" >/dev/null 2>&1
     return $?
   fi
   return 1
@@ -222,15 +268,19 @@ PY
 }
 
 resolve_health_url() {
+  if [[ -n "${HEALTH_URL:-}" ]]; then
+    printf '%s' "$HEALTH_URL"
+    return 0
+  fi
   local env_file="$INSTALL_DIR/.env"
   if [[ ! -f "$env_file" ]]; then
     printf 'http://127.0.0.1:8010/health'
     return 0
   fi
-  local base
-  base="$(sed -n -E 's/^RUNTIME_API_BASE_URL=(.*)$/\1/p' "$env_file" | tail -n 1)"
-  if [[ -n "$base" ]]; then
-    printf '%s/health' "${base%/}"
+  local port
+  port="$(sed -n -E 's/^SERVER_PORT=(.*)$/\1/p' "$env_file" | tail -n 1)"
+  if [[ -n "$port" ]]; then
+    printf 'http://127.0.0.1:%s/health' "$port"
   else
     printf 'http://127.0.0.1:8010/health'
   fi
@@ -247,6 +297,12 @@ wait_for_health() {
     elapsed=$((elapsed + HEALTH_INTERVAL_SECONDS))
   done
   return 1
+}
+
+agent_socket_healthy() {
+  [[ -S "$AGENT_SOCKET" ]] || return 1
+  command -v curl >/dev/null 2>&1 || return 1
+  curl -fsS --unix-socket "$AGENT_SOCKET" --connect-timeout 2 --max-time 5 http://localhost/healthz >/dev/null 2>&1
 }
 
 resolve_db_path() {
@@ -315,9 +371,10 @@ PY
 install_global_cli_shims() {
   local shim_path="/usr/local/bin/uptime-mesh"
   local compat_path="/usr/local/bin/uptimemesh"
-  cat > "$shim_path" <<EOF
+cat > "$shim_path" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+cd "${INSTALL_DIR}"
 CLI_BIN="${INSTALL_DIR}/.venv/bin/uptimemesh"
 if [[ ! -x "\${CLI_BIN}" ]]; then
   echo "uptime-mesh CLI is not installed yet at \${CLI_BIN}" >&2
@@ -344,6 +401,7 @@ prune_glob_keep() {
 
 prune_old_backups() {
   prune_glob_keep "${INSTALL_DIR}.prev.*.tar.gz" 3
+  prune_glob_keep "${INSTALL_DIR}.prev.*.venv.tgz" 3
   prune_glob_keep "${INSTALL_DIR}.prev.*.sqlite" 3
   prune_glob_keep "${INSTALL_DIR}/data/uptimemesh-agent.pre-update-*" 3
   prune_glob_keep "${INSTALL_DIR}.failed.*" 2
@@ -351,9 +409,10 @@ prune_old_backups() {
 
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/uptimemesh-update.XXXXXX")"
 APP_ARCHIVE_BACKUP=""
+VENV_ARCHIVE_BACKUP=""
 DB_BACKUP=""
 AGENT_BACKUP=""
-HEALTH_URL=""
+HEALTH_URL="${HEALTH_URL:-}"
 LATEST_VERSION=""
 PREVIOUS_VERSION=""
 ROLLBACK_READY=0
@@ -382,20 +441,23 @@ rollback_and_fail() {
         if [[ -d "$INSTALL_DIR/data" ]]; then
           cp -a "$INSTALL_DIR/data" "$restored_tree/" || warn "rollback failed to preserve data dir"
         fi
-        if [[ -d "$INSTALL_DIR/.venv" ]]; then
-          cp -a "$INSTALL_DIR/.venv" "$restored_tree/" || warn "rollback failed to preserve venv"
-        fi
         if [[ -d "$INSTALL_DIR" ]]; then
           FAILED_DIR="${INSTALL_DIR}.failed.$(date -u +%Y%m%dT%H%M%SZ)"
           mv "$INSTALL_DIR" "$FAILED_DIR" || true
         fi
         mv "$restored_tree" "$INSTALL_DIR" || warn "rollback failed to put app tree back"
+        if [[ -n "$VENV_ARCHIVE_BACKUP" && -f "$VENV_ARCHIVE_BACKUP" ]]; then
+          run_logged "rollback.venv_extract" tar -xzf "$VENV_ARCHIVE_BACKUP" -C "$INSTALL_DIR" || warn "rollback failed to restore previous venv"
+        fi
       else
         warn "rollback archive did not contain expected app tree"
       fi
     fi
 
     if [[ -n "$db_path" && -f "$DB_BACKUP" ]]; then
+      if command -v systemctl >/dev/null 2>&1 && service_exists uptime-mesh.service; then
+        systemctl stop uptime-mesh.service || warn "rollback could not stop uptime-mesh.service before DB restore"
+      fi
       mkdir -p "$(dirname "$db_path")" || true
       cp "$DB_BACKUP" "$db_path" || warn "rollback could not restore DB backup"
     fi
@@ -489,7 +551,7 @@ fi
 PREVIOUS_VERSION="$CURRENT_VERSION"
 
 if [[ "$FORCE" -ne 1 && -n "$CURRENT_VERSION" && "$CURRENT_VERSION" == "$LATEST_VERSION" ]]; then
-  log "already current | version: $CURRENT_VERSION"
+  log "already current | version: $CURRENT_VERSION | use --force to re-run checks and reinstall"
   exit 0
 fi
 
@@ -497,7 +559,7 @@ if [[ "$FORCE" -ne 1 ]]; then
   last_status="$(extract_state_field "$STATE_FILE" status)"
   last_attempted="$(extract_state_field "$STATE_FILE" attempted)"
   if [[ "$last_status" == "failed" && "$last_attempted" == "$LATEST_VERSION" ]]; then
-    log "skipping failed version retry | attempted: $LATEST_VERSION"
+    log "skipping failed version retry | attempted: $LATEST_VERSION | inspect $STATE_FILE or run with --force"
     exit 0
   fi
 fi
@@ -513,13 +575,17 @@ AGENT_BACKUP="$INSTALL_DIR/data/uptimemesh-agent.pre-update-${backup_stamp}"
 if [[ -d "$INSTALL_DIR" ]]; then
   run_logged "backup.app" tar --exclude='./data' --exclude='./.venv' -czf "$APP_ARCHIVE_BACKUP" -C "$(dirname "$INSTALL_DIR")" "$(basename "$INSTALL_DIR")" || fail "failed app directory backup"
 fi
+if [[ -d "$INSTALL_DIR/.venv" ]]; then
+  VENV_ARCHIVE_BACKUP="${INSTALL_DIR}.prev.${backup_stamp}.venv.tgz"
+  run_logged "backup.venv" tar -czf "$VENV_ARCHIVE_BACKUP" -C "$INSTALL_DIR" .venv || fail "failed venv backup"
+fi
 
 db_path="$(resolve_db_path || true)"
 if [[ -n "$db_path" && -f "$db_path" ]]; then
   if command -v sqlite3 >/dev/null 2>&1; then
-    run_logged "backup.db" sqlite3 "$db_path" ".backup '$DB_BACKUP'" || run_logged "backup.db_copy" cp "$db_path" "$DB_BACKUP" || fail "failed db backup"
+    run_logged "backup.db" sqlite3 "$db_path" ".backup '$DB_BACKUP'" || fail "failed db backup"
   else
-    run_logged "backup.db_copy" cp "$db_path" "$DB_BACKUP" || fail "failed db backup"
+    fail "sqlite3 is required for safe SQLite backup during update"
   fi
 fi
 
@@ -565,17 +631,19 @@ run_or_rollback "failed applying source sync archive" run_logged "sync.apply" ta
 [[ -f "$preserve_cfg" ]] && cp "$preserve_cfg" "$INSTALL_DIR/config.yaml"
 
 agent_new="$TMP_DIR/uptimemesh-agent.new"
-run_or_rollback "go agent build failed" run_logged "go.build" bash -lc "cd '$INSTALL_DIR' && go build -trimpath -ldflags '-s -w' -o '$agent_new' ./agent/cmd/uptimemesh-agent"
+run_or_rollback "go agent build failed" run_logged "go.build" bash -c 'cd "$1" && go build -trimpath -ldflags "-s -w" -o "$2" ./agent/cmd/uptimemesh-agent' bash "$INSTALL_DIR" "$agent_new"
 run_or_rollback "failed staging new agent binary" run_logged "agent.stage" install -m 0755 "$agent_new" "${BIN_PATH}.new"
 run_or_rollback "failed swapping new agent binary" run_logged "agent.swap" mv "${BIN_PATH}.new" "$BIN_PATH"
 
 if [[ ! -x "$INSTALL_DIR/.venv/bin/pip" ]]; then
   run_or_rollback "failed creating python venv" run_logged "venv.create" python3 -m venv "$INSTALL_DIR/.venv"
 fi
-run_or_rollback "pip upgrade failed" run_logged "pip.upgrade" "$INSTALL_DIR/.venv/bin/pip" install --upgrade pip
-run_or_rollback "pip install failed" run_logged "pip.install" "$INSTALL_DIR/.venv/bin/pip" install -e "$INSTALL_DIR"
+run_or_rollback "pip install failed" run_logged "pip.install.pinned" "$INSTALL_DIR/.venv/bin/pip" install --upgrade pip==25.3
+[[ -f "$INSTALL_DIR/requirements.lock" ]] || rollback_and_fail "requirements.lock is required for locked Python installs"
+run_or_rollback "locked pip install failed" run_logged "pip.install.locked" "$INSTALL_DIR/.venv/bin/pip" install -r "$INSTALL_DIR/requirements.lock"
+run_or_rollback "app pip install failed" run_logged "pip.install.app" "$INSTALL_DIR/.venv/bin/pip" install --no-build-isolation --no-deps -e "$INSTALL_DIR"
 run_or_rollback "failed installing CLI command shims" run_logged "cli.shims" install_global_cli_shims
-run_or_rollback "database migration failed" run_logged "db.migrate" bash -lc "cd '$INSTALL_DIR' && ./.venv/bin/alembic upgrade head"
+run_or_rollback "database migration failed" run_logged "db.migrate" bash -c 'cd "$1" && ./.venv/bin/alembic upgrade head' bash "$INSTALL_DIR"
 
 normalize_log_paths
 
@@ -586,6 +654,10 @@ if command -v systemctl >/dev/null 2>&1; then
   run_or_rollback "failed restarting uptime-mesh.service" run_logged "service.restart.api" systemctl restart uptime-mesh.service
   if service_exists uptime-mesh-agent.service; then
     run_or_rollback "failed restarting uptime-mesh-agent.service" run_logged "service.restart.agent" systemctl restart uptime-mesh-agent.service
+    run_or_rollback "agent service health gate failed" systemctl is-active --quiet uptime-mesh-agent.service
+    if [[ -S "$AGENT_SOCKET" ]]; then
+      run_or_rollback "agent socket health gate failed" agent_socket_healthy
+    fi
   else
     warn "skipping agent restart (unit not present)"
   fi

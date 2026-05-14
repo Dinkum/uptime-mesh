@@ -1,20 +1,26 @@
 {% extends "layout.html" %}
 
 {% block content %}
-  <div class="mesh-card bg-white rounded-2xl p-6">
+  <div class="mesh-card rounded-2xl p-6">
     <div class="flex items-center justify-between">
       <h2 class="text-lg font-semibold">Events</h2>
-      <span class="text-xs mono text-slate-400">Live stream enabled</span>
+      <span id="event-stream-state" class="badge badge-outline mono">connecting</span>
     </div>
     <div id="event-list" class="mt-4 space-y-3">
       {% for event in events %}
-        <div class="p-3 rounded-xl border border-slate-100">
+        <div class="p-3 rounded-xl border border-slate-700/40 bg-slate-950/30">
           <div class="flex items-center justify-between">
             <p class="font-medium">{{ event.name }}</p>
             <span class="badge badge-outline">{{ event.level }}</span>
           </div>
           <p class="text-xs text-slate-400">{{ event.category }} · {{ event.created_at }}</p>
-          <p class="text-xs mono text-slate-500">{{ event.fields }}</p>
+          <div class="mt-2 flex flex-wrap gap-2">
+            {% if event.fields %}
+              {% for key, value in event.fields.items() %}
+                <span class="badge badge-outline mono">{{ key }}={{ value }}</span>
+              {% endfor %}
+            {% endif %}
+          </div>
         </div>
       {% else %}
         <p class="text-sm text-slate-400">No events yet.</p>
@@ -24,20 +30,69 @@
 
   <script>
     const eventList = document.getElementById("event-list");
-    const source = new EventSource("/events/stream");
+    const streamState = document.getElementById("event-stream-state");
+    const seenEvents = new Set({{ events | map(attribute='id') | list | tojson }});
+    const streamSince = {{ events_stream_since | tojson }};
+    const source = new EventSource(`/events/stream${streamSince ? `?since=${encodeURIComponent(streamSince)}` : ""}`);
+
+    function escapeHtml(input) {
+      return String(input ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+    }
+
+    function fieldBadges(fields) {
+      if (!fields || typeof fields !== "object") return "";
+      return Object.entries(fields)
+        .slice(0, 12)
+        .map(([key, value]) => `<span class="badge badge-outline mono">${escapeHtml(key)}=${escapeHtml(value)}</span>`)
+        .join("");
+    }
+
+    source.onopen = () => {
+      if (streamState) {
+        streamState.textContent = "live";
+        streamState.className = "badge badge-success badge-outline mono";
+      }
+    };
+
+    source.onerror = () => {
+      if (streamState) {
+        streamState.textContent = "reconnecting";
+        streamState.className = "badge badge-warning badge-outline mono";
+      }
+    };
+
     source.addEventListener("event", (message) => {
       const payload = JSON.parse(message.data);
+      if (payload.id && seenEvents.has(payload.id)) {
+        return;
+      }
+      if (payload.id) {
+        seenEvents.add(payload.id);
+      }
+      eventList.querySelectorAll("p").forEach((item) => {
+        if (item.textContent.trim() === "No events yet.") {
+          item.remove();
+        }
+      });
       const wrapper = document.createElement("div");
-      wrapper.className = "p-3 rounded-xl border border-slate-100";
+      wrapper.className = "p-3 rounded-xl border border-slate-700/40 bg-slate-950/30";
       wrapper.innerHTML = `
         <div class="flex items-center justify-between">
-          <p class="font-medium">${payload.name}</p>
-          <span class="badge badge-outline">${payload.level}</span>
+          <p class="font-medium">${escapeHtml(payload.name)}</p>
+          <span class="badge badge-outline">${escapeHtml(payload.level)}</span>
         </div>
-        <p class="text-xs text-slate-400">${payload.category} · ${payload.created_at}</p>
-        <p class="text-xs mono text-slate-500">${JSON.stringify(payload.fields)}</p>
+        <p class="text-xs text-slate-400">${escapeHtml(payload.category)} · ${escapeHtml(payload.created_at)}</p>
+        <div class="mt-2 flex flex-wrap gap-2">${fieldBadges(payload.fields)}</div>
       `;
       eventList.prepend(wrapper);
+      while (eventList.children.length > 200) {
+        eventList.removeChild(eventList.lastElementChild);
+      }
     });
   </script>
 {% endblock %}

@@ -33,9 +33,13 @@ import (
 )
 
 const (
-	agentVersion     = "0.2.1"
-	swimGossipFanout = 3
+	agentVersion           = "0.2.2"
+	swimGossipFanout       = 3
+	swimIndirectRelayLimit = 32
+	swimMaxPeerStates      = 1024
 )
+
+var actuatedRuntimeRoles = []string{"backend_server", "reverse_proxy"}
 
 type Config struct {
 	EnvFile                    string
@@ -47,6 +51,7 @@ type Config struct {
 	IdentityDir                string
 	HeartbeatIntervalSeconds   int
 	HeartbeatTTLSeconds        int
+	APIRequestTimeoutSeconds   int
 	EnableWireGuard            bool
 	MeshCIDR                   string
 	PrimaryIface               string
@@ -117,6 +122,7 @@ type Agent struct {
 	swimState          string
 	swimPeers          map[string]*SwimPeerState
 	swimPending        map[string]chan swimMessage
+	swimIndirectSem    chan struct{}
 	swimConn           *net.UDPConn
 	internalCDNVersion string
 	internalCDNHash    string
@@ -134,6 +140,16 @@ type wgPeerIntent struct {
 	endpoint            string
 	allowedIPs          string
 	persistentKeepalive int
+}
+
+type clusterPeerDTO struct {
+	NodeID string `json:"node_id"`
+	MeshIP string `json:"mesh_ip"`
+}
+
+type rolePlacementDTO struct {
+	PlacementMap    map[string][]string `json:"placement_map"`
+	NodeAssignments map[string][]string `json:"node_assignments"`
 }
 
 type swimMessage struct {
@@ -219,7 +235,7 @@ func main() {
 		cfg: cfg,
 		log: logger,
 		client: &http.Client{
-			Timeout: time.Duration(cfg.CommandTimeoutSeconds) * time.Second,
+			Timeout: time.Duration(cfg.APIRequestTimeoutSeconds) * time.Second,
 		},
 		state:           FailoverState{ActiveIface: cfg.PrimaryIface},
 		lastStatusPatch: map[string]any{},
@@ -227,6 +243,7 @@ func main() {
 		swimState:       "healthy",
 		swimPeers:       map[string]*SwimPeerState{},
 		swimPending:     map[string]chan swimMessage{},
+		swimIndirectSem: make(chan struct{}, swimIndirectRelayLimit),
 		assignedRoles:   []string{},
 		backendTargets:  []string{},
 		loadScores:      map[string]float64{},
@@ -343,12 +360,13 @@ func loadConfig(envFile string) (Config, error) {
 		EnvFile:                    envFile,
 		LogFile:                    logFile,
 		LogLevel:                   get("LOG_LEVEL", "INFO"),
-		APIServerURL:               strings.TrimSuffix(get("RUNTIME_API_BASE_URL", "http://127.0.0.1:8010"), "/"),
+		APIServerURL:               strings.TrimSuffix(get("RUNTIME_API_BASE_URL", "http://127.0.0.1:8000"), "/"),
 		NodeID:                     get("RUNTIME_NODE_ID", ""),
 		NodeName:                   get("RUNTIME_NODE_NAME", ""),
 		IdentityDir:                get("RUNTIME_IDENTITY_DIR", "data/identities"),
 		HeartbeatIntervalSeconds:   parseInt("RUNTIME_HEARTBEAT_INTERVAL_SECONDS", 15),
 		HeartbeatTTLSeconds:        parseInt("RUNTIME_HEARTBEAT_TTL_SECONDS", 45),
+		APIRequestTimeoutSeconds:   parseInt("RUNTIME_API_TIMEOUT_SECONDS", 5),
 		EnableWireGuard:            parseBool("RUNTIME_WG_CONFIGURE", true),
 		MeshCIDR:                   get("RUNTIME_MESH_CIDR", "10.42.0.0/16"),
 		PrimaryIface:               get("RUNTIME_WG_PRIMARY_IFACE", "wg-mesh0"),
@@ -360,7 +378,7 @@ func loadConfig(envFile string) (Config, error) {
 		FailoverThreshold:          parseInt("RUNTIME_FAILOVER_THRESHOLD", 3),
 		FailbackStableCount:        parseInt("RUNTIME_FAILBACK_STABLE_COUNT", 6),
 		FailbackEnabled:            parseBool("RUNTIME_FAILBACK_ENABLED", false),
-		CommandTimeoutSeconds:      parseInt("RUNTIME_COMMAND_TIMEOUT_SECONDS", 6),
+		CommandTimeoutSeconds:      parseInt("RUNTIME_COMMAND_TIMEOUT_SECONDS", 30),
 		PingTimeoutSeconds:         parseInt("RUNTIME_PING_TIMEOUT_SECONDS", 1),
 		WGKeyDir:                   get("RUNTIME_WG_KEY_DIR", "data/wireguard"),
 		WGLocalAddress:             get("RUNTIME_WG_LOCAL_ADDRESS", ""),
@@ -395,6 +413,24 @@ func loadConfig(envFile string) (Config, error) {
 	}
 	if cfg.HeartbeatTTLSeconds < 10 {
 		cfg.HeartbeatTTLSeconds = 10
+	}
+	if cfg.APIRequestTimeoutSeconds < 1 {
+		cfg.APIRequestTimeoutSeconds = 5
+	}
+	if cfg.APIRequestTimeoutSeconds > 60 {
+		cfg.APIRequestTimeoutSeconds = 60
+	}
+	if cfg.CommandTimeoutSeconds < 1 {
+		cfg.CommandTimeoutSeconds = 30
+	}
+	if cfg.CommandTimeoutSeconds > 300 {
+		cfg.CommandTimeoutSeconds = 300
+	}
+	if cfg.PingTimeoutSeconds < 1 {
+		cfg.PingTimeoutSeconds = 1
+	}
+	if cfg.PingTimeoutSeconds > 30 {
+		cfg.PingTimeoutSeconds = 30
 	}
 	if cfg.FailoverThreshold < 1 {
 		cfg.FailoverThreshold = 1
@@ -580,6 +616,58 @@ func writeJSON(w http.ResponseWriter, statusCode int, payload map[string]any) {
 	_, _ = w.Write(body)
 }
 
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
+}
+
+func removeUnixSocketFile(path string) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		return fmt.Errorf("refusing to remove non-socket path: %s", path)
+	}
+	return os.Remove(path)
+}
+
 func (a *Agent) startUnixSocketAPI(ctx context.Context) error {
 	socketPath := strings.TrimSpace(a.cfg.UnixSocketPath)
 	if socketPath == "" {
@@ -589,7 +677,7 @@ func (a *Agent) startUnixSocketAPI(ctx context.Context) error {
 	if err := os.MkdirAll(socketDir, 0o755); err != nil {
 		return fmt.Errorf("create socket dir: %w", err)
 	}
-	if err := os.Remove(socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := removeUnixSocketFile(socketPath); err != nil {
 		return fmt.Errorf("remove stale socket: %w", err)
 	}
 
@@ -644,7 +732,7 @@ func (a *Agent) startUnixSocketAPI(ctx context.Context) error {
 		defer cancel()
 		_ = server.Shutdown(shutdownCtx)
 		_ = listener.Close()
-		_ = os.Remove(socketPath)
+		_ = removeUnixSocketFile(socketPath)
 		a.log.Info("agent.admin", "socket.stop", "Stopped unix socket admin API", map[string]any{
 			"socket_path": socketPath,
 		})
@@ -802,6 +890,13 @@ func (a *Agent) handleSWIMMessage(remote *net.UDPAddr, msg swimMessage) {
 		a.mu.Lock()
 		peer := a.swimPeers[msg.From]
 		if peer == nil {
+			if len(a.swimPeers) >= swimMaxPeerStates {
+				a.mu.Unlock()
+				a.log.Warn("agent.swim", "peer.drop", "Dropped SWIM peer because peer-state limit is reached", map[string]any{
+					"peer_limit": swimMaxPeerStates,
+				})
+				return
+			}
 			peer = &SwimPeerState{
 				NodeID:      msg.From,
 				State:       "healthy",
@@ -860,8 +955,17 @@ func (a *Agent) handleSWIMMessage(remote *net.UDPAddr, msg swimMessage) {
 		if remote == nil {
 			return
 		}
+		select {
+		case a.swimIndirectSem <- struct{}{}:
+		default:
+			a.log.Warn("agent.swim", "indirect.drop", "Dropped SWIM indirect probe because relay limit is reached", map[string]any{
+				"relay_limit": swimIndirectRelayLimit,
+			})
+			return
+		}
 		relay := *remote
 		go func(relayAddr net.UDPAddr, relayMsg swimMessage) {
+			defer func() { <-a.swimIndirectSem }()
 			targetNodeID := strings.TrimSpace(relayMsg.TargetNode)
 			targetIP := strings.TrimSpace(relayMsg.TargetIP)
 			if targetNodeID == "" || targetIP == "" || strings.TrimSpace(relayMsg.Nonce) == "" {
@@ -1055,6 +1159,10 @@ func (a *Agent) mergeSWIMGossip(peers map[string]map[string]any) {
 		a.mu.Lock()
 		peer := a.swimPeers[nodeID]
 		if peer == nil {
+			if len(a.swimPeers) >= swimMaxPeerStates {
+				a.mu.Unlock()
+				continue
+			}
 			peer = &SwimPeerState{
 				NodeID:      nodeID,
 				State:       "unknown",
@@ -1218,7 +1326,7 @@ func (a *Agent) indirectProbeSWIM(targetNodeID string, targetIP string, helpers 
 	}
 }
 
-func (a *Agent) fetchClusterPeers(ctx context.Context, leaseToken string) ([]map[string]any, error) {
+func (a *Agent) fetchClusterPeers(ctx context.Context, leaseToken string) ([]clusterPeerDTO, error) {
 	u := fmt.Sprintf(
 		"%s/cluster/peers?node_id=%s&lease_token=%s",
 		a.cfg.APIServerURL,
@@ -1238,7 +1346,7 @@ func (a *Agent) fetchClusterPeers(ctx context.Context, leaseToken string) ([]map
 	if err != nil {
 		return nil, err
 	}
-	var rows []map[string]any
+	var rows []clusterPeerDTO
 	if err := json.Unmarshal(body, &rows); err != nil {
 		return nil, err
 	}
@@ -1248,7 +1356,7 @@ func (a *Agent) fetchClusterPeers(ctx context.Context, leaseToken string) ([]map
 func (a *Agent) reconcileSWIM(
 	ctx context.Context,
 	leaseToken string,
-	peersRaw []map[string]any,
+	peersRaw []clusterPeerDTO,
 	peersErr error,
 ) map[string]any {
 	patch := map[string]any{
@@ -1271,15 +1379,38 @@ func (a *Agent) reconcileSWIM(
 
 	now := time.Now().UTC()
 	candidates := make([]*SwimPeerState, 0, len(peersRaw))
-	a.mu.Lock()
+	knownPeerIDs := map[string]struct{}{}
 	for _, row := range peersRaw {
-		nodeID := strings.TrimSpace(fmt.Sprintf("%v", row["node_id"]))
+		nodeID := strings.TrimSpace(row.NodeID)
+		if nodeID != "" && nodeID != a.cfg.NodeID {
+			knownPeerIDs[nodeID] = struct{}{}
+		}
+	}
+	pruneAfterSeconds := a.cfg.SWIMCooldownSeconds * 2
+	if pruneAfterSeconds < 300 {
+		pruneAfterSeconds = 300
+	}
+	pruneBefore := now.Add(-time.Duration(pruneAfterSeconds) * time.Second)
+	a.mu.Lock()
+	for nodeID, peer := range a.swimPeers {
+		if _, ok := knownPeerIDs[nodeID]; ok {
+			continue
+		}
+		if peer == nil || peer.LastSeen.IsZero() || peer.LastSeen.Before(pruneBefore) {
+			delete(a.swimPeers, nodeID)
+		}
+	}
+	for _, row := range peersRaw {
+		nodeID := strings.TrimSpace(row.NodeID)
 		if nodeID == "" || nodeID == a.cfg.NodeID {
 			continue
 		}
-		meshIP := strings.TrimSpace(fmt.Sprintf("%v", row["mesh_ip"]))
+		meshIP := strings.TrimSpace(row.MeshIP)
 		peer := a.swimPeers[nodeID]
 		if peer == nil {
+			if len(a.swimPeers) >= swimMaxPeerStates {
+				continue
+			}
 			peer = &SwimPeerState{
 				NodeID: nodeID,
 				State:  "unknown",
@@ -1509,6 +1640,17 @@ func (a *Agent) syncInternalCDN(ctx context.Context, leaseToken string) map[stri
 	a.mu.RLock()
 	knownHash := strings.TrimSpace(a.internalCDNHash)
 	a.mu.RUnlock()
+	contentBase := strings.TrimSpace(a.cfg.InternalCDNDir)
+	if contentBase == "" {
+		contentBase = "data/internal-cdn"
+	}
+	targetDir := filepath.Join(contentBase, "active")
+	indexPath := filepath.Join(targetDir, "index.html")
+	if knownHash != "" {
+		if _, statErr := os.Stat(indexPath); statErr != nil {
+			knownHash = ""
+		}
+	}
 	u := fmt.Sprintf(
 		"%s/cluster/content/active?node_id=%s&lease_token=%s",
 		a.cfg.APIServerURL,
@@ -1547,11 +1689,6 @@ func (a *Agent) syncInternalCDN(ctx context.Context, leaseToken string) map[stri
 	hashSHA := strings.TrimSpace(fmt.Sprintf("%v", payload["hash_sha256"]))
 	bodyBase64 := strings.TrimSpace(fmt.Sprintf("%v", payload["body_base64"]))
 	sizeBytes, _ := payload["size_bytes"].(float64)
-	targetDir := filepath.Join(strings.TrimSpace(a.cfg.InternalCDNDir), "active")
-	if targetDir == "" {
-		targetDir = "data/internal-cdn/active"
-	}
-	indexPath := filepath.Join(targetDir, "index.html")
 	if hashSHA != "" && hashSHA == knownHash {
 		if _, statErr := os.Stat(indexPath); statErr == nil {
 			patch["internal_cdn_state"] = "healthy"
@@ -1586,7 +1723,7 @@ func (a *Agent) syncInternalCDN(ctx context.Context, leaseToken string) map[stri
 		patch["internal_cdn_error"] = err.Error()
 		return patch
 	}
-	if err := os.WriteFile(indexPath, raw, 0o644); err != nil {
+	if err := writeFileAtomic(indexPath, raw, 0o644); err != nil {
 		patch["internal_cdn_state"] = "degraded"
 		patch["internal_cdn_error"] = err.Error()
 		return patch
@@ -2300,7 +2437,7 @@ func (a *Agent) syncRoleAssignment(
 	ctx context.Context,
 	leaseToken string,
 	peersFetched bool,
-	peersRaw []map[string]any,
+	peersRaw []clusterPeerDTO,
 	peersErr error,
 ) map[string]any {
 	patch := map[string]any{}
@@ -2330,33 +2467,27 @@ func (a *Agent) syncRoleAssignment(
 		patch["role_assignment_error"] = err.Error()
 		return patch
 	}
-	var payload map[string]any
+	var payload rolePlacementDTO
 	if err := json.Unmarshal(body, &payload); err != nil {
 		patch["role_assignment_error"] = err.Error()
 		return patch
 	}
 	assignments := []string{}
-	nodeAssignments, ok := payload["node_assignments"].(map[string]any)
-	if ok {
-		if raw, ok := nodeAssignments[a.cfg.NodeID].([]any); ok {
-			for _, item := range raw {
-				value := strings.TrimSpace(fmt.Sprintf("%v", item))
-				if value != "" {
-					assignments = append(assignments, value)
-				}
+	if raw, ok := payload.NodeAssignments[a.cfg.NodeID]; ok {
+		for _, item := range raw {
+			value := strings.TrimSpace(item)
+			if value != "" {
+				assignments = append(assignments, value)
 			}
 		}
 	}
 
 	backendNodeIDs := []string{}
-	placementMap, ok := payload["placement_map"].(map[string]any)
-	if ok {
-		if raw, ok := placementMap["backend_server"].([]any); ok {
-			for _, item := range raw {
-				value := strings.TrimSpace(fmt.Sprintf("%v", item))
-				if value != "" {
-					backendNodeIDs = append(backendNodeIDs, value)
-				}
+	if raw, ok := payload.PlacementMap["backend_server"]; ok {
+		for _, item := range raw {
+			value := strings.TrimSpace(item)
+			if value != "" {
+				backendNodeIDs = append(backendNodeIDs, value)
 			}
 		}
 	}
@@ -2370,8 +2501,8 @@ func (a *Agent) syncRoleAssignment(
 			patch["backend_targets_error"] = peersErr.Error()
 		} else {
 			for _, row := range peersRaw {
-				nodeID := strings.TrimSpace(fmt.Sprintf("%v", row["node_id"]))
-				meshIP := strings.TrimSpace(fmt.Sprintf("%v", row["mesh_ip"]))
+				nodeID := strings.TrimSpace(row.NodeID)
+				meshIP := strings.TrimSpace(row.MeshIP)
 				if nodeID != "" && meshIP != "" {
 					peerByNodeID[nodeID] = meshIP
 				}
@@ -2414,7 +2545,8 @@ func (a *Agent) reconcileRoleRuntimes(ctx context.Context) map[string]any {
 	a.mu.RUnlock()
 
 	patch := map[string]any{
-		"role_runtime_roles": roles,
+		"role_runtime_roles":        roles,
+		"role_runtime_capabilities": append([]string{}, actuatedRuntimeRoles...),
 	}
 	backendEnabled := hasRole(roles, "backend_server")
 	proxyEnabled := hasRole(roles, "reverse_proxy")
@@ -2496,7 +2628,9 @@ server {
 			return patch
 		}
 	}
-	if err := os.WriteFile(configPath, []byte(config), 0o644); err != nil {
+	backup, backupErr := os.ReadFile(configPath)
+	hadBackup := backupErr == nil
+	if err := writeFileAtomic(configPath, []byte(config), 0o644); err != nil {
 		patch["backend_runtime_state"] = "degraded"
 		patch["backend_runtime_error"] = err.Error()
 		setRoleActuationStatus(patch, "backend_server", false, templateHash, -1, err.Error())
@@ -2512,6 +2646,11 @@ server {
 
 	code, out, errText := a.runCommand(ctx, "backend.nginx_validate", "nginx", "-t")
 	if code != 0 {
+		if hadBackup {
+			_ = writeFileAtomic(configPath, backup, 0o644)
+		} else {
+			_ = os.Remove(configPath)
+		}
 		patch["backend_runtime_state"] = "degraded"
 		patch["backend_runtime_error"] = firstNonEmpty(errText, out, fmt.Sprintf("exit_%d", code))
 		setRoleActuationStatus(
@@ -2557,6 +2696,9 @@ server {
 	if code != 0 {
 		code, out, errText = a.runCommand(ctx, "backend.nginx_restart", "systemctl", "restart", "nginx")
 		if code != 0 {
+			if hadBackup {
+				_ = writeFileAtomic(configPath, backup, 0o644)
+			}
 			patch["backend_runtime_state"] = "degraded"
 			patch["backend_runtime_error"] = firstNonEmpty(errText, out, fmt.Sprintf("exit_%d", code))
 			setRoleActuationStatus(
@@ -2646,7 +2788,9 @@ func (a *Agent) reconcileProxyRuntime(ctx context.Context, enabled bool, upstrea
 			return patch
 		}
 	}
-	if err := os.WriteFile(configPath, []byte(builder.String()), 0o644); err != nil {
+	configBody := []byte(builder.String())
+	candidatePath := configPath + ".candidate"
+	if err := writeFileAtomic(candidatePath, configBody, 0o644); err != nil {
 		patch["proxy_runtime_state"] = "degraded"
 		patch["proxy_runtime_error"] = err.Error()
 		setRoleActuationStatus(patch, "reverse_proxy", false, templateHash, -1, err.Error())
@@ -2660,8 +2804,9 @@ func (a *Agent) reconcileProxyRuntime(ctx context.Context, enabled bool, upstrea
 		return patch
 	}
 
-	code, out, errText := a.runCommand(ctx, "proxy.caddy_validate", "caddy", "validate", "--config", configPath, "--adapter", "caddyfile")
+	code, out, errText := a.runCommand(ctx, "proxy.caddy_validate", "caddy", "validate", "--config", candidatePath, "--adapter", "caddyfile")
 	if code != 0 {
+		_ = os.Remove(candidatePath)
 		patch["proxy_runtime_state"] = "degraded"
 		patch["proxy_runtime_error"] = firstNonEmpty(errText, out, fmt.Sprintf("exit_%d", code))
 		setRoleActuationStatus(
@@ -2681,9 +2826,29 @@ func (a *Agent) reconcileProxyRuntime(ctx context.Context, enabled bool, upstrea
 		})
 		return patch
 	}
+	backup, backupErr := os.ReadFile(configPath)
+	hadBackup := backupErr == nil
+	if err := writeFileAtomic(configPath, configBody, 0o644); err != nil {
+		_ = os.Remove(candidatePath)
+		patch["proxy_runtime_state"] = "degraded"
+		patch["proxy_runtime_error"] = err.Error()
+		setRoleActuationStatus(patch, "reverse_proxy", false, templateHash, -1, err.Error())
+		a.log.Warn("agent.roles", "role.reverse_proxy.apply", "Reverse proxy role apply failed", map[string]any{
+			"apply_ok":         false,
+			"template_hash":    templateHash,
+			"reload_exit_code": -1,
+			"error":            err.Error(),
+			"path":             configPath,
+		})
+		return patch
+	}
+	_ = os.Remove(candidatePath)
 
 	code, out, errText = a.runCommand(ctx, "proxy.caddy_enable", "systemctl", "enable", "--now", "caddy")
 	if code != 0 {
+		if hadBackup {
+			_ = writeFileAtomic(configPath, backup, 0o644)
+		}
 		patch["proxy_runtime_state"] = "degraded"
 		patch["proxy_runtime_error"] = firstNonEmpty(errText, out, fmt.Sprintf("exit_%d", code))
 		setRoleActuationStatus(
@@ -2707,6 +2872,9 @@ func (a *Agent) reconcileProxyRuntime(ctx context.Context, enabled bool, upstrea
 	if code != 0 {
 		code, out, errText = a.runCommand(ctx, "proxy.caddy_restart", "systemctl", "restart", "caddy")
 		if code != 0 {
+			if hadBackup {
+				_ = writeFileAtomic(configPath, backup, 0o644)
+			}
 			patch["proxy_runtime_state"] = "degraded"
 			patch["proxy_runtime_error"] = firstNonEmpty(errText, out, fmt.Sprintf("exit_%d", code))
 			setRoleActuationStatus(
@@ -2875,7 +3043,7 @@ func (a *Agent) tick(ctx context.Context) error {
 			"error": privateKeyErr.Error(),
 		})
 	}
-	peersRaw := []map[string]any{}
+	peersRaw := []clusterPeerDTO{}
 	peersErr := error(nil)
 	peersFetched := false
 	if leaseErr == nil && a.cfg.SWIMEnabled {
@@ -3278,11 +3446,24 @@ func (a *Agent) wireGuardKeyPath(iface string) string {
 	return filepath.Join(dir, iface+".key")
 }
 
+func validWireGuardPrivateKey(raw string) bool {
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(raw))
+	return err == nil && len(decoded) == 32
+}
+
 func (a *Agent) ensureWireGuardKey(ctx context.Context, iface string) (string, error) {
 	keyPath := a.wireGuardKeyPath(iface)
-	info, err := os.Stat(keyPath)
-	if err == nil && info.Size() > 0 {
-		return keyPath, nil
+	if raw, err := os.ReadFile(keyPath); err == nil && len(strings.TrimSpace(string(raw))) > 0 {
+		if validWireGuardPrivateKey(string(raw)) {
+			return keyPath, nil
+		}
+		quarantinePath := fmt.Sprintf("%s.invalid.%d", keyPath, time.Now().Unix())
+		_ = os.Rename(keyPath, quarantinePath)
+		a.log.Warn("agent.wireguard", "key.invalid", "Quarantined invalid WireGuard private key", map[string]any{
+			"iface":           iface,
+			"key_path":        keyPath,
+			"quarantine_path": quarantinePath,
+		})
 	}
 
 	code, out, errText := a.runCommand(ctx, "wireguard.key.generate", "wg", "genkey")
@@ -3290,7 +3471,10 @@ func (a *Agent) ensureWireGuardKey(ctx context.Context, iface string) (string, e
 		return "", fmt.Errorf("wg genkey failed: %s", firstNonEmpty(errText, out, fmt.Sprintf("exit_%d", code)))
 	}
 	key := strings.TrimSpace(out) + "\n"
-	if writeErr := os.WriteFile(keyPath, []byte(key), 0o600); writeErr != nil {
+	if !validWireGuardPrivateKey(key) {
+		return "", errors.New("wg genkey returned invalid private key material")
+	}
+	if writeErr := writeFileAtomic(keyPath, []byte(key), 0o600); writeErr != nil {
 		return "", writeErr
 	}
 	a.log.Info("agent.wireguard", "key.create", "Generated WireGuard private key", map[string]any{
@@ -3436,12 +3620,17 @@ func (a *Agent) interfaceUp(ctx context.Context, iface string) bool {
 
 func (a *Agent) pingRouter(ctx context.Context, iface, ip string) bool {
 	timeout := strconv.Itoa(maxInt(1, a.cfg.PingTimeoutSeconds))
-	code, _, _ := a.runCommand(ctx, "wireguard.router.ping", "ping", "-I", iface, "-c", "1", "-W", timeout, ip)
+	pingTimeout := time.Duration(maxInt(1, a.cfg.PingTimeoutSeconds)+1) * time.Second
+	code, _, _ := a.runCommandWithTimeout(ctx, pingTimeout, "wireguard.router.ping", "ping", "-I", iface, "-c", "1", "-W", timeout, ip)
 	return code == 0
 }
 
 func (a *Agent) runCommand(ctx context.Context, event string, name string, args ...string) (int, string, string) {
-	cmdCtx, cancel := context.WithTimeout(ctx, time.Duration(a.cfg.CommandTimeoutSeconds)*time.Second)
+	return a.runCommandWithTimeout(ctx, time.Duration(a.cfg.CommandTimeoutSeconds)*time.Second, event, name, args...)
+}
+
+func (a *Agent) runCommandWithTimeout(ctx context.Context, timeout time.Duration, event string, name string, args ...string) (int, string, string) {
+	cmdCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(cmdCtx, name, args...)
@@ -3630,10 +3819,15 @@ func signMessage(privateKey crypto.PrivateKey, message []byte) (string, error) {
 }
 
 func heartbeatSigningMessage(nodeID, leaseToken string, signedAt int64, ttlSeconds int, statusPatch map[string]any) ([]byte, error) {
-	statusJSON, err := json.Marshal(statusPatch)
-	if err != nil {
+	// Keep this byte contract in lockstep with app.identity.heartbeat_signing_message:
+	// newline-delimited fields plus canonical JSON for statusPatch.
+	var statusBuffer bytes.Buffer
+	encoder := json.NewEncoder(&statusBuffer)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(statusPatch); err != nil {
 		return nil, err
 	}
+	statusJSON := bytes.TrimSpace(statusBuffer.Bytes())
 	raw := fmt.Sprintf("%s\n%s\n%d\n%d\n%s", nodeID, leaseToken, signedAt, ttlSeconds, string(statusJSON))
 	return []byte(raw), nil
 }

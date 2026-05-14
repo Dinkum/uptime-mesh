@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -69,7 +70,7 @@ async def list_discovery_services(
         )
         rows = (await session.execute(query)).all()
         op.step("db.select", "Fetched healthy endpoint rows", rows=len(rows))
-        grouped: dict[str, dict[str, object]] = {}
+        grouped: dict[str, dict[str, Any]] = {}
         for row in rows:
             service_id = str(row.service_id)
             service_name = str(row.service_name)
@@ -131,6 +132,7 @@ async def list_endpoint_registry(
     session: AsyncSession,
     *,
     stale_after_seconds: int = 90,
+    node_id: str | None = None,
 ) -> list[dict[str, object]]:
     threshold = max(30, stale_after_seconds)
     now = datetime.now(timezone.utc)
@@ -138,6 +140,7 @@ async def list_endpoint_registry(
         "discovery.endpoints.list",
         "Listing endpoint registry (all health states)",
         stale_after_seconds=threshold,
+        node_id=node_id or "",
     ) as op:
         query = (
             select(
@@ -157,6 +160,8 @@ async def list_endpoint_registry(
             .join(Service, Service.id == Replica.service_id)
             .order_by(Service.name.asc(), Endpoint.id.asc())
         )
+        if node_id:
+            query = query.where(Replica.node_id == node_id)
         rows = (await session.execute(query)).all()
         op.step("db.select", "Fetched endpoint rows", rows=len(rows))
 

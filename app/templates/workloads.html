@@ -285,21 +285,31 @@
 
   <script>
     async function serviceAction(serviceId, action) {
-      const response = await fetch(`/services/${serviceId}/${action}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: "{}"
-      });
-      if (response.ok) window.location.reload();
+      if (!window.confirm(`Run ${action} for service ${serviceId}?`)) return;
+      try {
+        await window.umFetch(`/services/${serviceId}/${action}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{}"
+        });
+        window.location.reload();
+      } catch (error) {
+        console.error(error);
+      }
     }
 
     async function replicaAction(replicaId, action) {
-      const response = await fetch(`/replicas/${replicaId}/${action}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: "{}"
-      });
-      if (response.ok) window.location.reload();
+      if (!window.confirm(`Run ${action} for replica ${replicaId}?`)) return;
+      try {
+        await window.umFetch(`/replicas/${replicaId}/${action}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{}"
+        });
+        window.location.reload();
+      } catch (error) {
+        console.error(error);
+      }
     }
 
     function escapeHtml(input) {
@@ -361,22 +371,21 @@
     }
 
     async function schedulerPlanAll() {
-      const response = await fetch("/scheduler/plan/all");
-      if (!response.ok) return;
+      const response = await window.umFetch("/scheduler/plan/all");
       const data = await response.json();
       renderResults(data);
     }
 
     async function schedulerReconcileAll() {
-      const response = await fetch("/scheduler/reconcile/all", { method: "POST" });
-      if (!response.ok) return;
+      if (!window.confirm("Reconcile all scheduled services?")) return;
+      const response = await window.umFetch("/scheduler/reconcile/all", { method: "POST" });
       const data = await response.json();
       renderResults(data);
     }
 
     async function reconcileService(serviceId) {
-      const response = await fetch(`/scheduler/reconcile/services/${serviceId}`, { method: "POST" });
-      if (!response.ok) return;
+      if (!window.confirm(`Reconcile service ${serviceId}?`)) return;
+      await window.umFetch(`/scheduler/reconcile/services/${serviceId}`, { method: "POST" });
       await schedulerPlanAll();
     }
   </script>

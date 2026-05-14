@@ -116,6 +116,13 @@ def _run_etcdctl(
         )
     except FileNotFoundError as exc:
         raise EtcdUnavailableError("etcd.command", str(exc)) from exc
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or f"timed out after {timeout_seconds}s"
+        raise EtcdError(
+            "etcd.timeout",
+            f"{stderr.strip() or stdout.strip()}",
+        ) from exc
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 
@@ -126,11 +133,15 @@ async def _run_checked(
     timeout_seconds: int = 20,
 ) -> str:
     arg_list = list(args)
-    code, out, err = await asyncio.to_thread(
-        _run_etcdctl,
-        args=tuple(arg_list),
-        timeout_seconds=timeout_seconds,
-    )
+    try:
+        code, out, err = await asyncio.to_thread(
+            _run_etcdctl,
+            args=tuple(arg_list),
+            timeout_seconds=timeout_seconds,
+        )
+    except EtcdError:
+        record_etcd_operation(action=action, ok=False)
+        raise
     if code != 0:
         record_etcd_operation(action=action, ok=False)
         _logger.warning(
@@ -210,7 +221,10 @@ def _coerce_int(value: object, default: int = 0) -> int:
     return default
 
 
-async def endpoint_status() -> list[dict[str, object]]:
+async def endpoint_status(
+    *,
+    health_rows: list[EtcdHealth] | None = None,
+) -> list[dict[str, object]]:
     out = await _run_checked(
         args=("endpoint", "status", "-w", "json"),
         action="endpoint.status",
@@ -220,22 +234,26 @@ async def endpoint_status() -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     if not isinstance(parsed, list):
         return rows
-    health_by_endpoint = {item.endpoint: item for item in await endpoint_health()}
+    if health_rows is None:
+        health_rows = await endpoint_health()
+    health_by_endpoint = {item.endpoint: item for item in health_rows}
     for item in parsed:
         if not isinstance(item, dict):
             continue
         endpoint = str(item.get("Endpoint") or "")
-        status = item.get("Status") if isinstance(item.get("Status"), dict) else {}
+        raw_status = item.get("Status")
+        status = raw_status if isinstance(raw_status, dict) else {}
         leader = _coerce_int(status.get("leader"), default=0)
-        header = status.get("header") if isinstance(status.get("header"), dict) else {}
+        raw_header = status.get("header")
+        header = raw_header if isinstance(raw_header, dict) else {}
         health_row = health_by_endpoint.get(endpoint)
         rows.append(
             {
                 "endpoint": endpoint,
-                "member_id": str(status.get("header", {}).get("member_id") or ""),
+                "member_id": str(header.get("member_id") or ""),
                 "healthy": bool(health_row.healthy) if health_row else False,
                 "error": health_row.error if health_row else "",
-                "is_leader": leader != 0 and _coerce_int(status.get("header", {}).get("member_id"), default=0) == leader,
+                "is_leader": leader != 0 and _coerce_int(header.get("member_id"), default=0) == leader,
                 "db_size": _coerce_int(status.get("dbSize"), default=0),
                 "revision": _coerce_int(header.get("revision"), default=0),
                 "raft_term": _coerce_int(status.get("raftTerm"), default=0),

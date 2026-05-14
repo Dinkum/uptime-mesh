@@ -259,7 +259,7 @@ async def create_service(session: AsyncSession, payload: ServiceCreate) -> Servi
         "service.create",
         "Creating service",
         service_id=payload.id,
-        name=payload.name,
+        service_name=payload.name,
     ) as op:
         service = Service(
             id=payload.id,

@@ -11,7 +11,6 @@
       rel="stylesheet"
     />
     <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://cdn.jsdelivr.net/npm/daisyui@4.7.3/dist/full.min.js"></script>
     <style>
       :root {
         --mesh-ink: #e2e8f0;
@@ -30,6 +29,122 @@
       }
       .mono {
         font-family: "IBM Plex Mono", monospace;
+      }
+      .btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0.45rem;
+        min-height: 2.5rem;
+        padding: 0 1rem;
+        border-radius: 0.75rem;
+        border: 1px solid rgba(100, 116, 139, 0.62);
+        background: rgba(15, 23, 42, 0.72);
+        color: #e2e8f0;
+        font-weight: 700;
+        text-decoration: none;
+        transition: border-color 120ms ease, background 120ms ease, color 120ms ease, opacity 120ms ease;
+      }
+      .btn:hover {
+        border-color: rgba(56, 189, 248, 0.75);
+        background: rgba(14, 165, 233, 0.18);
+      }
+      .btn:disabled {
+        cursor: not-allowed;
+        opacity: 0.55;
+      }
+      .btn-primary {
+        border-color: rgba(56, 189, 248, 0.9);
+        background: rgba(14, 165, 233, 0.28);
+        color: #f0f9ff;
+      }
+      .btn-error {
+        border-color: rgba(251, 113, 133, 0.74);
+        background: rgba(127, 29, 29, 0.42);
+        color: #ffe4e6;
+      }
+      .btn-outline {
+        background: rgba(15, 23, 42, 0.52);
+      }
+      .btn-sm {
+        min-height: 2rem;
+        padding: 0 0.75rem;
+        border-radius: 0.65rem;
+        font-size: 0.875rem;
+      }
+      .btn-xs {
+        min-height: 1.65rem;
+        padding: 0 0.55rem;
+        border-radius: 0.55rem;
+        font-size: 0.75rem;
+      }
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        min-height: 1.45rem;
+        padding: 0 0.55rem;
+        border-radius: 999px;
+        border: 1px solid rgba(148, 163, 184, 0.45);
+        color: #cbd5e1;
+        font-size: 0.75rem;
+        font-weight: 700;
+      }
+      .badge-success {
+        border-color: rgba(52, 211, 153, 0.74);
+        color: #a7f3d0;
+      }
+      .badge-warning {
+        border-color: rgba(251, 191, 36, 0.78);
+        color: #fde68a;
+      }
+      .badge-error {
+        border-color: rgba(251, 113, 133, 0.76);
+        color: #fecdd3;
+      }
+      .alert {
+        border: 1px solid rgba(148, 163, 184, 0.28);
+        border-radius: 0.75rem;
+        padding: 0.9rem 1rem;
+      }
+      .alert-info {
+        border-color: rgba(56, 189, 248, 0.45);
+        background: rgba(14, 165, 233, 0.14);
+      }
+      .alert-success {
+        border-color: rgba(52, 211, 153, 0.45);
+        background: rgba(6, 78, 59, 0.24);
+      }
+      .alert-warning {
+        border-color: rgba(251, 191, 36, 0.48);
+        background: rgba(120, 53, 15, 0.22);
+      }
+      .alert-error {
+        border-color: rgba(251, 113, 133, 0.5);
+        background: rgba(127, 29, 29, 0.25);
+      }
+      .table {
+        border-collapse: collapse;
+      }
+      .table th,
+      .table td {
+        padding: 0.75rem;
+        border-bottom: 1px solid rgba(51, 65, 85, 0.55);
+      }
+      .progress {
+        appearance: none;
+        overflow: hidden;
+        border-radius: 999px;
+        background: rgba(30, 41, 59, 0.9);
+      }
+      .progress::-webkit-progress-value {
+        background: #38bdf8;
+      }
+      .toast {
+        position: fixed;
+        right: 1rem;
+        bottom: 1rem;
+        display: grid;
+        gap: 0.6rem;
       }
       .mesh-card {
         border: 1px solid rgba(148, 163, 184, 0.22);
@@ -157,6 +272,14 @@
       .text-slate-500 {
         color: #94a3b8 !important;
       }
+      .um-toast {
+        border: 1px solid rgba(148, 163, 184, 0.28);
+        background: rgba(15, 23, 42, 0.96);
+        box-shadow: 0 18px 38px rgba(2, 6, 23, 0.5);
+      }
+      .um-toast.error {
+        border-color: rgba(251, 113, 133, 0.55);
+      }
     </style>
   </head>
   <body>
@@ -208,5 +331,64 @@
         {% block content %}{% endblock %}
       </main>
     </div>
-  </body>
+    <div id="um-toast-root" class="toast toast-end z-50"></div>
+    <script>
+      window.umToast = function(message, tone = "info") {
+        const root = document.getElementById("um-toast-root");
+        if (!root) return;
+        const toast = document.createElement("div");
+        toast.className = `um-toast alert ${tone === "error" ? "alert-error error" : "alert-info"}`;
+        toast.innerHTML = `<span>${window.umEscapeHtml ? window.umEscapeHtml(message) : String(message || "")}</span>`;
+        root.appendChild(toast);
+        window.setTimeout(() => toast.remove(), 5200);
+      };
+
+      window.umEscapeHtml = function(input) {
+        return String(input ?? "")
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;")
+          .replace(/'/g, "&#039;");
+      };
+
+      window.umFetch = async function(url, options = {}, button = null) {
+        const originalText = button ? button.textContent : "";
+        if (button) {
+          button.disabled = true;
+          button.textContent = button.dataset.busyText || "Working";
+        }
+        try {
+          const response = await fetch(url, options);
+          if (!response.ok) {
+            const body = await response.text();
+            let message = body || `Request failed (${response.status})`;
+            try {
+              const parsed = JSON.parse(body);
+              if (parsed && typeof parsed.detail === "string") {
+                message = parsed.detail;
+              }
+            } catch (error) {
+              // Keep the response text when the server did not return JSON.
+            }
+            window.umToast(message, "error");
+            const failure = new Error(message);
+            failure.umAlreadyToasted = true;
+            throw failure;
+          }
+          return response;
+        } catch (error) {
+          if (!error.umAlreadyToasted && !String(error.message || "").startsWith("Request failed")) {
+            window.umToast(error.message || String(error), "error");
+          }
+          throw error;
+        } finally {
+          if (button) {
+            button.disabled = false;
+            button.textContent = originalText;
+          }
+        }
+      };
+    </script>
+    </body>
 </html>

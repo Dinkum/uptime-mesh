@@ -1,24 +1,24 @@
 {
   "schema_version": 1,
-  "version": "0.0.6",
+  "version": "0.0.7",
   "channels": {
     "stable": {
-      "version": "0.0.6",
+      "version": "0.0.7",
       "bootstrap": {
         "path": "ops/bootstrap.sh",
-        "sha256": "7b5feb64c6e5ff7dc674f8a3b9a0e18c277a869b14fd165b5311292ff9920554"
+        "sha256": "25ae217c36a0615153ec58d990233c8c6061fadc2ddb0a667dcede3ab3623345"
       },
       "install": {
         "path": "install.sh",
-        "sha256": "d8bf28769fc2b71b8b86301f3ef4fd60a0468aee1d7c63bc7d1f4c4d37e5cf0f"
+        "sha256": "c7fc8d7577c5656cc6ec14a92a1cbdba1fa46837c8d2407de20b672c077a6cfd"
       },
       "update": {
         "path": "ops/update.sh",
-        "sha256": "c4b83345273dd8a1de2d697278c724457bec69eb86801fc680644af358de081b"
+        "sha256": "2bda59d01469e67a85f25edbdfef58013767d9a71a89057ee1d95b1e569e0d37"
       },
       "agent": {
         "name": "uptimemesh-agent",
-        "version": "0.2.1"
+        "version": "0.2.2"
       }
     }
   }

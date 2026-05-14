@@ -7,8 +7,10 @@
 set -eu
 
 DEFAULT_VERSION_URL="https://raw.githubusercontent.com/Dinkum/uptime-mesh/main/version.json"
+DEFAULT_GITHUB_REPO="Dinkum/uptime-mesh"
 VERSION_URL="${VERSION_URL:-$DEFAULT_VERSION_URL}"
 CHANNEL="${CHANNEL:-stable}"
+GITHUB_REPO="${GITHUB_REPO:-$DEFAULT_GITHUB_REPO}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/uptime-mesh}"
 LOCK_DIR="${LOCK_DIR:-/tmp/uptimemesh-bootstrap.lock}"
 BOOTSTRAP_LOG="${BOOTSTRAP_LOG:-${INSTALL_DIR}/data/logs/bootstrap.log}"
@@ -17,27 +19,66 @@ MIN_FREE_MB="${MIN_FREE_MB:-256}"
 TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-900}"
 FORCE=0
 
+usage() {
+  cat <<'USAGE'
+Usage:
+  sudo ops/bootstrap.sh [options]
+
+Options:
+  --version-url <url>       Manifest URL (default: stable GitHub manifest)
+  --channel <name>          Manifest channel (default: stable)
+  --github-repo <slug>      GitHub repo slug for install/update source
+  --install-dir <path>      Install directory (default: /opt/uptime-mesh)
+  --timeout-seconds <n>     Download and install timeout
+  --force                   Force install or update path
+  -h, --help                Show help
+USAGE
+}
+
+require_arg_value() {
+  flag="$1"
+  value="${2:-}"
+  if [ -z "$value" ] || [ "${value#--}" != "$value" ]; then
+    echo "missing value for ${flag}" >&2
+    usage
+    exit 1
+  fi
+}
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --version-url)
+      require_arg_value "$1" "${2:-}"
       VERSION_URL="$2"
       shift 2
       ;;
     --channel)
+      require_arg_value "$1" "${2:-}"
       CHANNEL="$2"
       shift 2
       ;;
+    --github-repo)
+      require_arg_value "$1" "${2:-}"
+      GITHUB_REPO="$2"
+      shift 2
+      ;;
     --install-dir)
+      require_arg_value "$1" "${2:-}"
       INSTALL_DIR="$2"
       shift 2
       ;;
     --timeout-seconds)
+      require_arg_value "$1" "${2:-}"
       TIMEOUT_SECONDS="$2"
       shift 2
       ;;
     --force)
       FORCE=1
       shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
       ;;
     *)
       echo "unknown argument: $1" >&2
@@ -103,7 +144,7 @@ download_file() {
         return 0
       fi
     elif command -v wget >/dev/null 2>&1; then
-      if wget -qO "$dst" "$src"; then
+      if wget -qO "$dst" --timeout=30 --tries=1 "$src"; then
         return 0
       fi
     else
@@ -120,7 +161,7 @@ run_with_timeout() {
     timeout "$TIMEOUT_SECONDS" "$@"
     return $?
   fi
-  "$@"
+  fail "timeout command is required for bounded install/update runs"
 }
 
 preflight() {
@@ -227,16 +268,16 @@ chmod +x "$script_file"
 if [ "$MODE" = "install" ]; then
   log "dispatching install script"
   if [ "$FORCE" -eq 1 ]; then
-    UPTIMEMESH_INSTALL_DIR="$INSTALL_DIR" run_with_timeout "$script_file" --force || fail "install script failed"
+    UPTIMEMESH_INSTALL_DIR="$INSTALL_DIR" UPTIMEMESH_VERSION_URL="$VERSION_URL" UPTIMEMESH_CHANNEL="$CHANNEL" UPTIMEMESH_REPO_URL="https://github.com/$GITHUB_REPO" run_with_timeout "$script_file" --force || fail "install script failed"
   else
-    UPTIMEMESH_INSTALL_DIR="$INSTALL_DIR" run_with_timeout "$script_file" || fail "install script failed"
+    UPTIMEMESH_INSTALL_DIR="$INSTALL_DIR" UPTIMEMESH_VERSION_URL="$VERSION_URL" UPTIMEMESH_CHANNEL="$CHANNEL" UPTIMEMESH_REPO_URL="https://github.com/$GITHUB_REPO" run_with_timeout "$script_file" || fail "install script failed"
   fi
 else
   log "dispatching update script"
   if [ "$FORCE" -eq 1 ]; then
-    run_with_timeout "$script_file" --install-dir "$INSTALL_DIR" --version-url "$VERSION_URL" --channel "$CHANNEL" --force || fail "update script failed"
+    run_with_timeout "$script_file" --install-dir "$INSTALL_DIR" --version-url "$VERSION_URL" --channel "$CHANNEL" --github-repo "$GITHUB_REPO" --force || fail "update script failed"
   else
-    run_with_timeout "$script_file" --install-dir "$INSTALL_DIR" --version-url "$VERSION_URL" --channel "$CHANNEL" || fail "update script failed"
+    run_with_timeout "$script_file" --install-dir "$INSTALL_DIR" --version-url "$VERSION_URL" --channel "$CHANNEL" --github-repo "$GITHUB_REPO" || fail "update script failed"
   fi
 fi
 

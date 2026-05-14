@@ -16,6 +16,7 @@ class RoleSpecUpsert(BaseModel):
     cooldown_seconds: int = Field(default=30, ge=0, le=3600)
     slot_count: int = Field(default=0, ge=0)
     runtime_template: str = Field(default="")
+    runtime_owner: str = Field(default="control-plane")
 
 
 class RoleSpecOut(RoleSpecUpsert):

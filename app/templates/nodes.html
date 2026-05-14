@@ -1,6 +1,27 @@
 {% extends "layout.html" %}
 
 {% block content %}
+  <style>
+    .node-form-control {
+      width: 100%;
+      min-width: 0;
+      border-radius: 0.75rem;
+      border: 1px solid rgba(100, 116, 139, 0.75);
+      background: rgba(2, 6, 23, 0.75);
+      color: #f8fafc;
+      padding: 0.72rem 0.9rem;
+      line-height: 1.35;
+    }
+    .node-form-control::placeholder {
+      color: #94a3b8;
+    }
+    .node-form-control:focus {
+      outline: none;
+      border-color: rgba(56, 189, 248, 0.95);
+      box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.2);
+    }
+  </style>
+
   <div class="max-w-7xl mx-auto">
     <section class="grid grid-cols-2 lg:grid-cols-6 gap-4 mb-6">
       <div class="mesh-card rounded-2xl p-5 min-h-[110px]">
@@ -44,6 +65,10 @@
             <span class="badge badge-outline mono py-3">etcd disabled</span>
           {% elif not etcd.configured %}
             <span class="badge badge-outline mono py-3">etcd unconfigured</span>
+          {% elif etcd.summary_only %}
+            <span class="badge {% if etcd.has_quorum %}badge-success{% else %}badge-warning{% endif %} badge-outline mono py-3">
+              etcd {{ "ok" if etcd.has_quorum else "attention" }}
+            </span>
           {% else %}
             <span class="badge badge-outline mono py-3">members {{ etcd.member_count }}</span>
             <span class="badge {% if etcd.has_quorum %}badge-success{% else %}badge-warning{% endif %} badge-outline mono py-3">
@@ -60,6 +85,54 @@
       </div>
     {% endif %}
 
+    <section class="mesh-card rounded-2xl p-6 mb-6">
+      <div class="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-4">
+        <div>
+          <h2 class="text-lg font-semibold">Add Node</h2>
+          <p class="text-sm text-slate-500 mt-1">Generate a one time install command for the next machine.</p>
+        </div>
+        <form id="join-command-form" class="grid grid-cols-1 md:grid-cols-4 gap-3 lg:min-w-[760px]">
+          <label class="block md:col-span-2">
+            <span class="text-xs uppercase tracking-[0.12em] text-slate-500">Peer Host/IP</span>
+            <input class="node-form-control mt-1 mono" name="peer" placeholder="51.15.211.158" required />
+          </label>
+          <label class="block">
+            <span class="text-xs uppercase tracking-[0.12em] text-slate-500">Role</span>
+            <select class="node-form-control mt-1" name="role">
+              <option value="auto">Auto</option>
+              <option value="backend_server">Backend</option>
+              <option value="reverse_proxy">Reverse Proxy</option>
+            </select>
+          </label>
+          <label class="block">
+            <span class="text-xs uppercase tracking-[0.12em] text-slate-500">TTL</span>
+            <select class="node-form-control mt-1" name="ttl_seconds">
+              <option value="1800">30 min</option>
+              <option value="3600">1 hour</option>
+              <option value="86400">24 hours</option>
+            </select>
+          </label>
+          <label class="block">
+            <span class="text-xs uppercase tracking-[0.12em] text-slate-500">Port</span>
+            <input class="node-form-control mt-1 mono" name="join_port" type="number" min="1" max="65535" value="8010" />
+          </label>
+          <div class="md:col-span-3 flex items-end">
+            <button class="btn btn-primary w-full md:w-auto" type="submit" data-busy-text="Generating">Generate Command</button>
+          </div>
+        </form>
+      </div>
+      <div id="join-command-result" class="hidden mt-4 rounded-xl border border-slate-700/40 bg-slate-950/70 p-4">
+        <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+          <div>
+            <p class="text-xs uppercase tracking-[0.14em] text-slate-500">Install Command</p>
+            <p id="join-command-expiry" class="text-xs text-slate-500 mt-1"></p>
+          </div>
+          <button id="join-command-copy" class="btn btn-sm btn-outline" type="button">Copy</button>
+        </div>
+        <pre class="mono text-xs whitespace-pre-wrap break-all mt-3 text-slate-200" id="join-command-output"></pre>
+      </div>
+    </section>
+
     {% if view_mode == "map" %}
       <section class="grid grid-cols-1 xl:grid-cols-3 gap-6 mb-6">
         <article class="mesh-card rounded-2xl p-6 xl:col-span-2">
@@ -67,7 +140,14 @@
             <h2 class="text-lg font-semibold">Network Map</h2>
             <p class="text-xs text-slate-500">Node color indicates total load</p>
           </div>
-          <div id="network-map" class="w-full rounded-2xl border border-slate-700/40 bg-slate-950/45 overflow-hidden"></div>
+          {% if map_nodes %}
+            <div id="network-map" class="w-full rounded-2xl border border-slate-700/40 bg-slate-950/45 overflow-hidden"></div>
+          {% else %}
+            <div class="min-h-[320px] rounded-2xl border border-slate-700/40 bg-slate-950/45 flex flex-col items-center justify-center text-center p-8">
+              <h3 class="text-xl font-semibold">No nodes to map yet.</h3>
+              <p class="text-sm text-slate-400 mt-2">Switch to Node List and generate an Add Node command.</p>
+            </div>
+          {% endif %}
         </article>
         <article class="mesh-card rounded-2xl p-6">
           <h3 class="text-base font-semibold mb-3">Map Legend</h3>
@@ -202,14 +282,22 @@
 
             <div class="flex flex-wrap gap-2 mt-5 pt-4 border-t border-slate-700/40">
               <a class="btn btn-sm btn-outline" href="{{ ui_prefix }}/nodes/{{ node.id }}">View Details</a>
-              <button class="btn btn-sm btn-outline" onclick="nodeAction('{{ node.id }}', 'cordon')">Cordon</button>
-              <button class="btn btn-sm btn-outline" onclick="nodeAction('{{ node.id }}', 'drain')">Drain</button>
-              <button class="btn btn-sm btn-outline" onclick="nodeAction('{{ node.id }}', 'rotate-wg-keys')">Rotate Keys</button>
+              <span class="badge badge-outline">{{ node.maintenance_text }}</span>
+              {% if node.schedulable %}
+                <button class="btn btn-sm btn-outline" onclick="nodeAction('{{ node.id }}', 'cordon')">Cordon</button>
+              {% else %}
+                <button class="btn btn-sm btn-outline" onclick="nodeAction('{{ node.id }}', 'uncordon')">Uncordon</button>
+              {% endif %}
+              {% if not node.draining %}
+                <button class="btn btn-sm btn-error" onclick="nodeAction('{{ node.id }}', 'drain')">Drain</button>
+              {% endif %}
+              <button class="btn btn-sm btn-error" onclick="nodeAction('{{ node.id }}', 'rotate-wg-keys')">Rotate Keys</button>
             </div>
           </article>
         {% else %}
-          <section class="mesh-card rounded-2xl p-8 text-center text-slate-400">
-            No nodes registered yet.
+          <section class="mesh-card rounded-2xl p-8 text-center">
+            <h2 class="text-xl font-semibold">No nodes registered yet.</h2>
+            <p class="text-sm text-slate-400 mt-2">Use Add Node above, run the generated command on a machine, then refresh this page.</p>
           </section>
         {% endfor %}
       </section>
@@ -264,18 +352,64 @@
   </div>
 
   <script>
+    const actionLabels = {
+      "cordon": "cordon this node",
+      "uncordon": "uncordon this node",
+      "drain": "drain this node",
+      "rotate-wg-keys": "rotate WireGuard keys"
+    };
+
     async function nodeAction(nodeId, action) {
-      try {
-        const response = await fetch(`/nodes/${nodeId}/${action}`, { method: "POST" });
-        if (response.ok) {
-          window.location.reload();
-          return;
-        }
-        const body = await response.text();
-        alert(`Action failed (${response.status}): ${body}`);
-      } catch (error) {
-        alert(`Action failed: ${error}`);
+      const label = actionLabels[action] || action;
+      if (!window.confirm(`Confirm ${label}?`)) {
+        return;
       }
+      try {
+        await window.umFetch(`/nodes/${nodeId}/${action}`, { method: "POST" });
+        window.location.reload();
+      } catch (error) {
+        console.error(error);
+      }
+    }
+
+    const joinCommandForm = document.getElementById("join-command-form");
+    const joinCommandResult = document.getElementById("join-command-result");
+    const joinCommandOutput = document.getElementById("join-command-output");
+    const joinCommandExpiry = document.getElementById("join-command-expiry");
+    const joinCommandCopy = document.getElementById("join-command-copy");
+
+    if (joinCommandForm) {
+      joinCommandForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const submitButton = joinCommandForm.querySelector("button[type='submit']");
+        const body = new FormData(joinCommandForm);
+        try {
+          const response = await window.umFetch("/ui/nodes/join-command", {
+            method: "POST",
+            body
+          }, submitButton);
+          const payload = await response.json();
+          joinCommandOutput.textContent = payload.install_command || "";
+          joinCommandExpiry.textContent = payload.expires_at ? `Expires ${payload.expires_at}` : "";
+          joinCommandResult.classList.remove("hidden");
+          window.umToast("Join command ready.");
+        } catch (error) {
+          console.error(error);
+        }
+      });
+    }
+
+    if (joinCommandCopy) {
+      joinCommandCopy.addEventListener("click", async () => {
+        const command = joinCommandOutput ? joinCommandOutput.textContent : "";
+        if (!command) return;
+        try {
+          await navigator.clipboard.writeText(command);
+          window.umToast("Command copied.");
+        } catch (error) {
+          window.umToast("Copy failed. Select the command text manually.", "error");
+        }
+      });
     }
 
     {% if view_mode == "map" %}
@@ -295,7 +429,7 @@
         const host = document.getElementById("network-map");
         if (!host) return;
         const width = host.clientWidth || 1000;
-        const height = 540;
+        const height = Math.max(360, Math.min(620, Math.round(width * 0.58)));
         host.style.height = `${height}px`;
         host.innerHTML = "";
 
@@ -347,7 +481,8 @@
           idLabel.setAttribute("fill", "#f8fafc");
           idLabel.setAttribute("font-size", "9");
           idLabel.setAttribute("font-family", "IBM Plex Mono, monospace");
-          idLabel.textContent = node.id;
+          const label = String(node.name || node.id || "").slice(0, 18);
+          idLabel.textContent = label;
           group.appendChild(idLabel);
 
           const roleLabel = document.createElementNS("http://www.w3.org/2000/svg", "text");

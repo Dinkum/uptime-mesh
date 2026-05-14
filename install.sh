@@ -170,6 +170,7 @@ install_global_cli_shims() {
   cat > "${shim_path}" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+cd "${APP_DIR}"
 CLI_BIN="${APP_DIR}/.venv/bin/uptimemesh"
 if [[ ! -x "\${CLI_BIN}" ]]; then
   echo "uptime-mesh CLI is not installed yet at \${CLI_BIN}" >&2
@@ -179,6 +180,24 @@ exec "\${CLI_BIN}" "\$@"
 EOF
   chmod 0755 "${shim_path}"
   ln -sfn "${shim_path}" "${compat_path}"
+}
+
+repo_slug_from_url() {
+  local url="$1"
+  url="${url%.git}"
+  url="${url#https://github.com/}"
+  url="${url#git@github.com:}"
+  printf '%s' "$url"
+}
+
+require_arg_value() {
+  local flag="$1"
+  local value="${2:-}"
+  if [[ -z "$value" || "$value" == --* ]]; then
+    echo "missing value for ${flag}" >&2
+    usage
+    exit 1
+  fi
 }
 
 run_cli_with_write_retry() {
@@ -269,7 +288,11 @@ run_migrations_with_rollback() {
   if [[ -n "${db_path}" && -f "${db_path}" ]]; then
     install -d "${APP_DIR}/data/install-backups"
     backup_path="${APP_DIR}/data/install-backups/app.db.pre-migrate.$(date -u +%Y%m%dT%H%M%SZ).bak"
-    cp "${db_path}" "${backup_path}" || fail "failed to snapshot database before migration"
+    if command -v sqlite3 >/dev/null 2>&1; then
+      sqlite3 "${db_path}" ".backup '${backup_path}'" || fail "failed to snapshot database before migration"
+    else
+      fail "sqlite3 is required for safe SQLite migration backup"
+    fi
     backup_created=1
     say "Created migration backup | path: ${backup_path}"
   fi
@@ -317,8 +340,12 @@ run_preflight_checks() {
   local required_kb=0
   local rc=0
   local port=""
-  local tcp_ports=("${PORT}" "80" "443" "2379" "2380")
+  local tcp_ports=("${PORT}" "2379" "2380")
   local udp_ports=("51820" "51821" "7946")
+
+  if [[ "${SETUP_HTTPS_PROXY}" -eq 1 ]]; then
+    tcp_ports+=("80" "443")
+  fi
 
   say "Running preflight checks"
   require_cmd systemctl
@@ -401,7 +428,7 @@ download_url_retry() {
         return 0
       fi
     elif command -v wget >/dev/null 2>&1; then
-      if wget -qO "${dst}" "${src}"; then
+      if wget -qO "${dst}" --timeout=45 --tries=1 "${src}"; then
         return 0
       fi
     else
@@ -548,10 +575,20 @@ PY
 
   rm -rf "${install_tmp}"
   cp -a "${src_root}" "${install_tmp}"
+  local previous_dir=""
   if [[ -d "${INSTALL_DIR}" ]]; then
-    rm -rf "${INSTALL_DIR}"
+    previous_dir="${INSTALL_DIR}.pre-remote-install.$(date -u +%Y%m%dT%H%M%SZ)"
+    mv "${INSTALL_DIR}" "${previous_dir}" || fail "failed to stage existing install tree for rollback"
   fi
-  mv "${install_tmp}" "${INSTALL_DIR}"
+  if ! mv "${install_tmp}" "${INSTALL_DIR}"; then
+    if [[ -n "${previous_dir}" && -d "${previous_dir}" ]]; then
+      mv "${previous_dir}" "${INSTALL_DIR}" || true
+    fi
+    fail "failed to install release source tree"
+  fi
+  if [[ -n "${previous_dir}" ]]; then
+    say "Preserved previous install tree | path: ${previous_dir}"
+  fi
   printf '%s\n' "${latest_version}" > "${INSTALL_DIR}/VERSION"
 }
 
@@ -584,13 +621,6 @@ if [[ ! -d "${APP_DIR}/app" || ! -f "${APP_DIR}/pyproject.toml" ]]; then
   exec "${INSTALL_DIR}/install.sh" "$@"
 fi
 
-init_install_log
-cat <<'EOF'
-+--------------------------------------------------------------+
-|                      UPTIMEMESH INSTALL                      |
-+--------------------------------------------------------------+
-EOF
-
 usage() {
   cat <<'USAGE'
 Usage:
@@ -611,6 +641,8 @@ Options:
   --port <port>              Local API port (default: 8010)
   --force                    Reinstall over an existing node install
   --detect-public-ip         Use external IP discovery (ipify) for advertised endpoint defaults
+  --advertise-public-ip      Alias for --detect-public-ip
+  --no-https-proxy           Skip the local HTTPS reverse proxy on ports 80/443
   --install-deps             Force apt dependency install (auto-enabled by default)
   --wizard                   Interactive setup wizard
   -h, --help                 Show help
@@ -641,6 +673,7 @@ BOOTSTRAP=0
 PORT="8010"
 INSTALL_DEPS=0
 INSTALL_MONITORING=1
+SETUP_HTTPS_PROXY=1
 WIZARD=0
 DETECT_PUBLIC_IP=0
 MIN_DISK_MB="${UPTIMEMESH_MIN_DISK_MB:-2048}"
@@ -743,9 +776,11 @@ detect_public_ip() {
 
 default_api_endpoint() {
   local detected_ip=""
-  detected_ip="$(detect_local_ip)"
-  if [[ -z "${detected_ip}" && "${DETECT_PUBLIC_IP}" -eq 1 ]]; then
+  if [[ "${DETECT_PUBLIC_IP}" -eq 1 ]]; then
     detected_ip="$(detect_public_ip)"
+  fi
+  if [[ -z "${detected_ip}" ]]; then
+    detected_ip="$(detect_local_ip)"
   fi
   if [[ -n "${detected_ip}" ]]; then
     printf 'http://%s:%s' "${detected_ip}" "$PORT"
@@ -788,7 +823,11 @@ normalize_join_api_url() {
     port="${hostport##*:}"
   fi
   if [[ -z "$port" ]]; then
-    port="$default_port"
+    if [[ "$scheme" == "https" ]]; then
+      port="443"
+    else
+      port="$default_port"
+    fi
   fi
   printf '%s://%s:%s' "$scheme" "$host" "$port"
 }
@@ -998,9 +1037,6 @@ run_wizard() {
 
   echo "UptimeMesh setup wizard"
   echo "-----------------------"
-  if [[ "$INSTALL_DEPS" -eq 0 ]]; then
-    dep_default="n"
-  fi
   reply="$(prompt_yes_no "Install apt dependencies?" "$dep_default")"
   if [[ "$reply" == "y" ]]; then
     INSTALL_DEPS=1
@@ -1014,11 +1050,13 @@ run_wizard() {
   if [[ -n "$JOIN_TARGET" ]]; then
     mode="join"
   fi
-  mode="$(prompt_default "Is this the first node or joining another? (first|join)" "$mode")"
-  case "$mode" in
-    first|join) ;;
-    *) mode="first" ;;
-  esac
+  while true; do
+    mode="$(prompt_default "Is this the first node or joining another? (first|join)" "$mode")"
+    case "$mode" in
+      first|join) break ;;
+      *) echo "enter first or join" ;;
+    esac
+  done
 
   if [[ -z "$NODE_ROLE" ]]; then
     NODE_ROLE="auto"
@@ -1061,6 +1099,7 @@ run_wizard() {
   echo "  join_target:  ${JOIN_TARGET:-"(none)"}"
   echo "  etcd_peer:    ${ETCD_PEER_URL:-"(auto/none)"}"
   echo "  monitoring:   mandatory"
+  echo "  https_proxy:  $SETUP_HTTPS_PROXY"
   if [[ -n "$JOIN_TOKEN" ]]; then
     token_prefix="${JOIN_TOKEN:0:8}"
     echo "  join_token:   ${token_prefix}..."
@@ -1130,29 +1169,41 @@ ORIGINAL_ARGC="$#"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --name)
+      require_arg_value "$1" "${2:-}"
       NODE_NAME="$2"; shift 2 ;;
     --username)
+      require_arg_value "$1" "${2:-}"
       INSTALL_ADMIN_USERNAME="$2"; shift 2 ;;
     --role)
+      require_arg_value "$1" "${2:-}"
       NODE_ROLE="$2"; shift 2 ;;
     --api-url)
+      require_arg_value "$1" "${2:-}"
       API_URL="$2"; shift 2 ;;
     --api-endpoint)
+      require_arg_value "$1" "${2:-}"
       API_ENDPOINT="$2"; shift 2 ;;
     --etcd-peer-url)
+      require_arg_value "$1" "${2:-}"
       ETCD_PEER_URL="$2"; shift 2 ;;
     --token)
+      require_arg_value "$1" "${2:-}"
       JOIN_TOKEN="$2"; shift 2 ;;
     --join)
+      require_arg_value "$1" "${2:-}"
       JOIN_TARGET="$2"; shift 2 ;;
     --join-port)
+      require_arg_value "$1" "${2:-}"
       JOIN_PORT="$2"; shift 2 ;;
     --port)
+      require_arg_value "$1" "${2:-}"
       PORT="$2"; shift 2 ;;
     --force)
       FORCE_INSTALL=1; shift ;;
-    --detect-public-ip)
+    --detect-public-ip|--advertise-public-ip)
       DETECT_PUBLIC_IP=1; shift ;;
+    --no-https-proxy)
+      SETUP_HTTPS_PROXY=0; shift ;;
     --install-deps)
       INSTALL_DEPS=1; shift ;;
     --wizard)
@@ -1170,6 +1221,13 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   echo "run as root (use sudo)" >&2
   exit 1
 fi
+
+init_install_log
+cat <<'EOF'
++--------------------------------------------------------------+
+|                      UPTIMEMESH INSTALL                      |
++--------------------------------------------------------------+
+EOF
 
 if [[ "$WIZARD" -eq 0 ]]; then
   if [[ "$ORIGINAL_ARGC" -eq 0 || -n "$JOIN_TARGET" ]]; then
@@ -1236,6 +1294,16 @@ if [[ -f "${APP_DIR}/VERSION" && -f "${APP_DIR}/.env" && "$FORCE_INSTALL" -ne 1 
   fail "installation already initialized in ${APP_DIR} (use --force to reinstall)"
 fi
 
+if [[ "$FORCE_INSTALL" -eq 1 ]]; then
+  say "Stopping existing UptimeMesh services before forced reinstall"
+  systemctl stop uptime-mesh-update.timer uptime-mesh-watchdog.timer >/dev/null 2>&1 || true
+  systemctl stop uptime-mesh.service uptime-mesh-agent.service uptime-mesh-watchdog.service uptime-mesh-update.service >/dev/null 2>&1 || true
+  systemctl stop etcd.service etcd-server.service etcd2.service >/dev/null 2>&1 || true
+  if [[ "${SETUP_HTTPS_PROXY}" -eq 1 ]]; then
+    systemctl stop nginx.service caddy.service >/dev/null 2>&1 || true
+  fi
+fi
+
 run_preflight_checks
 
 if [[ "$INSTALL_DEPS" -eq 1 ]]; then
@@ -1249,8 +1317,10 @@ if [[ "$INSTALL_DEPS" -eq 1 ]]; then
 
   install_required_lxd
   install_required_etcd
-  apt_install_optional nginx
-  apt_install_optional caddy
+  if [[ "${SETUP_HTTPS_PROXY}" -eq 1 ]]; then
+    apt_install_optional nginx
+    apt_install_optional caddy
+  fi
   run_quiet_command \
     "Install optional package set: monitoring stack" \
     apt-get install -y prometheus prometheus-node-exporter prometheus-alertmanager grafana \
@@ -1275,8 +1345,10 @@ if [[ ! -d .venv ]]; then
   python3 -m venv .venv
 fi
 
-run_quiet_command "Upgrade pip" .venv/bin/pip install --upgrade pip || fail "pip upgrade failed"
-run_quiet_command "Install Python app dependencies" .venv/bin/pip install -e . || fail "python dependency install failed"
+run_quiet_command "Install pinned pip" .venv/bin/pip install --upgrade pip==25.3 || fail "pip install failed"
+[[ -f requirements.lock ]] || fail "requirements.lock is required for locked Python installs"
+run_quiet_command "Install locked Python dependencies" .venv/bin/pip install -r requirements.lock || fail "locked python dependency install failed"
+run_quiet_command "Install Python app package" .venv/bin/pip install --no-build-isolation --no-deps -e . || fail "python app install failed"
 install_global_cli_shims
 mkdir -p data
 mkdir -p data/logs
@@ -1317,9 +1389,11 @@ def setv(key: str, value: str) -> None:
 
 setv("DATABASE_URL", "sqlite+aiosqlite:///./data/app.db")
 setv("APP_ENV", "prod")
+setv("SERVER_HOST", "0.0.0.0")
+setv("SERVER_PORT", "${PORT}")
 setv("LOG_LEVEL", kv.get("LOG_LEVEL", "INFO") or "INFO")
 setv("LOG_FILE", "./data/logs/app.log")
-setv("AUTH_COOKIE_SECURE", "true")
+setv("AUTH_COOKIE_SECURE", "true" if "${SETUP_HTTPS_PROXY}" == "1" else "false")
 setv("AGENT_LOG_FILE", kv.get("AGENT_LOG_FILE", "./data/logs/agent.log") or "./data/logs/agent.log")
 setv("AGENT_ENABLE_UNIX_SOCKET", kv.get("AGENT_ENABLE_UNIX_SOCKET", "true") or "true")
 setv("AGENT_UNIX_SOCKET", kv.get("AGENT_UNIX_SOCKET", "./data/agent.sock") or "./data/agent.sock")
@@ -1357,6 +1431,9 @@ setv("RUNTIME_API_BASE_URL", "${API_URL}")
 setv("RUNTIME_IDENTITY_DIR", "./data/identities")
 setv("RUNTIME_HEARTBEAT_INTERVAL_SECONDS", kv.get("RUNTIME_HEARTBEAT_INTERVAL_SECONDS", "15") or "15")
 setv("RUNTIME_HEARTBEAT_TTL_SECONDS", kv.get("RUNTIME_HEARTBEAT_TTL_SECONDS", "45") or "45")
+setv("RUNTIME_API_TIMEOUT_SECONDS", kv.get("RUNTIME_API_TIMEOUT_SECONDS", "5") or "5")
+setv("RUNTIME_COMMAND_TIMEOUT_SECONDS", kv.get("RUNTIME_COMMAND_TIMEOUT_SECONDS", "30") or "30")
+setv("RUNTIME_PING_TIMEOUT_SECONDS", kv.get("RUNTIME_PING_TIMEOUT_SECONDS", "1") or "1")
 setv("RUNTIME_MESH_CIDR", kv.get("RUNTIME_MESH_CIDR", "10.42.0.0/16") or "10.42.0.0/16")
 setv("RUNTIME_WG_PRIMARY_IFACE", kv.get("RUNTIME_WG_PRIMARY_IFACE", "wg-mesh0") or "wg-mesh0")
 setv("RUNTIME_WG_SECONDARY_IFACE", kv.get("RUNTIME_WG_SECONDARY_IFACE", "wg-mesh1") or "wg-mesh1")
@@ -1387,6 +1464,7 @@ setv("RUNTIME_ETCD_PROBE_INTERVAL_SECONDS", kv.get("RUNTIME_ETCD_PROBE_INTERVAL_
 setv("RUNTIME_SWIM_ENABLE", kv.get("RUNTIME_SWIM_ENABLE", "true") or "true")
 setv("RUNTIME_SWIM_PORT", kv.get("RUNTIME_SWIM_PORT", "7946") or "7946")
 setv("RUNTIME_SWIM_PROBE_TIMEOUT_MS", kv.get("RUNTIME_SWIM_PROBE_TIMEOUT_MS", "500") or "500")
+setv("RUNTIME_SWIM_INDIRECT_PROBE_COUNT", kv.get("RUNTIME_SWIM_INDIRECT_PROBE_COUNT", "3") or "3")
 setv("RUNTIME_SWIM_SUSPECT_THRESHOLD", kv.get("RUNTIME_SWIM_SUSPECT_THRESHOLD", "2") or "2")
 setv("RUNTIME_SWIM_DEAD_THRESHOLD", kv.get("RUNTIME_SWIM_DEAD_THRESHOLD", "4") or "4")
 setv("RUNTIME_SWIM_COOLDOWN_SECONDS", kv.get("RUNTIME_SWIM_COOLDOWN_SECONDS", "30") or "30")
@@ -1613,8 +1691,9 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=${APP_DIR}
-ExecStart=${APP_DIR}/ops/bootstrap.sh --install-dir ${APP_DIR} --version-url ${DEFAULT_VERSION_URL} --channel ${UPDATE_CHANNEL}
+ExecStart=${APP_DIR}/ops/bootstrap.sh --install-dir ${APP_DIR} --version-url ${DEFAULT_VERSION_URL} --channel ${UPDATE_CHANNEL} --github-repo $(repo_slug_from_url "${REPO_URL}")
 Environment=UPDATE_LOG=${APP_DIR}/data/logs/update.log
+TimeoutStartSec=1200
 SYSTEMD
 
 cat > /etc/systemd/system/uptime-mesh-update.timer <<SYSTEMD
@@ -1638,7 +1717,12 @@ ensure_etcd_services_started
 say "Starting core services"
 systemctl enable uptime-mesh.service
 systemctl restart uptime-mesh.service || systemctl start uptime-mesh.service
-ensure_self_signed_tls_proxy
+if [[ "${SETUP_HTTPS_PROXY}" -eq 1 ]]; then
+  ensure_self_signed_tls_proxy
+else
+  WEB_UI_URL="http://127.0.0.1:${PORT}/ui"
+  warn "Skipping local HTTPS reverse proxy; UI is only exposed on the API listener"
+fi
 systemctl enable --now uptime-mesh-watchdog.timer
 systemctl enable --now uptime-mesh-update.timer
 if ! systemctl start uptime-mesh-watchdog.service >/dev/null 2>&1; then
@@ -1653,12 +1737,12 @@ enable_service_if_exists prometheus-alertmanager.service
 enable_service_if_exists grafana-server.service
 
 for _ in 1 2 3 4 5 6 7 8 9 10; do
-  if curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+  if curl -fsS --connect-timeout 2 --max-time 5 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
     break
   fi
   sleep 1
 done
-curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null
+curl -fsS --connect-timeout 2 --max-time 5 "http://127.0.0.1:${PORT}/health" >/dev/null
 
 python3 - <<'PY'
 import json

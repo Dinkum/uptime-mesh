@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import NoReturn
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -7,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import get_db_session, get_writable_db_session
 from app.logger import get_logger
+from app.routes.errors import raise_lxd_http_error
 from app.schemas.replicas import (
     ReplicaCreate,
     ReplicaMove,
@@ -23,19 +25,13 @@ router = APIRouter(prefix="/replicas", tags=["replicas"])
 _logger = get_logger("api.replicas")
 
 
-def _raise_lxd_http_error(exc: lxd_service.LXDOperationError) -> None:
-    status_code = 503 if isinstance(exc, lxd_service.LXDUnavailableError) else 409
-    _logger.warning(
-        "replica.lxd_error",
-        "Replica action failed due to LXD operation error",
-        action=exc.action,
-        detail=exc.detail,
-        status_code=status_code,
+def _raise_replica_lxd_http_error(exc: lxd_service.LXDOperationError) -> NoReturn:
+    raise_lxd_http_error(
+        exc,
+        logger=_logger,
+        event="replica.lxd_error",
+        message="Replica action failed due to LXD operation error",
     )
-    raise HTTPException(
-        status_code=status_code,
-        detail=f"LXD operation failed ({exc.action}): {exc.detail}",
-    ) from exc
 
 
 @router.get("", response_model=List[ReplicaOut])
@@ -71,7 +67,7 @@ async def create_replica(
     try:
         replica = await replica_service.create_replica(session, payload)
     except lxd_service.LXDOperationError as exc:
-        _raise_lxd_http_error(exc)
+        _raise_replica_lxd_http_error(exc)
     return ReplicaOut.model_validate(replica)
 
 
@@ -87,7 +83,7 @@ async def update_replica(
     try:
         updated = await replica_service.update_replica(session, replica, payload)
     except lxd_service.LXDOperationError as exc:
-        _raise_lxd_http_error(exc)
+        _raise_replica_lxd_http_error(exc)
     return ReplicaOut.model_validate(updated)
 
 
@@ -105,7 +101,7 @@ async def move_replica(
     try:
         updated = await replica_service.move_replica(session, replica, payload.target_node_id)
     except lxd_service.LXDOperationError as exc:
-        _raise_lxd_http_error(exc)
+        _raise_replica_lxd_http_error(exc)
     return ReplicaOut.model_validate(updated)
 
 
@@ -120,7 +116,7 @@ async def restart_replica(
     try:
         updated = await replica_service.restart_replica(session, replica)
     except lxd_service.LXDOperationError as exc:
-        _raise_lxd_http_error(exc)
+        _raise_replica_lxd_http_error(exc)
     return ReplicaOut.model_validate(updated)
 
 
@@ -135,7 +131,7 @@ async def snapshot_replica(
     try:
         updated = await replica_service.snapshot_replica(session, replica)
     except lxd_service.LXDOperationError as exc:
-        _raise_lxd_http_error(exc)
+        _raise_replica_lxd_http_error(exc)
     return ReplicaOut.model_validate(updated)
 
 
@@ -152,7 +148,7 @@ async def restore_replica(
     try:
         updated = await replica_service.restore_replica(session, replica, snapshot_id)
     except lxd_service.LXDOperationError as exc:
-        _raise_lxd_http_error(exc)
+        _raise_replica_lxd_http_error(exc)
     return ReplicaOut.model_validate(updated)
 
 
@@ -167,4 +163,4 @@ async def delete_replica(
     try:
         await replica_service.delete_replica(session, replica)
     except lxd_service.LXDOperationError as exc:
-        _raise_lxd_http_error(exc)
+        _raise_replica_lxd_http_error(exc)

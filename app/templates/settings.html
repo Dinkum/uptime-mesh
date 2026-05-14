@@ -58,7 +58,10 @@
             <h2 class="text-lg font-semibold">etcd Snapshots</h2>
             <p class="text-sm text-slate-500">Run snapshots now and track restore readiness.</p>
           </div>
-          <button class="btn btn-sm btn-outline" id="snapshot-btn">Request Snapshot</button>
+          <div class="flex gap-2">
+            <button class="btn btn-sm btn-outline" id="snapshot-refresh-btn" type="button">Refresh</button>
+            <button class="btn btn-sm btn-outline" id="snapshot-btn" type="button">Request Snapshot</button>
+          </div>
         </div>
         <div class="mt-4 space-y-2 text-sm" id="snapshot-list">
           {% for snapshot in snapshots %}
@@ -73,10 +76,10 @@
                 <div class="flex items-center gap-2 shrink-0">
                   <span class="badge badge-outline">{{ snapshot.status }}</span>
                   {% if snapshot.status == "completed" %}
-                    <button class="btn btn-xs btn-outline snapshot-restore-btn" data-snapshot-id="{{ snapshot.id }}">Restore</button>
                     {% if snapshot.location %}
                       <a class="btn btn-xs btn-outline" href="/etcd/snapshots/{{ snapshot.id }}/download">Download</a>
                     {% endif %}
+                    <button class="btn btn-xs btn-error snapshot-restore-btn" data-snapshot-id="{{ snapshot.id }}">Restore</button>
                   {% endif %}
                 </div>
               </div>
@@ -96,7 +99,10 @@
             <h2 class="text-lg font-semibold">Support Bundles</h2>
             <p class="text-sm text-slate-500">Collect redacted diagnostics for troubleshooting.</p>
           </div>
-          <button class="btn btn-sm btn-outline" id="bundle-btn">Request Bundle</button>
+          <div class="flex gap-2">
+            <button class="btn btn-sm btn-outline" id="bundle-refresh-btn" type="button">Refresh</button>
+            <button class="btn btn-sm btn-outline" id="bundle-btn" type="button">Request Bundle</button>
+          </div>
         </div>
         <div class="mt-4 space-y-2 text-sm" id="bundle-list">
           {% for bundle in bundles %}
@@ -124,49 +130,63 @@
     <script>
       const snapshotBtn = document.getElementById("snapshot-btn");
       const bundleBtn = document.getElementById("bundle-btn");
+      const snapshotRefreshBtn = document.getElementById("snapshot-refresh-btn");
+      const bundleRefreshBtn = document.getElementById("bundle-refresh-btn");
 
       function addRow(containerId, id, status, extras) {
         const container = document.getElementById(containerId);
         if (!container) return;
 
+        const safeId = escapeHtml(id);
+        const safeStatus = escapeHtml(status);
+        const safeDownload = extras && extras.download ? escapeHtml(extras.download) : "";
+        const safeError = extras && extras.error ? escapeHtml(extras.error) : "";
+        const mode = extras && extras.mode ? extras.mode : "prepend";
         const row = document.createElement("div");
         row.className = "rounded-xl border border-slate-700/40 p-3";
+        row.setAttribute("data-artifact-id", String(id ?? ""));
+        container.querySelectorAll("p").forEach((item) => {
+          if (item.textContent.trim().startsWith("No ")) {
+            item.remove();
+          }
+        });
+        container.querySelectorAll(`[data-artifact-id="${CSS.escape(String(id ?? ""))}"]`).forEach((item) => item.remove());
 
         if (containerId === "snapshot-list") {
           const restoreButton = status === "completed"
-            ? `<button class="btn btn-xs btn-outline snapshot-restore-btn" data-snapshot-id="${id}">Restore</button>`
+            ? `<button class="btn btn-xs btn-error snapshot-restore-btn" data-snapshot-id="${safeId}">Restore</button>`
             : "";
-          const download = extras && extras.download
-            ? `<a class="btn btn-xs btn-outline" href="${extras.download}">Download</a>`
+          const download = safeDownload
+            ? `<a class="btn btn-xs btn-outline" href="${safeDownload}">Download</a>`
             : "";
-          const error = extras && extras.error
-            ? `<p class="text-xs text-rose-300 break-all mt-2">${extras.error}</p>`
+          const error = safeError
+            ? `<p class="text-xs text-rose-300 break-all mt-2">${safeError}</p>`
             : "";
           row.innerHTML = `
             <div class="flex justify-between items-center gap-3">
               <div class="flex flex-col min-w-0">
-                <span class="mono truncate">${id}</span>
+                <span class="mono truncate">${safeId}</span>
               </div>
               <div class="flex items-center gap-2 shrink-0">
-                <span class="badge badge-outline">${status}</span>
-                ${restoreButton}
+                <span class="badge badge-outline">${safeStatus}</span>
                 ${download}
+                ${restoreButton}
               </div>
             </div>
             ${error}
           `;
         } else {
-          const download = extras && extras.download
-            ? `<a class="btn btn-xs btn-outline" href="${extras.download}">Download</a>`
+          const download = safeDownload
+            ? `<a class="btn btn-xs btn-outline" href="${safeDownload}">Download</a>`
             : "";
-          const error = extras && extras.error
-            ? `<p class="text-xs text-rose-300 break-all mt-2">${extras.error}</p>`
+          const error = safeError
+            ? `<p class="text-xs text-rose-300 break-all mt-2">${safeError}</p>`
             : "";
           row.innerHTML = `
             <div class="flex justify-between items-center gap-3">
-              <span class="mono truncate">${id}</span>
+              <span class="mono truncate">${safeId}</span>
               <div class="flex items-center gap-2 shrink-0">
-                <span class="badge badge-outline">${status}</span>
+                <span class="badge badge-outline">${safeStatus}</span>
                 ${download}
               </div>
             </div>
@@ -174,51 +194,116 @@
           `;
         }
 
-        container.prepend(row);
+        if (mode === "append") {
+          container.appendChild(row);
+        } else {
+          container.prepend(row);
+        }
+        while (container.children.length > 50) {
+          container.removeChild(container.lastElementChild);
+        }
+      }
+
+      function escapeHtml(input) {
+        return String(input ?? "")
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;")
+          .replace(/'/g, "&#039;");
       }
 
       async function restoreSnapshot(snapshotId) {
-        const response = await fetch(`/etcd/snapshots/${snapshotId}/restore`, {
+        if (!window.confirm(`Restore snapshot ${snapshotId}? This replaces etcd state.`)) {
+          return;
+        }
+        const response = await window.umFetch(`/etcd/snapshots/${snapshotId}/restore`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({})
         });
-        if (response.ok) {
-          const data = await response.json();
-          const download = data.location ? `/etcd/snapshots/${data.id}/download` : "";
-          addRow("snapshot-list", data.id, data.status, { download, error: data.error || "" });
+        const data = await response.json();
+        const download = data.location ? `/etcd/snapshots/${data.id}/download` : "";
+        addRow("snapshot-list", data.id, data.status, { download, error: data.error || "" });
+        window.umToast("Restore requested.");
+      }
+
+      async function refreshArtifactList(containerId, url, downloadBase) {
+        const response = await window.umFetch(url);
+        const rows = await response.json();
+        const container = document.getElementById(containerId);
+        if (!container || !Array.isArray(rows)) return;
+        container.innerHTML = "";
+        if (rows.length === 0) {
+          container.innerHTML = containerId === "snapshot-list"
+            ? '<p class="text-slate-400">No snapshots yet.</p>'
+            : '<p class="text-slate-400">No bundles yet.</p>';
+          return;
         }
+        rows.forEach((row) => {
+          const download = row.location || row.path ? `${downloadBase}/${row.id}/download` : "";
+          addRow(containerId, row.id, row.status, { download, error: row.error || "", mode: "append" });
+        });
+      }
+
+      function pollArtifactList(containerId, url, downloadBase) {
+        let remaining = 40;
+        const timer = window.setInterval(async () => {
+          remaining -= 1;
+          try {
+            await refreshArtifactList(containerId, url, downloadBase);
+          } catch (error) {
+            console.error(error);
+          }
+          if (remaining <= 0) {
+            window.clearInterval(timer);
+          }
+        }, 3000);
       }
 
       if (snapshotBtn) {
         snapshotBtn.addEventListener("click", async () => {
           const id = crypto.randomUUID();
-          const response = await fetch("/etcd/snapshots", {
+          const response = await window.umFetch("/etcd/snapshots", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ id })
-          });
-          if (response.ok) {
-            const data = await response.json();
-            const download = data.location ? `/etcd/snapshots/${data.id}/download` : "";
-            addRow("snapshot-list", data.id, data.status, { download, error: data.error || "" });
-          }
+          }, snapshotBtn);
+          const data = await response.json();
+          const download = data.location ? `/etcd/snapshots/${data.id}/download` : "";
+          addRow("snapshot-list", data.id, data.status, { download, error: data.error || "" });
+          window.umToast("Snapshot requested.");
+          pollArtifactList("snapshot-list", "/etcd/snapshots", "/etcd/snapshots");
+        });
+      }
+
+      if (snapshotRefreshBtn) {
+        snapshotRefreshBtn.addEventListener("click", async () => {
+          await refreshArtifactList("snapshot-list", "/etcd/snapshots", "/etcd/snapshots");
+          window.umToast("Snapshot list refreshed.");
         });
       }
 
       if (bundleBtn) {
         bundleBtn.addEventListener("click", async () => {
           const id = crypto.randomUUID();
-          const response = await fetch("/support-bundles", {
+          const response = await window.umFetch("/support-bundles", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ id })
-          });
-          if (response.ok) {
-            const data = await response.json();
-            const download = data.path ? `/support-bundles/${data.id}/download` : "";
-            addRow("bundle-list", data.id, data.status, { download, error: data.error || "" });
-          }
+          }, bundleBtn);
+          const data = await response.json();
+          const download = data.path ? `/support-bundles/${data.id}/download` : "";
+          addRow("bundle-list", data.id, data.status, { download, error: data.error || "" });
+          window.umToast("Support bundle requested.");
+          pollArtifactList("bundle-list", "/support-bundles", "/support-bundles");
+        });
+      }
+
+      if (bundleRefreshBtn) {
+        bundleRefreshBtn.addEventListener("click", async () => {
+          await refreshArtifactList("bundle-list", "/support-bundles", "/support-bundles");
+          window.umToast("Bundle list refreshed.");
         });
       }
 
@@ -293,32 +378,32 @@
         <form method="post" action="{{ ui_prefix }}/settings/routing/application" class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-5">
           <label class="block">
             <span class="settings-label">Application ID</span>
-            <input class="settings-input mono" type="text" name="app_id" placeholder="hello-world" />
+            <input class="settings-input mono" type="text" name="app_id" placeholder="hello-world" value="{{ routing_form.app_id or '' }}" />
             <p class="settings-help">Use existing ID to update, or leave blank to derive from the name.</p>
           </label>
           <label class="block">
             <span class="settings-label">Name</span>
-            <input class="settings-input" type="text" name="name" placeholder="Hello World" />
+            <input class="settings-input" type="text" name="name" placeholder="Hello World" value="{{ routing_form.name or '' }}" />
           </label>
           <label class="block md:col-span-2">
             <span class="settings-label">Description</span>
-            <input class="settings-input" type="text" name="description" placeholder="Public app description" />
+            <input class="settings-input" type="text" name="description" placeholder="Public app description" value="{{ routing_form.description or '' }}" />
           </label>
           <label class="block">
             <span class="settings-label">Target Service</span>
             <select class="settings-input mono" name="target_service_id">
               <option value="">(none)</option>
               {% for service in service_options %}
-                <option value="{{ service.id }}">{{ service.name }} ({{ service.id }})</option>
+                <option value="{{ service.id }}" {% if routing_form.target_service_id == service.id %}selected{% endif %}>{{ service.name }} ({{ service.id }})</option>
               {% endfor %}
             </select>
           </label>
           <label class="block">
             <span class="settings-label">Default Path</span>
-            <input class="settings-input mono" type="text" name="default_path" value="/" />
+            <input class="settings-input mono" type="text" name="default_path" value="{{ routing_form.default_path or '/' }}" />
           </label>
           <label class="inline-flex items-center gap-2 mt-1 md:col-span-2">
-            <input type="checkbox" name="enabled" value="true" checked />
+            <input type="checkbox" name="enabled" value="true" {% if routing_form.application_enabled is not defined or routing_form.application_enabled %}checked{% endif %} />
             <span class="text-sm text-slate-300">Application enabled</span>
           </label>
           <div class="md:col-span-2">
@@ -364,7 +449,7 @@
                     {% endif %}
                   </td>
                   <td>
-                    <form method="post" action="{{ ui_prefix }}/settings/routing/domain/delete">
+                    <form method="post" action="{{ ui_prefix }}/settings/routing/domain/delete" onsubmit="return window.confirm('Delete this domain route?');">
                       <input type="hidden" name="route_id" value="{{ binding.id }}" />
                       <button class="btn btn-xs btn-outline" type="submit">Delete</button>
                     </form>
@@ -382,28 +467,28 @@
         <form method="post" action="{{ ui_prefix }}/settings/routing/domain" class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-5">
           <label class="block">
             <span class="settings-label">Route ID</span>
-            <input class="settings-input mono" type="text" name="route_id" placeholder="optional-id" />
+            <input class="settings-input mono" type="text" name="route_id" placeholder="optional-id" value="{{ routing_form.route_id or '' }}" />
             <p class="settings-help">Use existing ID to update. Leave blank to auto-generate.</p>
           </label>
           <label class="block">
             <span class="settings-label">Domain</span>
-            <input class="settings-input mono" type="text" name="domain" placeholder="app.example.com" required />
+            <input class="settings-input mono" type="text" name="domain" placeholder="app.example.com" value="{{ routing_form.domain or '' }}" required />
           </label>
           <label class="block">
             <span class="settings-label">Path Prefix</span>
-            <input class="settings-input mono" type="text" name="path" value="/" />
+            <input class="settings-input mono" type="text" name="path" value="{{ routing_form.path or '/' }}" />
           </label>
           <label class="block">
             <span class="settings-label">Application</span>
             <select class="settings-input mono" name="application_id" required>
               <option value="">Select application</option>
               {% for app in applications %}
-                <option value="{{ app.id }}">{{ app.name }} ({{ app.id }})</option>
+                <option value="{{ app.id }}" {% if routing_form.application_id == app.id %}selected{% endif %}>{{ app.name }} ({{ app.id }})</option>
               {% endfor %}
             </select>
           </label>
           <label class="inline-flex items-center gap-2 mt-1 md:col-span-2">
-            <input type="checkbox" name="enabled" value="true" checked />
+            <input type="checkbox" name="enabled" value="true" {% if routing_form.domain_enabled is not defined or routing_form.domain_enabled %}checked{% endif %} />
             <span class="text-sm text-slate-300">Route enabled</span>
           </label>
           <div class="md:col-span-2">
@@ -496,7 +581,7 @@
           </div>
         </div>
 
-        <form method="post" action="{{ ui_prefix }}/settings/providers" class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-5">
+        <form method="post" action="{{ ui_prefix }}/settings/providers" class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-5" id="provider-settings-form">
           <label class="block md:col-span-2">
             <span class="settings-label">Domain Ingress Target</span>
             <input class="settings-input mono" type="text" name="domain_ingress_target" value="{{ domain_ingress_target }}" placeholder="203.0.113.10 or ingress.example.net" />
@@ -506,10 +591,18 @@
           <label class="block">
             <span class="settings-label">OpenAI API Key</span>
             <input class="settings-input" type="password" name="provider_openai_api_key" placeholder="Leave blank to keep existing" />
+            <label class="inline-flex items-center gap-2 mt-2 text-xs text-slate-400">
+              <input type="checkbox" name="clear_provider_openai_api_key" value="true" />
+              Clear saved key
+            </label>
           </label>
           <label class="block">
             <span class="settings-label">Cloudflare API Token</span>
             <input class="settings-input" type="password" name="provider_cloudflare_api_token" placeholder="Leave blank to keep existing" />
+            <label class="inline-flex items-center gap-2 mt-2 text-xs text-slate-400">
+              <input type="checkbox" name="clear_provider_cloudflare_api_token" value="true" />
+              Clear saved token
+            </label>
           </label>
           <label class="block">
             <span class="settings-label">Cloudflare Zone ID</span>
@@ -518,14 +611,26 @@
           <label class="block">
             <span class="settings-label">Hetzner API Token</span>
             <input class="settings-input" type="password" name="provider_hetzner_api_token" placeholder="Leave blank to keep existing" />
+            <label class="inline-flex items-center gap-2 mt-2 text-xs text-slate-400">
+              <input type="checkbox" name="clear_provider_hetzner_api_token" value="true" />
+              Clear saved token
+            </label>
           </label>
           <label class="block">
             <span class="settings-label">Scaleway API Token</span>
             <input class="settings-input" type="password" name="provider_scaleway_api_token" placeholder="Leave blank to keep existing" />
+            <label class="inline-flex items-center gap-2 mt-2 text-xs text-slate-400">
+              <input type="checkbox" name="clear_provider_scaleway_api_token" value="true" />
+              Clear saved token
+            </label>
           </label>
           <label class="block">
             <span class="settings-label">Online.net API Token</span>
             <input class="settings-input" type="password" name="provider_online_api_token" placeholder="Leave blank to keep existing" />
+            <label class="inline-flex items-center gap-2 mt-2 text-xs text-slate-400">
+              <input type="checkbox" name="clear_provider_online_api_token" value="true" />
+              Clear saved token
+            </label>
           </label>
           <div class="md:col-span-2">
             <button class="btn btn-primary" type="submit">Save Provider Settings</button>
@@ -533,6 +638,17 @@
         </form>
       </article>
     </section>
+    <script>
+      const providerSettingsForm = document.getElementById("provider-settings-form");
+      if (providerSettingsForm) {
+        providerSettingsForm.addEventListener("submit", (event) => {
+          const clearCount = providerSettingsForm.querySelectorAll("input[name^='clear_provider_']:checked").length;
+          if (clearCount > 0 && !window.confirm(`Clear ${clearCount} saved provider credential${clearCount === 1 ? "" : "s"}?`)) {
+            event.preventDefault();
+          }
+        });
+      }
+    </script>
 
   {% else %}
     <section class="grid gap-6 lg:grid-cols-2">

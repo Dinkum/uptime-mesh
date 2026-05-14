@@ -3,9 +3,16 @@
 {% block content %}
   <div class="flex flex-wrap items-center gap-2 mb-5">
     <a class="btn btn-sm btn-outline" href="{{ ui_prefix }}/nodes">Back to Nodes</a>
-    <button class="btn btn-sm btn-outline" onclick="nodeAction('{{ node_id }}', 'cordon')">Cordon</button>
-    <button class="btn btn-sm btn-outline" onclick="nodeAction('{{ node_id }}', 'drain')">Drain</button>
-    <button class="btn btn-sm btn-outline" onclick="nodeAction('{{ node_id }}', 'rotate-wg-keys')">Rotate Keys</button>
+    <span class="badge badge-outline">{{ node.maintenance_text }}</span>
+    {% if node.schedulable %}
+      <button class="btn btn-sm btn-outline" onclick="nodeAction('{{ node_id }}', 'cordon')">Cordon</button>
+    {% else %}
+      <button class="btn btn-sm btn-outline" onclick="nodeAction('{{ node_id }}', 'uncordon')">Uncordon</button>
+    {% endif %}
+    {% if not node.draining %}
+      <button class="btn btn-sm btn-error" onclick="nodeAction('{{ node_id }}', 'drain')">Drain</button>
+    {% endif %}
+    <button class="btn btn-sm btn-error" onclick="nodeAction('{{ node_id }}', 'rotate-wg-keys')">Rotate Keys</button>
   </div>
 
   <section class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
@@ -390,17 +397,23 @@
   </section>
 
   <script>
+    const actionLabels = {
+      "cordon": "cordon this node",
+      "uncordon": "uncordon this node",
+      "drain": "drain this node",
+      "rotate-wg-keys": "rotate WireGuard keys"
+    };
+
     async function nodeAction(nodeId, action) {
+      const label = actionLabels[action] || action;
+      if (!window.confirm(`Confirm ${label}?`)) {
+        return;
+      }
       try {
-        const response = await fetch(`/nodes/${nodeId}/${action}`, { method: "POST" });
-        if (response.ok) {
-          window.location.reload();
-          return;
-        }
-        const body = await response.text();
-        alert(`Action failed (${response.status}): ${body}`);
+        await window.umFetch(`/nodes/${nodeId}/${action}`, { method: "POST" });
+        window.location.reload();
       } catch (error) {
-        alert(`Action failed: ${error}`);
+        console.error(error);
       }
     }
   </script>

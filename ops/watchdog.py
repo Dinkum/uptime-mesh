@@ -20,8 +20,29 @@ class CommandResult:
     stderr: str
 
 
-def _run_command(args: list[str]) -> CommandResult:
-    proc = subprocess.run(args, capture_output=True, text=True, check=False)
+def _timeout_output(value: str | bytes | None) -> str:
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return value or ""
+
+
+def _run_command(args: list[str], *, timeout_seconds: int = 10) -> CommandResult:
+    try:
+        proc = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = _timeout_output(exc.stdout)
+        stderr = _timeout_output(exc.stderr)
+        return CommandResult(
+            code=124,
+            stdout=stdout.strip(),
+            stderr=(stderr or f"timed out after {timeout_seconds}s").strip(),
+        )
     return CommandResult(
         code=proc.returncode,
         stdout=(proc.stdout or "").strip(),
@@ -44,7 +65,7 @@ def _service_state(service_name: str) -> Tuple[bool, bool]:
 
 
 def _restart_service(service_name: str) -> CommandResult:
-    return _run_command(["systemctl", "restart", service_name])
+    return _run_command(["systemctl", "restart", service_name], timeout_seconds=30)
 
 
 def _health_check(url: str, timeout_seconds: int) -> Tuple[bool, int, str]:

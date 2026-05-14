@@ -1,34 +1,23 @@
 # UptimeMesh
 
-> Self-healing private mesh control plane for small to mid-sized clusters.
+Private mesh control for small clusters that need encrypted node traffic, visible health, and practical failover without a large platform team.
 
-UptimeMesh gives you a WireGuard-backed, etcd-powered mesh with a Go agent, LXD sandboxes, and a Web UI / CLI for day-2 ops. It’s designed to be source-first, observable, and safe to fail over.
+UptimeMesh ships a FastAPI control plane, Web UI, CLI, Go node agent, WireGuard runtime, etcd coordination, LXD workload hooks, gateway routing, discovery, monitoring, snapshots, and support bundle tooling.
 
-This repo contains the V1 control plane, UI, Go agent, and operational tooling.
+## What It Does
 
----
-
-## Highlights
-
-- 🔐 **Encrypted mesh**: WireGuard for node-to-node transport.
-- 🧠 **Cluster truth**: etcd for replicated state and coordination.
-- 🤖 **Node agent**: standalone Go agent (`uptimemesh-agent`) for reconcile loops and signed heartbeats.
-- 🔌 **Local agent control**: unix socket admin API (`data/agent.sock`) with `/healthz`, `/version`, `/status`.
-- 🧱 **Workload sandboxes**: LXD containers with snapshot/restore and rollout/rollback primitives.
-- 🖥️ **UI + CLI**: built-in Web UI and ASCII-first `uptimemesh` CLI.
-- 📊 **Observability-ready**: Prometheus config reconciliation, Grafana dashboard provisioning, Alertmanager rules, and structured logs (`app.log`, `agent.log`).
-- 🔁 **Failover foundations**: dual WireGuard interfaces and route metric switching for runtime failover.
-- 🧭 **Router assignment automation**: node joins auto-reconcile primary/secondary router assignments.
-- 🔎 **Discovery**: CoreDNS zone generation (`mesh.local`) from the health registry.
-- 🌐 **Gateway**: NGINX route rendering with validate -> reload -> health-check -> rollback safety.
-- 🌍 **Domain routing**: map custom domains/subdomains to applications and service backends.
-- 🔑 **Provider settings**: OpenAI, Cloudflare, Hetzner, Scaleway, and Online.net API integration fields in UI settings.
-
----
+* Builds a private WireGuard mesh for node traffic.
+* Tracks cluster state with etcd when quorum support is enabled.
+* Runs a Go agent on each node for heartbeats, role runtime, WireGuard reconcile, and local status.
+* Provides a Web UI and `uptimemesh` CLI for common operator tasks.
+* Manages LXD workload placement, snapshots, restore requests, and replica moves.
+* Renders CoreDNS, NGINX, and Prometheus config from current cluster state.
+* Supports domain routing and provider settings for OpenAI, Cloudflare, Hetzner, Scaleway, and Online.net.
+* Creates support bundles with sanitized cluster state and useful diagnostics.
 
 ## Quickstart
 
-### 1. First Node Install (auto-bootstrap)
+### 1. Install The First Node
 
 Run this on the first node in a new mesh:
 
@@ -36,260 +25,212 @@ Run this on the first node in a new mesh:
 sudo ./install.sh
 ```
 
-This command is first-node mode by default:
-- generated short UUID node ID
-- generated 3-word node name
-- role defaults to `auto` (runtime role chosen automatically)
-- auto-bootstraps the cluster
-- seeds monitoring config
-- required dependencies installed automatically
+The first node install will:
 
-At the end of a first-node bootstrap, the installer prints generated admin credentials once
-(`username` + password).
+* create a short node ID
+* create a readable node name
+* use the `auto` role unless you set one
+* bootstrap the cluster
+* seed monitoring config
+* install required system packages
 
-Direct from GitHub:
+The installer prints generated admin credentials once at the end of bootstrap.
+
+Install directly from GitHub:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Dinkum/uptime-mesh/main/install.sh | bash
 ```
 
----
-
-### 2. Verify in UI or CLI
+### 2. Open The UI Or CLI
 
 Web UI:
-- `http://<first-node-ip>:8010/ui`
 
-Basic CLI checks (run on the first node):
-```bash
-uptime-mesh --api-url http://127.0.0.1:8010 nodes-status --username <admin-username> --password <admin-pass>
+```text
+http://<node-ip>:8010/ui
 ```
 
----
+Basic CLI health check:
+
+```bash
+uptime-mesh --api-url http://127.0.0.1:8010 nodes-status --username <admin-user> --password <admin-pass>
+```
 
 ### 3. Join More Nodes
 
-Join flow (peer + one-time token; defaults to port `8010`):
+Create a join token in the UI or CLI, then run:
 
 ```bash
-sudo ./install.sh --join <cluster-node-ip> --token <join-token>
+sudo ./install.sh --join <node-ip> --token <join-token>
 ```
 
-Non-default peer port:
+Use a custom peer port when the first node is not listening on `8010`:
 
 ```bash
-sudo ./install.sh --join <cluster-node-ip> --join-port 9010 --token <join-token>
+sudo ./install.sh --join <node-ip> --join-port 9010 --token <join-token>
 ```
 
-Optional: use wizard or explicit flags:
+For guided setup:
 
 ```bash
 sudo ./install.sh --wizard
 ```
 
-### Optional Install Command Flags
+### Install Flags
 
-- `--wizard`: interactive setup flow.
-- `--join <peer-ip|url>`: join an existing mesh via peer API.
-- `--join-port <port>`: peer API port for `--join` (default `8010`).
-- `--name <name>`: override node display name.
-- `--role <auto|backend_server|reverse_proxy>`: optional role override (default `auto`).
-- `--api-endpoint <url>`: advertised API endpoint for this node.
-- `--api-url <url>`: cluster API URL (used for join/bootstrap paths).
-- `--token <join-token>`: required in join mode.
-- `--install-deps`: force apt dependency installation.
-- `--port <port>`: local API port (default `8010`).
-
----
+* `--wizard`: run the interactive setup flow.
+* `--join <peer-ip|url>`: join an existing mesh through a peer API.
+* `--join-port <port>`: peer API port for join mode. Default: `8010`.
+* `--name <name>`: set the node display name.
+* `--role <auto|backend_server|reverse_proxy>`: set the runtime role. Default: `auto`.
+* `--api-endpoint <url>`: advertise this node API endpoint.
+* `--api-url <url>`: set the cluster API URL for join and bootstrap paths.
+* `--token <join-token>`: required in join mode.
+* `--install-deps`: force dependency installation.
+* `--port <port>`: set the local API port. Default: `8010`.
 
 ## Architecture
 
-```text
-                  +---------------------------+
-                  |        Web UI / CLI       |
-                  +-------------+-------------+
-                                |
-                                v
-                  +---------------------------+
-                  |   FastAPI Control Plane   |
-                  |    auth / APIs / events   |
-                  +-------------+-------------+
-                                |
-                                v
-                  +---------------------------+
-                  |        etcd Quorum        |
-                  |     cluster truth/audit   |
-                  +-------------+-------------+
-                                |
-                                v
-        =============================================================
-        =               WireGuard Mesh (private fabric)             =
-        =============================================================
-          +----------------+    +----------------+    +----------------+
-          |     NODE A     |    |     NODE B     |    |     NODE C     |
-          |----------------|    |----------------|    |----------------|
-          |  Go agent      |    |  Go agent      |    |  Go agent      |
-          |  LXD sandboxes |    |  LXD sandboxes |    |  LXD sandboxes |
-          |  WG peer       |    |  WG peer       |    |  WG peer       |
-          +----------------+    +----------------+    +----------------+
+UptimeMesh keeps the operator surface small:
+
+* The Web UI and CLI call the FastAPI control plane.
+* The control plane stores durable cluster state in SQLite and can coordinate through etcd.
+* Nodes communicate across WireGuard.
+* The Go agent runs local reconcile loops and reports signed heartbeats.
+* LXD, CoreDNS, NGINX, and Prometheus are updated from declared cluster state.
+
+### Node Behavior
+
+Every installed node can run the API, Web UI, Go agent, and local runtime loops. Runtime role placement decides which nodes serve backend content, reverse proxy traffic, DNS, or other managed roles.
+
+Writes are blocked when etcd is `down`, `unavailable`, or `stale`. Local workloads and node runtime loops continue during partial control plane degradation.
+
+## Common Configuration Options
+
+Most installs only need a few settings. Use `.env.example` as the full reference. The installer also manages `config.yaml`, which is created when missing, repaired when keys are absent, and updated when managed values change through the UI or API.
+
+```dotenv
+# Supported runtime mode for deployed nodes.
+APP_ENV=prod
+
+# Control plane database. The local default stores SQLite data under ./data.
+DATABASE_URL=sqlite+aiosqlite:///./data/app.db
+
+# Log level and app log path.
+LOG_LEVEL=INFO
+LOG_FILE=data/logs/app.log
+
+# Enable Prometheus style metrics from the app.
+METRICS_ENABLED=true
+
+# Browser session secret. Installer and bootstrap flows generate this for real installs.
+AUTH_SECRET_KEY=change-me-uptimemesh-auth-secret
+
+# Set this to true when the UI is served through HTTPS.
+AUTH_COOKIE_SECURE=false
+
+# Cluster signing secret used for node trust flows. Generated during bootstrap.
+CLUSTER_SIGNING_KEY=change-me-uptimemesh-cluster-signing-key
+
+# Node certificate storage and validity period.
+CLUSTER_PKI_DIR=data/pki
+NODE_CERT_VALIDITY_DAYS=30
+
+# Enable etcd coordination and set endpoints when running a quorum.
+ETCD_ENABLED=false
+ETCD_ENDPOINTS=
+
+# Snapshot storage, retention, and schedule interval.
+ETCD_SNAPSHOT_DIR=data/etcd-snapshots
+ETCD_SNAPSHOT_RETENTION=30
+ETCD_SNAPSHOT_INTERVAL_SECONDS=86400
+
+# Enable the local runtime controller on nodes that should run reconcile loops.
+RUNTIME_ENABLE=false
+RUNTIME_NODE_ID=
+RUNTIME_NODE_NAME=
+RUNTIME_NODE_ROLE=auto
+RUNTIME_API_BASE_URL=http://127.0.0.1:8000
+
+# Heartbeat cadence and expiry window for node liveness.
+RUNTIME_HEARTBEAT_INTERVAL_SECONDS=15
+RUNTIME_HEARTBEAT_TTL_SECONDS=45
+
+# WireGuard interfaces and route metrics used by failover.
+RUNTIME_WG_PRIMARY_IFACE=wg-mesh0
+RUNTIME_WG_SECONDARY_IFACE=wg-mesh1
+RUNTIME_ROUTE_PRIMARY_METRIC=100
+RUNTIME_ROUTE_SECONDARY_METRIC=200
+
+# CoreDNS discovery output. Enable this when nodes should render DNS records.
+RUNTIME_DISCOVERY_ENABLE=false
+RUNTIME_DISCOVERY_DOMAIN=mesh.local
+RUNTIME_DISCOVERY_ZONE_PATH=data/coredns/db.mesh.local
+RUNTIME_DISCOVERY_COREFILE_PATH=data/coredns/Corefile
+
+# NGINX gateway output. Enable this when nodes should render ingress config.
+RUNTIME_GATEWAY_ENABLE=false
+RUNTIME_GATEWAY_CONFIG_PATH=data/nginx/nginx.conf
+RUNTIME_GATEWAY_LISTEN=0.0.0.0:80
+RUNTIME_GATEWAY_SERVER_NAME=_
+
+# LXD execution settings for workload actions.
+LXD_ENABLED=true
+LXD_COMMAND=lxc
+LXD_PROJECT=default
+LXD_DEFAULT_IMAGE=images:ubuntu/22.04
+
+# Support bundle output directory.
+SUPPORT_BUNDLE_DIR=data/support-bundles
 ```
-
-### Node Roles
-
-* **Node (role-agnostic install)**
-
-  * Runs API/UI and the Go agent loop.
-  * etcd member (when configured).
-  * Executes LXD workload actions.
-  * Receives runtime role placement automatically (or explicit override).
-
-### Control Behavior
-
-* Writes are guarded when etcd is `down`, `unavailable`, or `stale`.
-* Existing workloads and local runtime logic continue during partial control-plane degradation.
-
----
-
-## Configuration
-
-Config is split between:
-
-* `.env` – runtime environment settings (see `.env.example`).
-* `config.yaml` – managed cluster-level config (auto-generated and auto-healed).
-
-`config.yaml`:
-
-* Created automatically if missing.
-* Rebuilt with defaults when keys are missing.
-* Written in stable key order with section comments.
-* Updated immediately when managed values change via UI/API.
-
-High-level areas (non-exhaustive):
-
-### Core App
-
-* `APP_ENV` (set to `prod`)
-* `DATABASE_URL`
-* `LOG_LEVEL`, `LOG_FILE`
-* `METRICS_ENABLED`
-
-### Routing & Provider Integrations
-
-* `applications_json`, `domain_routes_json`, `domain_ingress_target`
-* `provider_openai_api_key`
-* `provider_cloudflare_api_token`, `provider_cloudflare_zone_id`
-* `provider_hetzner_api_token`, `provider_scaleway_api_token`, `provider_online_api_token`
-
-### Auth & Security
-
-* `AUTH_SECRET_KEY`, `AUTH_COOKIE_SECURE`
-* `CLUSTER_SIGNING_KEY`, `CLUSTER_PKI_DIR`
-* `NODE_CERT_VALIDITY_DAYS`
-* `CLUSTER_LEASE_TOKEN_TTL_SECONDS`
-* `HEARTBEAT_SIGNATURE_MAX_SKEW_SECONDS`
-
-### etcd & Backups
-
-* `ETCD_ENABLED`, `ETCD_ENDPOINTS`, `ETCD_PREFIX`
-* `ETCD_SNAPSHOT_DIR`, `ETCD_SNAPSHOT_RETENTION`
-
-### Runtime / Agent Loop
-
-* `RUNTIME_ENABLE`
-* `RUNTIME_NODE_ID`, `RUNTIME_NODE_NAME`, `RUNTIME_NODE_ROLE`
-* `RUNTIME_API_BASE_URL`
-* `RUNTIME_HEARTBEAT_INTERVAL_SECONDS`, `RUNTIME_HEARTBEAT_TTL_SECONDS`
-
-### WireGuard Failover
-
-* `RUNTIME_WG_PRIMARY_IFACE`, `RUNTIME_WG_SECONDARY_IFACE`
-* `RUNTIME_WG_PRIMARY_ROUTER_IP`, `RUNTIME_WG_SECONDARY_ROUTER_IP`
-* `RUNTIME_ROUTE_PRIMARY_METRIC`, `RUNTIME_ROUTE_SECONDARY_METRIC`
-* `RUNTIME_FAILOVER_THRESHOLD`, `RUNTIME_FAILBACK_STABLE_COUNT`
-
-### Discovery
-
-* `RUNTIME_DISCOVERY_ENABLE`
-* `RUNTIME_DISCOVERY_DOMAIN`
-* `RUNTIME_DISCOVERY_ZONE_PATH`
-* `RUNTIME_DISCOVERY_COREFILE_PATH`
-* `RUNTIME_DISCOVERY_LISTEN`
-* `RUNTIME_DISCOVERY_FORWARDERS`
-* `RUNTIME_DISCOVERY_RELOAD_COMMAND`
-
-### Gateway
-
-* `RUNTIME_GATEWAY_ENABLE`
-* `RUNTIME_GATEWAY_CONFIG_PATH`
-* `RUNTIME_GATEWAY_CANDIDATE_PATH`
-* `RUNTIME_GATEWAY_BACKUP_PATH`
-* `RUNTIME_GATEWAY_LISTEN`
-* `RUNTIME_GATEWAY_SERVER_NAME`
-* `RUNTIME_GATEWAY_VALIDATE_COMMAND`
-* `RUNTIME_GATEWAY_RELOAD_COMMAND`
-* `RUNTIME_GATEWAY_HEALTHCHECK_URLS`
-
-### LXD
-
-* `LXD_ENABLED`, `LXD_COMMAND`, `LXD_PROJECT`
-* `LXD_DEFAULT_IMAGE`, `LXD_DEFAULT_PROFILE`
-* `LXD_HEALTH_TIMEOUT_SECONDS`, `LXD_HEALTH_POLL_SECONDS`
-
-### Support Artifacts
-
-* `SUPPORT_BUNDLE_DIR`
-
-For the full list, use `.env.example` as the source of truth.
-
----
 
 ## CLI
 
 CLI entrypoint: `uptimemesh`.
 
-### Cluster Bootstrap / Join
+### Cluster Bootstrap And Join
 
 ```bash
-uptimemesh bootstrap --api-url http://127.0.0.1:8010 --username <admin-username> --password <admin-pass>
-uptimemesh create-token --api-url http://127.0.0.1:8010 --username <admin-username> --password <admin-pass> --role auto
+uptimemesh bootstrap --api-url http://127.0.0.1:8010 --username <admin-user> --password <admin-pass>
+uptimemesh create-token --api-url http://127.0.0.1:8010 --username <admin-user> --password <admin-pass> --role auto
 
 uptimemesh join \
   --api-url http://127.0.0.1:8010 \
   --token <join-token> \
   --node-id node-a \
   --name node-a \
-  --api-endpoint http://<node-a-ip>:8010
+  --api-endpoint http://<node-ip>:8010
 
 uptimemesh heartbeat --api-url http://127.0.0.1:8010 --node-id node-a
-uptimemesh nodes-status --api-url http://127.0.0.1:8010 --username <admin-username> --password <admin-pass>
+uptimemesh nodes-status --api-url http://127.0.0.1:8010 --username <admin-user> --password <admin-pass>
 ```
 
 ### etcd Operations
 
 ```bash
-uptimemesh etcd-members --api-url http://127.0.0.1:8010 --username <admin-username> --password <admin-pass>
-uptimemesh etcd-quorum --api-url http://127.0.0.1:8010 --username <admin-username> --password <admin-pass>
-uptimemesh etcd-reconcile --api-url http://127.0.0.1:8010 --username <admin-username> --password <admin-pass> --dry-run
+uptimemesh etcd-members --api-url http://127.0.0.1:8010 --username <admin-user> --password <admin-pass>
+uptimemesh etcd-quorum --api-url http://127.0.0.1:8010 --username <admin-user> --password <admin-pass>
+uptimemesh etcd-reconcile --api-url http://127.0.0.1:8010 --username <admin-user> --password <admin-pass> --dry-run
 ```
 
-### Replica & Placement Operations
+### Replica And Placement Operations
 
 ```bash
 uptimemesh replica-move \
   --api-url http://127.0.0.1:8010 \
-  --username <admin-username> \
+  --username <admin-user> \
   --password <admin-pass> \
   --replica-id <replica-id> \
   --target-node-id <node-id>
 
 uptimemesh service-apply-pinned \
   --api-url http://127.0.0.1:8010 \
-  --username <admin-username> \
+  --username <admin-user> \
   --password <admin-pass> \
   --service-id <service-id>
 ```
 
-Pinned placement spec (in `service.spec`) supports either `pinned_replicas` or `placement.pinned_replicas`:
+Pinned placement in `service.spec` supports either `pinned_replicas` or `placement.pinned_replicas`:
 
 ```yaml
 pinned_replicas:
@@ -301,7 +242,7 @@ pinned_replicas:
     desired_state: running
 ```
 
-Gateway route spec (in `service.spec`) enables ingress for a service:
+Gateway routing in `service.spec` enables ingress for a service:
 
 ```yaml
 gateway:
@@ -310,23 +251,24 @@ gateway:
   path: /web/
 ```
 
-### Snapshots & Support
+### Snapshots And Support
 
 ```bash
-uptimemesh snapshot-run --api-url http://127.0.0.1:8010 --username <admin-username> --password <admin-pass>
-uptimemesh snapshot-list --api-url http://127.0.0.1:8010 --username <admin-username> --password <admin-pass>
-uptimemesh snapshot-restore --api-url http://127.0.0.1:8010 <snapshot-id> --username <admin-username> --password <admin-pass>
-uptimemesh snapshot-download --api-url http://127.0.0.1:8010 <snapshot-id> --output ./snapshot.db --username <admin-username> --password <admin-pass>
+uptimemesh snapshot-run --api-url http://127.0.0.1:8010 --username <admin-user> --password <admin-pass>
+uptimemesh snapshot-list --api-url http://127.0.0.1:8010 --username <admin-user> --password <admin-pass>
+uptimemesh snapshot-restore --api-url http://127.0.0.1:8010 <snapshot-id> --username <admin-user> --password <admin-pass>
+uptimemesh snapshot-download --api-url http://127.0.0.1:8010 <snapshot-id> --output ./snapshot.db --username <admin-user> --password <admin-pass>
 
-uptimemesh support-bundle-run --api-url http://127.0.0.1:8010 --username <admin-username> --password <admin-pass>
-uptimemesh support-bundle-list --api-url http://127.0.0.1:8010 --username <admin-username> --password <admin-pass>
-uptimemesh support-bundle-download --api-url http://127.0.0.1:8010 <bundle-id> --output ./bundle.tar.gz --username <admin-username> --password <admin-pass>
+uptimemesh support-bundle-run --api-url http://127.0.0.1:8010 --username <admin-user> --password <admin-pass>
+uptimemesh support-bundle-list --api-url http://127.0.0.1:8010 --username <admin-user> --password <admin-pass>
+uptimemesh support-bundle-download --api-url http://127.0.0.1:8010 <bundle-id> --output ./bundle.tar.gz --username <admin-user> --password <admin-pass>
 ```
 
-Scheduled etcd snapshots are enabled by default and controlled via:
-- `ETCD_SNAPSHOT_SCHEDULE_ENABLED`
-- `ETCD_SNAPSHOT_INTERVAL_SECONDS`
-- `ETCD_SNAPSHOT_SCHEDULE_REQUESTED_BY`
+Scheduled etcd snapshots are enabled by default and controlled with:
+
+* `ETCD_SNAPSHOT_SCHEDULE_ENABLED`
+* `ETCD_SNAPSHOT_INTERVAL_SECONDS`
+* `ETCD_SNAPSHOT_SCHEDULE_REQUESTED_BY`
 
 Node identity artifacts live under:
 
@@ -335,20 +277,15 @@ Node identity artifacts live under:
 * `data/identities/<node-id>/ca.crt`
 * `data/identities/<node-id>/lease.token`
 
----
-
 ## Versioning
 
-* `version.json` is the single version source of truth.
-* Runtime version data (app/manifest/channel/agent) is loaded from `version.json`.
-
----
+`version.json` is the version source for the app, manifest, release channel, and agent metadata.
 
 ## Operational Notes
 
-* `APP_ENV` should be set to `prod` (supported mode).
-* `AUTH_SECRET_KEY` and `CLUSTER_SIGNING_KEY` are internal secrets and are auto-generated by installer/bootstrap flows.
-* Joining nodes receive cluster-consistent internal signing secrets during enrollment; manual key editing is not required.
-* Operators should only touch those keys for explicit rotation/recovery procedures.
-* Behind HTTPS, set `AUTH_COOKIE_SECURE=true`.
-* Local agent admin API (unix socket): `curl --unix-socket data/agent.sock http://localhost/status`
+* Keep `APP_ENV=prod` for deployed nodes.
+* Installer and bootstrap flows generate `AUTH_SECRET_KEY` and `CLUSTER_SIGNING_KEY`.
+* Joining nodes receive cluster signing material during enrollment.
+* Only edit internal keys for planned rotation or recovery.
+* Set `AUTH_COOKIE_SECURE=true` behind HTTPS.
+* Local agent status is available with `curl --unix-socket data/agent.sock http://localhost/status`.

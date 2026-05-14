@@ -8,7 +8,7 @@ This directory contains the node-side lifecycle scripts used in production.
   - Acquires lock.
   - Fetches `version.json`.
   - Verifies script checksum.
-  - Runs `install.sh` (if node not installed) or `update.sh` (if installed).
+  - Runs repo-root `install.sh` (if node not installed) or `ops/update.sh` (if installed).
 
 - `update.sh`: full in-place application update.
   - Compares installed `VERSION` vs latest release.
@@ -19,10 +19,14 @@ This directory contains the node-side lifecycle scripts used in production.
   - Applies source update, rebuilds Go agent, runs migrations.
   - Restarts services and enforces health gate.
   - Rolls back on failure.
+  - Health probes use bounded curl/wget timeouts.
 
 - `agent-update.sh`: agent-only rebuild/swap/restart flow.
+  - Pre/post health gates use short per-request curl/wget timeouts so a hung local probe does not stall the update.
 
 - `node-update.sh`: compatibility wrapper to `agent-update.sh`.
+
+- `install.sh`: compatibility wrapper that dispatches to repo-root `install.sh`.
 
 ## Manifest contract (`version.json`)
 

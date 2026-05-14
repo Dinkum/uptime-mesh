@@ -1,0 +1,12 @@
+{% extends "layout.html" %}
+
+{% block content %}
+  <section class="mesh-card rounded-2xl p-8 max-w-2xl">
+    <p class="mono text-xs uppercase tracking-[0.2em] text-slate-500">404</p>
+    <h2 class="text-2xl font-semibold mt-3">{{ title }}</h2>
+    <p class="text-sm text-slate-400 mt-2">{{ message }}</p>
+    <div class="mt-6">
+      <a class="btn btn-primary" href="{{ back_url }}">{{ back_label }}</a>
+    </div>
+  </section>
+{% endblock %}

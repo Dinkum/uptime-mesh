@@ -169,15 +169,15 @@ def sanitize_next_path(next_path: Optional[str], *, fallback: str = "/ui") -> st
 
 @dataclass
 class _RateBucket:
-    failures: Deque[float] = field(default_factory=deque)
+    attempts: Deque[float] = field(default_factory=deque)
     blocked_until: float = 0.0
 
 
-class LoginRateLimiter:
+class AttemptRateLimiter:
     def __init__(
-        self, *, max_failures: int = 5, window_seconds: int = 60, lockout_seconds: int = 300
+        self, *, max_attempts: int = 5, window_seconds: int = 60, lockout_seconds: int = 300
     ) -> None:
-        self._max_failures = max_failures
+        self._max_attempts = max_attempts
         self._window_seconds = window_seconds
         self._lockout_seconds = lockout_seconds
         self._buckets: Dict[str, _RateBucket] = {}
@@ -186,6 +186,7 @@ class LoginRateLimiter:
     def check(self, key: str) -> Tuple[bool, int]:
         now = time.monotonic()
         with self._lock:
+            self._evict_expired(now)
             bucket = self._buckets.get(key)
             if bucket is None:
                 return True, 0
@@ -194,21 +195,45 @@ class LoginRateLimiter:
                 return False, max(1, math.ceil(bucket.blocked_until - now))
             return True, 0
 
-    def record_failure(self, key: str) -> None:
+    def record_attempt(self, key: str) -> None:
         now = time.monotonic()
         with self._lock:
+            self._evict_expired(now)
             bucket = self._buckets.setdefault(key, _RateBucket())
             self._prune(bucket, now)
-            bucket.failures.append(now)
-            if len(bucket.failures) >= self._max_failures:
+            bucket.attempts.append(now)
+            if len(bucket.attempts) >= self._max_attempts:
                 bucket.blocked_until = now + self._lockout_seconds
-                bucket.failures.clear()
+                bucket.attempts.clear()
 
-    def record_success(self, key: str) -> None:
+    def clear(self, key: str) -> None:
         with self._lock:
             self._buckets.pop(key, None)
 
     def _prune(self, bucket: _RateBucket, now: float) -> None:
         threshold = now - self._window_seconds
-        while bucket.failures and bucket.failures[0] < threshold:
-            bucket.failures.popleft()
+        while bucket.attempts and bucket.attempts[0] < threshold:
+            bucket.attempts.popleft()
+
+    def _evict_expired(self, now: float) -> None:
+        for key, bucket in list(self._buckets.items()):
+            self._prune(bucket, now)
+            if not bucket.attempts and bucket.blocked_until <= now:
+                self._buckets.pop(key, None)
+
+
+class LoginRateLimiter(AttemptRateLimiter):
+    def __init__(
+        self, *, max_failures: int = 5, window_seconds: int = 60, lockout_seconds: int = 300
+    ) -> None:
+        super().__init__(
+            max_attempts=max_failures,
+            window_seconds=window_seconds,
+            lockout_seconds=lockout_seconds,
+        )
+
+    def record_failure(self, key: str) -> None:
+        self.record_attempt(key)
+
+    def record_success(self, key: str) -> None:
+        self.clear(key)

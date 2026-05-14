@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools==80.9.0", "wheel==0.45.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -9,18 +9,19 @@ description = "UptimeMesh control-plane UI and API"
 requires-python = ">=3.11"
 readme = "README.md"
 dependencies = [
-  "fastapi>=0.110",
-  "uvicorn>=0.27",
-  "sqlalchemy>=2.0",
-  "greenlet>=3.0",
-  "aiosqlite>=0.19",
-  "pydantic-settings>=2.0",
-  "alembic>=1.13",
-  "jinja2>=3.1",
-  "python-multipart>=0.0.9",
-  "cryptography>=43.0",
-  "prometheus-client>=0.20",
-  "argon2-cffi>=23.1",
+  "fastapi==0.129.0",
+  "uvicorn==0.41.0",
+  "sqlalchemy==2.0.46",
+  "greenlet==3.3.1",
+  "aiosqlite==0.22.1",
+  "pydantic-settings==2.13.0",
+  "alembic==1.18.4",
+  "jinja2==3.1.6",
+  "python-multipart==0.0.22",
+  "PyYAML==6.0.2",
+  "cryptography==46.0.5",
+  "prometheus-client==0.24.1",
+  "argon2-cffi==25.1.0",
 ]
 
 [project.scripts]
@@ -28,9 +29,9 @@ uptimemesh = "app.cli:main"
 
 [project.optional-dependencies]
 dev = [
-  "ruff>=0.3",
-  "pytest>=8.0",
-  "pyright>=1.1",
+  "ruff==0.15.1",
+  "pytest==9.0.2",
+  "pyright==1.1.408",
 ]
 
 [tool.ruff]

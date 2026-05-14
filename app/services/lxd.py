@@ -122,6 +122,13 @@ def _run_lxc(
         )
     except FileNotFoundError as exc:
         raise LXDUnavailableError("lxd.command", str(exc)) from exc
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or f"timed out after {timeout_seconds}s"
+        raise LXDOperationError(
+            "lxd.timeout",
+            f"{stderr.strip() or stdout.strip()}",
+        ) from exc
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 
@@ -133,12 +140,16 @@ async def _run_lxc_checked(
     timeout_seconds: int = 30,
 ) -> str:
     arg_list = list(args)
-    code, out, err = await asyncio.to_thread(
-        _run_lxc,
-        args=tuple(arg_list),
-        project=project,
-        timeout_seconds=timeout_seconds,
-    )
+    try:
+        code, out, err = await asyncio.to_thread(
+            _run_lxc,
+            args=tuple(arg_list),
+            project=project,
+            timeout_seconds=timeout_seconds,
+        )
+    except LXDOperationError:
+        record_lxd_operation(action=action, ok=False)
+        raise
     if code != 0:
         record_lxd_operation(action=action, ok=False)
         _logger.warning(
