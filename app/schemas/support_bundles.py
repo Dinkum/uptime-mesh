@@ -3,12 +3,19 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, field_validator
+
+from app.validation import artifact_id
 
 
 class SupportBundleCreate(BaseModel):
-    id: Optional[str] = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+    id: Optional[str] = None
     requested_by: Optional[str] = None
+
+    @field_validator("id")
+    @classmethod
+    def _validate_id(cls, value: Optional[str]) -> Optional[str]:
+        return artifact_id(value, field_name="support bundle id") if value else value
 
 
 class SupportBundleOut(BaseModel):

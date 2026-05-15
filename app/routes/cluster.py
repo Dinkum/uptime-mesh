@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import get_db_session, get_writable_db_session
@@ -51,6 +51,13 @@ def _client_ip(request: Request) -> str:
     if request.client and request.client.host:
         return request.client.host
     return "unknown"
+
+
+def _bearer_token(authorization: str) -> str:
+    scheme, _, token = authorization.strip().partition(" ")
+    if scheme.casefold() == "bearer" and token.strip():
+        return token.strip()
+    return ""
 
 
 @router.post("/bootstrap", response_model=ClusterBootstrapOut)
@@ -113,20 +120,12 @@ async def heartbeat(
     session: AsyncSession = Depends(get_writable_db_session),
 ) -> HeartbeatOut:
     client_ip = _client_ip(request)
-    allowed_ip, retry_after_ip = _HEARTBEAT_IP_LIMITER.check(f"ip:{client_ip}")
-    if not allowed_ip:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Heartbeat rate limit exceeded for this IP. Retry in {retry_after_ip}s.",
-        )
     allowed_node, retry_after_node = _HEARTBEAT_NODE_LIMITER.check(f"node:{payload.node_id}")
     if not allowed_node:
         raise HTTPException(
             status_code=429,
             detail=f"Heartbeat rate limit exceeded for node ID. Retry in {retry_after_node}s.",
         )
-    _HEARTBEAT_IP_LIMITER.record_attempt(f"ip:{client_ip}")
-    _HEARTBEAT_NODE_LIMITER.record_attempt(f"node:{payload.node_id}")
     lease = await cluster_service.apply_heartbeat(
         session,
         node_id=payload.node_id,
@@ -137,7 +136,15 @@ async def heartbeat(
         signature=payload.signature,
     )
     if lease is None:
+        allowed_ip, retry_after_ip = _HEARTBEAT_IP_LIMITER.check(f"ip:{client_ip}")
+        _HEARTBEAT_IP_LIMITER.record_attempt(f"ip:{client_ip}")
+        if not allowed_ip:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Invalid heartbeat rate limit exceeded for this IP. Retry in {retry_after_ip}s.",
+            )
         raise HTTPException(status_code=401, detail="Invalid node id or lease token.")
+    _HEARTBEAT_NODE_LIMITER.record_attempt(f"node:{payload.node_id}")
     return lease
 
 
@@ -151,9 +158,10 @@ async def list_leases(
 @router.get("/peers", response_model=List[ClusterPeerOut])
 async def list_peers(
     node_id: str,
-    lease_token: str,
+    authorization: str = Header(default=""),
     session: AsyncSession = Depends(get_db_session),
 ) -> List[ClusterPeerOut]:
+    lease_token = _bearer_token(authorization)
     is_valid = await cluster_service.validate_node_lease_token(
         session,
         node_id=node_id,
@@ -201,10 +209,11 @@ async def list_swim(
 @router.get("/content/active", response_model=ContentActiveOut)
 async def active_content(
     node_id: str,
-    lease_token: str,
     known_hash: str | None = None,
+    authorization: str = Header(default=""),
     session: AsyncSession = Depends(get_db_session),
 ) -> ContentActiveOut:
+    lease_token = _bearer_token(authorization)
     is_valid = await cluster_service.validate_node_lease_token(
         session,
         node_id=node_id,

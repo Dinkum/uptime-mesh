@@ -18,6 +18,15 @@ class GatewayRouteOut(BaseModel):
     endpoints: list[GatewayRouteEndpointOut]
 
 
+class GatewaySourceMapEntryOut(BaseModel):
+    directive: str
+    value: str
+    source_type: str
+    source_id: str
+    service_id: str
+    field: str
+
+
 class GatewayStatusOut(BaseModel):
     enabled: bool
     config_path: str

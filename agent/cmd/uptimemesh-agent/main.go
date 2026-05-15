@@ -33,7 +33,7 @@ import (
 )
 
 const (
-	agentVersion           = "0.2.2"
+	agentVersion           = "0.2.3"
 	swimGossipFanout       = 3
 	swimIndirectRelayLimit = 32
 	swimMaxPeerStates      = 1024
@@ -776,7 +776,7 @@ func (a *Agent) readNodePrivateKey() (crypto.PrivateKey, error) {
 	return privateKey, nil
 }
 
-func (a *Agent) doGETWithRetry(ctx context.Context, targetURL string, attempts int) (*http.Response, error) {
+func (a *Agent) doGETWithRetry(ctx context.Context, targetURL string, attempts int, bearerToken string) (*http.Response, error) {
 	if attempts < 1 {
 		attempts = 1
 	}
@@ -786,6 +786,9 @@ func (a *Agent) doGETWithRetry(ctx context.Context, targetURL string, attempts i
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 		if err != nil {
 			return nil, err
+		}
+		if token := strings.TrimSpace(bearerToken); token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
 		}
 		resp, err := a.client.Do(req)
 		if err == nil {
@@ -1328,12 +1331,11 @@ func (a *Agent) indirectProbeSWIM(targetNodeID string, targetIP string, helpers 
 
 func (a *Agent) fetchClusterPeers(ctx context.Context, leaseToken string) ([]clusterPeerDTO, error) {
 	u := fmt.Sprintf(
-		"%s/cluster/peers?node_id=%s&lease_token=%s",
+		"%s/cluster/peers?node_id=%s",
 		a.cfg.APIServerURL,
 		url.QueryEscape(a.cfg.NodeID),
-		url.QueryEscape(leaseToken),
 	)
-	resp, err := a.doGETWithRetry(ctx, u, 3)
+	resp, err := a.doGETWithRetry(ctx, u, 3, leaseToken)
 	if err != nil {
 		return nil, err
 	}
@@ -1652,15 +1654,14 @@ func (a *Agent) syncInternalCDN(ctx context.Context, leaseToken string) map[stri
 		}
 	}
 	u := fmt.Sprintf(
-		"%s/cluster/content/active?node_id=%s&lease_token=%s",
+		"%s/cluster/content/active?node_id=%s",
 		a.cfg.APIServerURL,
 		url.QueryEscape(a.cfg.NodeID),
-		url.QueryEscape(leaseToken),
 	)
 	if knownHash != "" {
 		u += "&known_hash=" + url.QueryEscape(knownHash)
 	}
-	resp, err := a.doGETWithRetry(ctx, u, 3)
+	resp, err := a.doGETWithRetry(ctx, u, 3, leaseToken)
 	if err != nil {
 		patch["internal_cdn_state"] = "degraded"
 		patch["internal_cdn_error"] = err.Error()
@@ -2446,12 +2447,11 @@ func (a *Agent) syncRoleAssignment(
 		return patch
 	}
 	u := fmt.Sprintf(
-		"%s/roles/placement?node_id=%s&lease_token=%s",
+		"%s/roles/placement?node_id=%s",
 		a.cfg.APIServerURL,
 		url.QueryEscape(a.cfg.NodeID),
-		url.QueryEscape(leaseToken),
 	)
-	resp, err := a.doGETWithRetry(ctx, u, 3)
+	resp, err := a.doGETWithRetry(ctx, u, 3, leaseToken)
 	if err != nil {
 		patch["role_assignment_error"] = err.Error()
 		return patch

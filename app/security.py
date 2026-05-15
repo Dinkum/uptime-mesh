@@ -103,6 +103,7 @@ def create_session_token(
     secret_key: str,
     *,
     ttl_seconds: int,
+    session_epoch: str = "",
     now: Optional[int] = None,
 ) -> str:
     issued_at = now if now is not None else int(time.time())
@@ -110,6 +111,7 @@ def create_session_token(
         "u": username,
         "iat": issued_at,
         "exp": issued_at + ttl_seconds,
+        "ep": session_epoch,
     }
     payload_json = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     payload_b64 = _b64url_encode(payload_json)
@@ -120,7 +122,11 @@ def create_session_token(
 
 
 def decode_session_token(
-    token: str, secret_key: str, *, now: Optional[int] = None
+    token: str,
+    secret_key: str,
+    *,
+    session_epoch: Optional[str] = None,
+    now: Optional[int] = None,
 ) -> Optional[str]:
     try:
         payload_b64, signature_b64 = token.split(".", 1)
@@ -144,6 +150,7 @@ def decode_session_token(
         payload = json.loads(_b64url_decode(payload_b64))
         username = payload["u"]
         expires_at = int(payload["exp"])
+        token_epoch = str(payload.get("ep") or "")
     except (KeyError, ValueError, TypeError, json.JSONDecodeError):
         return None
 
@@ -153,8 +160,28 @@ def decode_session_token(
     current = now if now is not None else int(time.time())
     if expires_at < current:
         return None
+    if session_epoch is not None and token_epoch != session_epoch:
+        return None
 
     return username
+
+
+def create_csrf_token(session_token: str, secret_key: str) -> str:
+    if not session_token:
+        return ""
+    signature = hmac.new(
+        secret_key.encode("utf-8"),
+        f"csrf:{session_token}".encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+    return _b64url_encode(signature)
+
+
+def verify_csrf_token(session_token: str, csrf_token: str, secret_key: str) -> bool:
+    expected = create_csrf_token(session_token, secret_key)
+    if not expected or not csrf_token:
+        return False
+    return hmac.compare_digest(expected, csrf_token)
 
 
 def sanitize_next_path(next_path: Optional[str], *, fallback: str = "/ui") -> str:

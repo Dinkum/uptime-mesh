@@ -9,6 +9,10 @@ from app.config import Settings
 from app.identity import heartbeat_signing_message
 from app.models.snapshot_run import SnapshotRun
 from app.models.support_bundle import SupportBundle
+from app.schemas.services import ServiceCreate
+from app.security import create_session_token, decode_session_token
+from app.services.gateway import render_nginx_config
+from app.schemas.gateway import GatewayRouteEndpointOut, GatewayRouteOut
 from app.services.snapshots import _snapshot_restore_dir
 from app.services.snapshots import snapshot_artifact_path
 from app.services.support_bundles import support_bundle_artifact_path
@@ -78,6 +82,75 @@ def test_snapshot_restore_rejects_unsafe_snapshot_id_before_output_paths() -> No
         raise AssertionError("unsafe snapshot id was accepted for restore")
 
 
+def test_session_tokens_are_bound_to_session_epoch() -> None:
+    token = create_session_token(
+        "admin",
+        "secret",
+        ttl_seconds=60,
+        session_epoch="epoch-a",
+        now=1_700_000_000,
+    )
+
+    assert decode_session_token(
+        token,
+        "secret",
+        session_epoch="epoch-a",
+        now=1_700_000_001,
+    ) == "admin"
+    assert (
+        decode_session_token(
+            token,
+            "secret",
+            session_epoch="epoch-b",
+            now=1_700_000_001,
+        )
+        is None
+    )
+
+
+def test_service_spec_rejects_unknown_and_unsafe_config_inputs() -> None:
+    try:
+        ServiceCreate(id="svc-web", name="Web", spec={"type": "container", "unexpected": True})
+    except ValueError as exc:
+        assert "unexpected" in str(exc)
+    else:
+        raise AssertionError("free-form service spec field was accepted")
+
+    try:
+        ServiceCreate(
+            id="svc-web",
+            name="Web",
+            spec={
+                "type": "container",
+                "container": {"image": "example/web:1.0.0", "port": 8080},
+                "gateway": {"enabled": True, "host": "bad;host", "path": "/"},
+            },
+        )
+    except ValueError as exc:
+        assert "gateway.host" in str(exc)
+    else:
+        raise AssertionError("unsafe gateway host was accepted")
+
+
+def test_nginx_render_rejects_unsafe_route_values() -> None:
+    route = GatewayRouteOut(
+        service_id="svc-web",
+        service_name="Web",
+        host="web.example.test",
+        path="/bad;path",
+        upstream="svc_web",
+        endpoint_count=1,
+        endpoints=[GatewayRouteEndpointOut(address="127.0.0.1", port=8080)],
+    )
+
+    try:
+        render_nginx_config(routes=[route], listen="127.0.0.1:8080", default_server_name="_")
+    except ValueError as exc:
+        assert "path" in str(exc)
+    else:
+        raise AssertionError("unsafe NGINX route path was accepted")
+
+
 def test_agent_version_matches_manifest() -> None:
     go_source = GO_AGENT.read_text()
     match = re.search(r'agentVersion\s+=\s+"([^"]+)"', go_source)
@@ -126,6 +199,7 @@ def test_scheduler_dry_run_does_not_mutate_loaded_replica_objects() -> None:
     source = (ROOT / "app/services/scheduler.py").read_text()
     assert "if not dry_run:\n            replica.node_id = target_node.id" in source
     assert "if not dry_run:\n            replica.status = status" in source
+    assert "generated_on_cache_miss" in source
 
 
 def test_agent_reports_explicit_role_runtime_capabilities() -> None:

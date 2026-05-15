@@ -3,7 +3,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from app.validation import ip_address, mesh_id
 
 
 class ClusterBootstrapRequest(BaseModel):
@@ -40,6 +42,16 @@ class NodeJoinRequest(BaseModel):
     lease_ttl_seconds: int = Field(default=45, ge=10, le=300)
     csr_pem: str
 
+    @field_validator("node_id")
+    @classmethod
+    def _validate_node_id(cls, value: str) -> str:
+        return mesh_id(value, field_name="node id")
+
+    @field_validator("mesh_ip")
+    @classmethod
+    def _validate_mesh_ip(cls, value: Optional[str]) -> Optional[str]:
+        return ip_address(value, field_name="mesh ip") if value else value
+
 
 class NodeJoinOut(BaseModel):
     node_id: str
@@ -57,6 +69,11 @@ class HeartbeatRequest(BaseModel):
     status_patch: Dict[str, Any] = Field(default_factory=dict)
     signed_at: int
     signature: str
+
+    @field_validator("node_id")
+    @classmethod
+    def _validate_node_id(cls, value: str) -> str:
+        return mesh_id(value, field_name="node id")
 
 
 class HeartbeatOut(BaseModel):
@@ -89,6 +106,11 @@ class SwimReportRequest(BaseModel):
     state: str = Field(default="healthy")
     flags: Dict[str, Any] = Field(default_factory=dict)
     peers: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+
+    @field_validator("node_id")
+    @classmethod
+    def _validate_node_id(cls, value: str) -> str:
+        return mesh_id(value, field_name="node id")
 
 
 class SwimMemberOut(BaseModel):

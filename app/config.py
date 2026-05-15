@@ -62,6 +62,11 @@ class Settings(BaseSettings):
     lxd_default_profile: str = Field(default="default")
     lxd_health_timeout_seconds: int = Field(default=60, ge=5, le=600)
     lxd_health_poll_seconds: int = Field(default=2, ge=1, le=30)
+    docker_enabled: bool = Field(default=False)
+    docker_command: str = Field(default="docker")
+    docker_default_network: str = Field(default="bridge")
+    docker_health_timeout_seconds: int = Field(default=60, ge=5, le=600)
+    docker_health_poll_seconds: int = Field(default=2, ge=1, le=30)
 
     runtime_enable: bool = Field(default=False)
     runtime_node_id: str = Field(default="")

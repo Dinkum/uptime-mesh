@@ -365,7 +365,7 @@ def cmd_join_command(args: argparse.Namespace) -> int:
     install_url = _install_script_url(repo_url)
     install_command = (
         f"curl -fsSL {shlex.quote(install_url)} | "
-        f"sudo UPTIMEMESH_REPO_URL={shlex.quote(repo_url)} bash -s -- --join {shlex.quote(peer)} --token {shlex.quote(token)}"
+        f"sudo UPTIMEMESH_REPO_URL={shlex.quote(repo_url)} bash -s -- --join {shlex.quote(peer)}"
     )
     if args.role and args.role != "auto":
         install_command += f" --role {args.role}"
@@ -376,6 +376,7 @@ def cmd_join_command(args: argparse.Namespace) -> int:
         "role": token_payload.get("role"),
         "ttl_seconds": args.ttl,
         "token_id": token_payload.get("id"),
+        "join_token": token,
         "expires_at": token_payload.get("expires_at"),
         "install_command": install_command,
     }
@@ -384,9 +385,14 @@ def cmd_join_command(args: argparse.Namespace) -> int:
 
 
 def cmd_join(args: argparse.Namespace) -> int:
+    join_token = str(args.token or "").strip()
+    if not join_token:
+        join_token = getpass.getpass("Join token: ").strip()
+    if not join_token:
+        raise RuntimeError("Join token is required.")
     key_pem, csr_pem = _generate_key_and_csr(args.node_id)
     join_payload: Dict[str, Any] = {
-        "token": args.token,
+        "token": join_token,
         "node_id": args.node_id,
         "name": args.name,
         "mesh_ip": args.mesh_ip,
@@ -755,7 +761,11 @@ def build_parser() -> argparse.ArgumentParser:
     join_command.set_defaults(func=cmd_join_command)
 
     join = sub.add_parser("join", help="Join node with a one-time token and CSR-based identity")
-    join.add_argument("--token", required=True)
+    join.add_argument(
+        "--token",
+        default=os.getenv("UPTIMEMESH_JOIN_TOKEN", ""),
+        help="Join token. Defaults to UPTIMEMESH_JOIN_TOKEN, or prompts when omitted.",
+    )
     join.add_argument("--node-id", required=True)
     join.add_argument("--name", required=True)
     join.add_argument(

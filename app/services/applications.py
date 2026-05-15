@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
@@ -11,13 +10,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.logger import get_logger
 from app.services import cluster_settings
 from app.utils import sanitize_label
+from app.validation import dns_name, mesh_id, nginx_path
 
 _logger = get_logger("services.applications")
 
 APPLICATIONS_KEY = "applications_json"
 DOMAIN_ROUTES_KEY = "domain_routes_json"
 
-_DOMAIN_LABEL_RE = re.compile(r"^[a-z0-9-]{1,63}$")
 _DEFAULT_APP_ID = "hello-world"
 
 
@@ -43,26 +42,20 @@ def _normalize_path(value: Any, default: str = "/") -> str:
     raw = str(value or "").strip()
     if not raw:
         raw = default
-    if not raw.startswith("/"):
-        raw = f"/{raw}"
-    while "//" in raw:
-        raw = raw.replace("//", "/")
-    return raw
+    return nginx_path(raw.replace("//", "/"))
 
 
 def _normalize_domain(value: Any) -> str:
     raw = str(value or "").strip().lower().rstrip(".")
     if not raw:
         return ""
-    labels = raw.split(".")
-    if len(labels) < 2:
+    try:
+        normalized = dns_name(raw)
+    except ValueError:
         return ""
-    for label in labels:
-        if not label or not _DOMAIN_LABEL_RE.fullmatch(label):
-            return ""
-        if label.startswith("-") or label.endswith("-"):
-            return ""
-    return raw
+    if "." not in normalized:
+        return ""
+    return normalized
 
 
 def _parse_json_list(raw: str) -> list[dict[str, Any]]:
@@ -88,8 +81,15 @@ def _normalize_application(item: dict[str, Any]) -> dict[str, Any] | None:
         return None
     name = str(item.get("name") or app_id).strip() or app_id
     description = str(item.get("description") or "").strip()
-    target_service_id = str(item.get("target_service_id") or "").strip()
-    default_path = _normalize_path(item.get("default_path"), default="/")
+    try:
+        target_service_id = (
+            mesh_id(str(item.get("target_service_id") or ""), field_name="target service id")
+            if str(item.get("target_service_id") or "").strip()
+            else ""
+        )
+        default_path = _normalize_path(item.get("default_path"), default="/")
+    except ValueError:
+        return None
     enabled = _to_bool(item.get("enabled"), default=True)
     created_at = str(item.get("created_at") or _now_iso())
     updated_at = str(item.get("updated_at") or created_at)
@@ -234,12 +234,21 @@ async def upsert_application(
     if not normalized_id:
         return False, "Application id or name is required."
     now = _now_iso()
+    try:
+        clean_target_service_id = (
+            mesh_id(target_service_id, field_name="target service id")
+            if str(target_service_id or "").strip()
+            else ""
+        )
+        clean_default_path = _normalize_path(default_path, default="/")
+    except ValueError as exc:
+        return False, str(exc)
     normalized_row = {
         "id": normalized_id,
         "name": str(name or normalized_id).strip() or normalized_id,
         "description": str(description or "").strip(),
-        "target_service_id": str(target_service_id or "").strip(),
-        "default_path": _normalize_path(default_path, default="/"),
+        "target_service_id": clean_target_service_id,
+        "default_path": clean_default_path,
         "enabled": bool(enabled),
         "updated_at": now,
     }
@@ -284,7 +293,10 @@ async def upsert_domain_route(
 
     routes = parse_domain_routes_from_settings(settings_map, application_ids=app_ids)
     normalized_route_id = sanitize_label(route_id, max_len=48) or uuid4().hex[:10]
-    normalized_path = _normalize_path(path, default="/")
+    try:
+        normalized_path = _normalize_path(path, default="/")
+    except ValueError as exc:
+        return False, str(exc)
     now = _now_iso()
     candidate = {
         "id": normalized_route_id,

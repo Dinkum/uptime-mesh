@@ -155,6 +155,7 @@ def _empty_plan() -> SchedulerBulkResultOut:
         dry_run=True,
         generated_at=datetime.now(timezone.utc),
         results=[],
+        cache_state="empty",
     )
 
 
@@ -206,6 +207,7 @@ async def refresh_cached_plan(
     limit: int = 200,
 ) -> SchedulerBulkResultOut:
     plan = await reconcile_all_services(session, dry_run=True, limit=limit)
+    plan.cache_state = "refreshed"
     await cache_plan(session, plan)
     return plan
 
@@ -215,28 +217,35 @@ async def get_cached_plan(session: AsyncSession) -> SchedulerBulkResultOut:
     if setting is None or not setting.value.strip():
         _logger.warning(
             "scheduler.cache.miss",
-            "Scheduler plan cache not available; returning empty cached plan",
+            "Scheduler plan cache not available; generating a fresh dry-run plan",
         )
-        return _empty_plan()
+        plan = await reconcile_all_services(session, dry_run=True)
+        plan.cache_state = "generated_on_cache_miss"
+        return plan
     try:
         parsed = json.loads(setting.value)
     except json.JSONDecodeError as exc:
         _logger.warning(
             "scheduler.cache.parse_error",
-            "Failed to parse cached scheduler plan JSON; returning empty plan",
+            "Failed to parse cached scheduler plan JSON; generating a fresh dry-run plan",
             error=str(exc),
         )
-        return _empty_plan()
+        plan = await reconcile_all_services(session, dry_run=True)
+        plan.cache_state = "generated_after_cache_error"
+        return plan
     try:
         plan = SchedulerBulkResultOut.model_validate(parsed)
     except Exception as exc:  # noqa: BLE001
         _logger.warning(
             "scheduler.cache.validate_error",
-            "Cached scheduler plan failed schema validation; returning empty plan",
+            "Cached scheduler plan failed schema validation; generating a fresh dry-run plan",
             error_type=type(exc).__name__,
             error=str(exc),
         )
-        return _empty_plan()
+        plan = await reconcile_all_services(session, dry_run=True)
+        plan.cache_state = "generated_after_cache_error"
+        return plan
+    plan.cache_state = "cached"
     return plan
 
 
@@ -489,4 +498,5 @@ async def reconcile_all_services(
         dry_run=dry_run,
         generated_at=datetime.now(timezone.utc),
         results=results,
+        cache_state="fresh",
     )

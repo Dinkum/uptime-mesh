@@ -30,3 +30,4 @@ class SchedulerBulkResultOut(BaseModel):
     dry_run: bool
     generated_at: datetime
     results: List[SchedulerResultOut] = Field(default_factory=list)
+    cache_state: str = "fresh"

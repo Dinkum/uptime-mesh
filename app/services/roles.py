@@ -123,6 +123,14 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def _hash_score(role_name: str, node_id: str) -> int:
     raw = f"{role_name}|{node_id}".encode("utf-8")
     digest = hashlib.sha256(raw).digest()
@@ -363,7 +371,10 @@ async def reconcile_placement(
             # Fallback to lease-recency when SWIM has not converged yet.
             now = datetime.now(timezone.utc)
             healthy_nodes = sorted(
-                node.id for node in nodes if node.lease_expires_at is not None and node.lease_expires_at >= now
+                node.id
+                for node in nodes
+                if (lease_expires_at := _as_utc(node.lease_expires_at)) is not None
+                and lease_expires_at >= now
             )
 
         previous_map, previous_generated_at = _previous_placement(settings_map)
@@ -422,7 +433,8 @@ async def reconcile_placement(
 
             deficit = max(desired - len(holders), 0)
             if deficit:
-                warnings.append(f"role {role_name} under target by {deficit} replica(s)")
+                replica_label = "replica" if deficit == 1 else "replicas"
+                warnings.append(f"role {role_name} under target by {deficit} {replica_label}")
 
             row = RolePlanRow(
                 name=role_name,

@@ -39,7 +39,7 @@
       <h2 class="text-lg font-semibold mb-4">Holder Nodes</h2>
       <div class="space-y-3">
         {% for node in holder_nodes %}
-          <a href="{{ ui_prefix }}/nodes/{{ node.id }}" class="block rounded-xl border border-slate-700/40 px-4 py-3 hover:border-cyan-300/60">
+          <a href="{{ ui_prefix }}/nodes/{{ node.id }}" class="link-card block rounded-xl border border-slate-700/40 px-4 py-3 hover:border-cyan-300/60">
             <div class="flex items-center justify-between">
               <p class="mono">{{ node.id }}</p>
               <p class="text-xs text-slate-500">{{ node.roles_text }}</p>

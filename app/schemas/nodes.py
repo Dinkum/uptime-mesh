@@ -3,7 +3,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from app.validation import ip_address, mesh_id
 
 
 class NodeCreate(BaseModel):
@@ -15,6 +17,16 @@ class NodeCreate(BaseModel):
     status: Dict[str, Any] = Field(default_factory=dict)
     api_endpoint: Optional[str] = None
 
+    @field_validator("id")
+    @classmethod
+    def _validate_id(cls, value: str) -> str:
+        return mesh_id(value, field_name="node id")
+
+    @field_validator("mesh_ip")
+    @classmethod
+    def _validate_mesh_ip(cls, value: Optional[str]) -> Optional[str]:
+        return ip_address(value, field_name="mesh ip") if value else value
+
 
 class NodeUpdate(BaseModel):
     name: Optional[str] = None
@@ -23,6 +35,11 @@ class NodeUpdate(BaseModel):
     mesh_ip: Optional[str] = None
     status: Optional[Dict[str, Any]] = None
     api_endpoint: Optional[str] = None
+
+    @field_validator("mesh_ip")
+    @classmethod
+    def _validate_mesh_ip(cls, value: Optional[str]) -> Optional[str]:
+        return ip_address(value, field_name="mesh ip") if value else value
 
 
 class NodeOut(BaseModel):

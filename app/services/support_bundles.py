@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import platform
-import re
 import tarfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -28,11 +27,11 @@ from app.schemas.support_bundles import SupportBundleCreate
 from app.services import cluster_settings as cluster_settings_service
 from app.services import etcd as etcd_service
 from app.services.events import record_event
+from app.validation import artifact_id, path_under
 
 _logger = get_logger("services.support_bundles")
 _settings = get_settings()
 _SENSITIVE_KEY_PARTS = ("secret", "token", "password", "private_key", "auth_cookie", "signing_key")
-_ARTIFACT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _BUNDLE_ROW_LIMIT = 2000
 _LOG_TAIL_BYTES = 1024 * 1024
 
@@ -412,35 +411,22 @@ def _sanitize_cluster_settings_rows(rows: list[dict[str, object]]) -> list[dict[
 
 
 def _artifact_work_dir(base_dir: Path, bundle_id: str) -> Path:
-    clean_id = bundle_id.strip()
-    if not _ARTIFACT_ID_RE.fullmatch(clean_id):
-        raise ValueError("support bundle id must be a safe artifact slug")
+    clean_id = artifact_id(bundle_id, field_name="support bundle id")
     base = base_dir.resolve()
-    path = (base / f"{clean_id}.tmp").resolve()
-    if not path.is_relative_to(base):
-        raise ValueError("support bundle path escapes bundle directory")
-    return path
+    return path_under(base, base / f"{clean_id}.tmp", field_name="support bundle path")
 
 
 def _artifact_archive_path(base_dir: Path, bundle_id: str) -> Path:
-    clean_id = bundle_id.strip()
-    if not _ARTIFACT_ID_RE.fullmatch(clean_id):
-        raise ValueError("support bundle id must be a safe artifact slug")
+    clean_id = artifact_id(bundle_id, field_name="support bundle id")
     base = base_dir.resolve()
-    path = (base / f"{clean_id}.tar.gz").resolve()
-    if not path.is_relative_to(base):
-        raise ValueError("support bundle archive path escapes bundle directory")
-    return path
+    return path_under(base, base / f"{clean_id}.tar.gz", field_name="support bundle archive path")
 
 
 def support_bundle_artifact_path(bundle: SupportBundle) -> Path:
     if not bundle.path:
         raise ValueError("support bundle has no artifact path")
     base = Path(_settings.support_bundle_dir).resolve()
-    path = Path(bundle.path).resolve()
-    if not path.is_relative_to(base):
-        raise ValueError("support bundle artifact path escapes bundle directory")
-    return path
+    return path_under(base, Path(bundle.path), field_name="support bundle artifact path")
 
 
 async def _generate_support_bundle(session: AsyncSession, bundle_id: str) -> str:

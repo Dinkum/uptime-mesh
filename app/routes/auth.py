@@ -4,7 +4,6 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, status
 from fastapi.responses import RedirectResponse
-from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,9 +17,9 @@ from app.security import (
 )
 from app.services import auth as auth_service
 from app.services import rate_limits as rate_limit_service
+from app.templates import render_template
 
 router = APIRouter(prefix="/auth", include_in_schema=False)
-templates = Jinja2Templates(directory="app/templates")
 settings = get_settings()
 _logger = get_logger("auth.login")
 
@@ -43,7 +42,7 @@ def _login_context(
         "error": error,
         "next_path": next_path,
     }
-    return templates.TemplateResponse("login.html", context, status_code=status_code)
+    return render_template(request, "login.html", context, status_code=status_code)
 
 
 def _client_ip(request: Request) -> str:
@@ -150,11 +149,13 @@ async def login_submit(
 
         await rate_limit_service.clear_login_lockout(session, scope="login", subject=ip_key)
         op.step("rate_limit.reset", "Reset login rate limiter for successful auth")
+        session_epoch = await auth_service.get_session_epoch(session)
 
         token = create_session_token(
             username=normalized_username,
             secret_key=settings.auth_secret_key,
             ttl_seconds=settings.auth_session_ttl_seconds,
+            session_epoch=session_epoch,
         )
         response = RedirectResponse(url=next_path, status_code=status.HTTP_303_SEE_OTHER)
         response.set_cookie(
@@ -256,11 +257,13 @@ async def token_login(
 
         await rate_limit_service.clear_login_lockout(session, scope="login", subject=ip_key)
         op.step("rate_limit.reset", "Reset login rate limiter for successful auth")
+        session_epoch = await auth_service.get_session_epoch(session)
 
         token = create_session_token(
             username=normalized_username,
             secret_key=settings.auth_secret_key,
             ttl_seconds=settings.auth_session_ttl_seconds,
+            session_epoch=session_epoch,
         )
         _logger.info(
             "login.success",

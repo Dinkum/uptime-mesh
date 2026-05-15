@@ -4,6 +4,7 @@ import json
 import os
 from dataclasses import dataclass
 from functools import lru_cache
+from importlib import metadata
 from pathlib import Path
 from typing import Any, Dict
 
@@ -48,8 +49,28 @@ def _resolve_version_file() -> Path:
     )
 
 
+def _load_package_metadata_version() -> VersionInfo:
+    try:
+        app_version = metadata.version("uptimemesh")
+    except metadata.PackageNotFoundError as exc:
+        raise FileNotFoundError(
+            f"Unable to locate version.json. Set {_VERSION_FILE_ENV} to an explicit path."
+        ) from exc
+    return VersionInfo(
+        manifest_version=app_version,
+        app_version=app_version,
+        channel=_DEFAULT_CHANNEL,
+        channel_version=app_version,
+        agent_version="",
+        source_path="package-metadata:uptimemesh",
+    )
+
+
 def load_version_info(channel: str = _DEFAULT_CHANNEL) -> VersionInfo:
-    version_file = _resolve_version_file()
+    try:
+        version_file = _resolve_version_file()
+    except FileNotFoundError:
+        return _load_package_metadata_version()
     try:
         raw = json.loads(version_file.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:

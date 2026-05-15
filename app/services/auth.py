@@ -15,6 +15,7 @@ from app.services import cluster_settings
 AUTH_USERNAME_KEY = "auth_username"
 AUTH_PASSWORD_HASH_KEY = "auth_password_hash"
 AUTH_PASSWORD_UPDATED_AT_KEY = "auth_password_updated_at"
+AUTH_SESSION_EPOCH_KEY = "auth_session_epoch"
 DEFAULT_ADMIN_USERNAME = "admin"
 
 _logger = get_logger("services.auth")
@@ -31,6 +32,10 @@ def generate_random_password(length: int = 28) -> str:
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
+def _new_session_epoch() -> str:
+    return f"{int(datetime.now(timezone.utc).timestamp())}-{secrets.token_hex(8)}"
+
+
 async def set_credentials(
     session: AsyncSession,
     *,
@@ -43,6 +48,7 @@ async def set_credentials(
     await cluster_settings.set_setting(session, AUTH_USERNAME_KEY, normalized_username)
     await cluster_settings.set_setting(session, AUTH_PASSWORD_HASH_KEY, password_hash)
     await cluster_settings.set_setting(session, AUTH_PASSWORD_UPDATED_AT_KEY, updated_at)
+    await cluster_settings.set_setting(session, AUTH_SESSION_EPOCH_KEY, _new_session_epoch())
     _logger.info(
         "auth.credentials.set",
         "Set cluster admin credentials",
@@ -73,8 +79,35 @@ async def ensure_auth_defaults(session: AsyncSession) -> Tuple[str, str]:
             datetime.now(timezone.utc).isoformat(),
         )
         _logger.warning("auth.defaults", "Initialized missing auth password hash setting")
+    session_epoch = await cluster_settings.get_setting(session, AUTH_SESSION_EPOCH_KEY)
+    if session_epoch is None or not session_epoch.value.strip():
+        await cluster_settings.set_setting(session, AUTH_SESSION_EPOCH_KEY, _new_session_epoch())
 
     return username, password_hash
+
+
+async def get_session_epoch(session: AsyncSession) -> str:
+    await ensure_auth_defaults(session)
+    setting = await cluster_settings.get_setting(session, AUTH_SESSION_EPOCH_KEY)
+    return setting.value if setting is not None else ""
+
+
+async def get_security_summary(session: AsyncSession) -> dict[str, str]:
+    username, _ = await ensure_auth_defaults(session)
+    session_epoch = await get_session_epoch(session)
+    password_updated_at = await cluster_settings.get_setting(session, AUTH_PASSWORD_UPDATED_AT_KEY)
+    return {
+        "username": username,
+        "session_epoch": session_epoch,
+        "password_updated_at": password_updated_at.value if password_updated_at is not None else "",
+    }
+
+
+async def revoke_all_sessions(session: AsyncSession) -> str:
+    epoch = _new_session_epoch()
+    await cluster_settings.set_setting(session, AUTH_SESSION_EPOCH_KEY, epoch)
+    _logger.info("auth.sessions.revoke_all", "Revoked all admin sessions")
+    return epoch
 
 
 async def get_username(session: AsyncSession) -> str:
@@ -97,6 +130,7 @@ async def verify_credentials(session: AsyncSession, username: str, password: str
         updated_at = datetime.now(timezone.utc).isoformat()
         await cluster_settings.set_setting(session, AUTH_PASSWORD_HASH_KEY, updated_hash)
         await cluster_settings.set_setting(session, AUTH_PASSWORD_UPDATED_AT_KEY, updated_at)
+        await cluster_settings.set_setting(session, AUTH_SESSION_EPOCH_KEY, _new_session_epoch())
         _logger.info(
             "auth.password.rehash",
             "Rehashed stored password with current algorithm parameters",
@@ -122,5 +156,6 @@ async def change_password(
     updated_at = datetime.now(timezone.utc).isoformat()
     await cluster_settings.set_setting(session, AUTH_PASSWORD_HASH_KEY, updated_hash)
     await cluster_settings.set_setting(session, AUTH_PASSWORD_UPDATED_AT_KEY, updated_at)
+    await cluster_settings.set_setting(session, AUTH_SESSION_EPOCH_KEY, _new_session_epoch())
     _logger.info("auth.password.update", "Updated admin password", username=configured_username)
     return True, ""

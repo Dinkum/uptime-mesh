@@ -89,14 +89,15 @@
       <div class="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-4">
         <div>
           <h2 class="text-lg font-semibold">Add Node</h2>
-          <p class="text-sm text-slate-500 mt-1">Generate a one time install command for the next machine.</p>
+          <p class="text-sm text-slate-500 mt-1">Generate a one-time install command for the next machine.</p>
         </div>
-        <form id="join-command-form" class="grid grid-cols-1 md:grid-cols-4 gap-3 lg:min-w-[760px]">
+        <form id="join-command-form" class="grid grid-cols-1 md:grid-cols-6 gap-3 lg:min-w-[760px]">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
           <label class="block md:col-span-2">
             <span class="text-xs uppercase tracking-[0.12em] text-slate-500">Peer Host/IP</span>
             <input class="node-form-control mt-1 mono" name="peer" placeholder="51.15.211.158" required />
           </label>
-          <label class="block">
+          <label class="block md:col-span-2">
             <span class="text-xs uppercase tracking-[0.12em] text-slate-500">Role</span>
             <select class="node-form-control mt-1" name="role">
               <option value="auto">Auto</option>
@@ -104,7 +105,7 @@
               <option value="reverse_proxy">Reverse Proxy</option>
             </select>
           </label>
-          <label class="block">
+          <label class="block md:col-span-2">
             <span class="text-xs uppercase tracking-[0.12em] text-slate-500">TTL</span>
             <select class="node-form-control mt-1" name="ttl_seconds">
               <option value="1800">30 min</option>
@@ -112,11 +113,11 @@
               <option value="86400">24 hours</option>
             </select>
           </label>
-          <label class="block">
+          <label class="block md:col-span-2">
             <span class="text-xs uppercase tracking-[0.12em] text-slate-500">Port</span>
             <input class="node-form-control mt-1 mono" name="join_port" type="number" min="1" max="65535" value="8010" />
           </label>
-          <div class="md:col-span-3 flex items-end">
+          <div class="md:col-span-4 flex items-end">
             <button class="btn btn-primary w-full md:w-auto" type="submit" data-busy-text="Generating">Generate Command</button>
           </div>
         </form>
@@ -130,6 +131,15 @@
           <button id="join-command-copy" class="btn btn-sm btn-outline" type="button">Copy</button>
         </div>
         <pre class="mono text-xs whitespace-pre-wrap break-all mt-3 text-slate-200" id="join-command-output"></pre>
+        <div class="mt-4 rounded-xl border border-slate-700/40 bg-slate-950/45 p-3">
+          <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+            <div class="min-w-0">
+              <p class="text-xs uppercase tracking-[0.14em] text-slate-500">Join Token</p>
+              <p class="mono text-xs break-all mt-1 text-slate-200" id="join-token-output"></p>
+            </div>
+            <button id="join-token-copy" class="btn btn-sm btn-outline shrink-0" type="button">Copy</button>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -216,7 +226,7 @@
             <div class="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-4">
               <div>
                 <div class="flex flex-wrap items-center gap-3">
-                  <a class="text-xl font-semibold hover:underline" href="{{ ui_prefix }}/nodes/{{ node.id }}">{{ node.name }}</a>
+                  <a class="link-soft text-xl font-semibold" href="{{ ui_prefix }}/nodes/{{ node.id }}">{{ node.name }}</a>
                   {% if node.health_tone == "success" %}
                     <span class="badge badge-success badge-outline">{{ node.health_text }}</span>
                   {% elif node.health_tone == "warning" %}
@@ -377,6 +387,8 @@
     const joinCommandOutput = document.getElementById("join-command-output");
     const joinCommandExpiry = document.getElementById("join-command-expiry");
     const joinCommandCopy = document.getElementById("join-command-copy");
+    const joinTokenOutput = document.getElementById("join-token-output");
+    const joinTokenCopy = document.getElementById("join-token-copy");
 
     if (joinCommandForm) {
       joinCommandForm.addEventListener("submit", async (event) => {
@@ -390,6 +402,7 @@
           }, submitButton);
           const payload = await response.json();
           joinCommandOutput.textContent = payload.install_command || "";
+          joinTokenOutput.textContent = payload.join_token || "";
           joinCommandExpiry.textContent = payload.expires_at ? `Expires ${payload.expires_at}` : "";
           joinCommandResult.classList.remove("hidden");
           window.umToast("Join command ready.");
@@ -408,6 +421,19 @@
           window.umToast("Command copied.");
         } catch (error) {
           window.umToast("Copy failed. Select the command text manually.", "error");
+        }
+      });
+    }
+
+    if (joinTokenCopy) {
+      joinTokenCopy.addEventListener("click", async () => {
+        const token = joinTokenOutput ? joinTokenOutput.textContent : "";
+        if (!token) return;
+        try {
+          await navigator.clipboard.writeText(token);
+          window.umToast("Token copied.");
+        } catch (error) {
+          window.umToast("Copy failed. Select the token text manually.", "error");
         }
       });
     }

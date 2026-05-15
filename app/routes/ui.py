@@ -8,7 +8,6 @@ from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, status
 from fastapi.responses import RedirectResponse
-from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,6 +15,7 @@ from app.config import get_settings
 from app.dependencies import get_db_session, get_writable_db_session
 from app.models.event import Event
 from app.security import SESSION_COOKIE_NAME, create_session_token
+from app.security import create_csrf_token, verify_csrf_token
 from app.services import (
     applications as applications_service,
     auth as auth_service,
@@ -26,17 +26,21 @@ from app.services import (
     events as event_service,
     gateway as gateway_service,
     nodes as node_service,
+    preflight as preflight_service,
+    providers as provider_service,
     replicas as replica_service,
     roles as role_service,
     scheduler as scheduler_service,
+    service_state as service_state_service,
     services as service_service,
     snapshots as snapshot_service,
     support_bundles as support_bundle_service,
+    survivor as survivor_service,
 )
+from app.templates import render_template
 
 router = APIRouter(prefix="/ui", include_in_schema=False)
 
-templates = Jinja2Templates(directory="app/templates")
 settings = get_settings()
 
 
@@ -131,11 +135,11 @@ def _install_script_url(repo_url: str) -> str:
     return "https://raw.githubusercontent.com/Dinkum/uptime-mesh/main/install.sh"
 
 
-def _install_join_command(peer: str, token: str, role: str, join_port: int, repo_url: str) -> str:
+def _install_join_command(peer: str, role: str, join_port: int, repo_url: str) -> str:
     install_url = _install_script_url(repo_url)
     command = (
         f"curl -fsSL {shlex.quote(install_url)} | "
-        f"sudo UPTIMEMESH_REPO_URL={shlex.quote(repo_url)} bash -s -- --join {shlex.quote(peer)} --token {shlex.quote(token)}"
+        f"sudo UPTIMEMESH_REPO_URL={shlex.quote(repo_url)} bash -s -- --join {shlex.quote(peer)}"
     )
     if role and role != "auto":
         command = f"{command} --role {role}"
@@ -162,7 +166,12 @@ async def _not_found_response(
         "back_label": back_label,
     }
     context.update(await _base_context(request, session))
-    return templates.TemplateResponse("not_found.html", context, status_code=status.HTTP_404_NOT_FOUND)
+    return render_template(
+        request,
+        "not_found.html",
+        context,
+        status_code=status.HTTP_404_NOT_FOUND,
+    )
 
 
 async def _base_context(request: Request, session: AsyncSession) -> Dict[str, Any]:
@@ -194,13 +203,26 @@ async def _base_context(request: Request, session: AsyncSession) -> Dict[str, An
                 current_tab = tab_name
                 break
 
+    etcd_status = settings_map.get("etcd_status", "unknown")
+    etcd_attention_states = {"down", "unavailable", "stale"}
     return {
         "ui_prefix": "/ui",
         "current_tab": current_tab,
         "auth_user": getattr(request.state, "auth_user", ""),
-        "etcd_status": settings_map.get("etcd_status", "unknown"),
+        "csrf_token": create_csrf_token(
+            request.cookies.get(SESSION_COOKIE_NAME, ""),
+            settings.auth_secret_key,
+        ),
+        "etcd_status": etcd_status,
+        "etcd_needs_attention": etcd_status in etcd_attention_states,
         "etcd_last_sync_at": settings_map.get("etcd_last_sync_at"),
     }
+
+
+def _verify_ui_csrf(request: Request, csrf_token: str = Form(default="")) -> None:
+    session_token = request.cookies.get(SESSION_COOKIE_NAME, "")
+    if not verify_csrf_token(session_token, csrf_token, settings.auth_secret_key):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid CSRF token.")
 
 
 def _format_timestamp(value: datetime | None) -> str:
@@ -221,6 +243,18 @@ def _format_duration(seconds: int) -> str:
         return f"{hours}h {rem_minutes}m"
     days, rem_hours = divmod(hours, 24)
     return f"{days}d {rem_hours}h"
+
+
+def _format_event_field_value(key: str, value: Any) -> str:
+    if isinstance(value, str) and key.endswith("_at"):
+        parsed = _parse_datetime(value)
+        if parsed is not None:
+            return _format_timestamp(parsed)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, sort_keys=True)
+    return str(value)
 
 
 def _format_age(now: datetime, value: datetime | None) -> str:
@@ -447,6 +481,7 @@ async def overview(request: Request, session: AsyncSession = Depends(get_db_sess
 
     nodes = await node_service.list_nodes(session)
     events = await event_service.list_events(session, limit=12)
+    preflight = await preflight_service.build_preflight_report(session, settings)
 
     recent_event_count_q = await session.execute(
         select(func.count(Event.id)).where(Event.created_at >= window_start)
@@ -519,9 +554,10 @@ async def overview(request: Request, session: AsyncSession = Depends(get_db_sess
         "app_version": version_label,
         "agent_version": agent_version_label,
         "events": events,
+        "preflight": preflight,
     }
     context.update(await _base_context(request, session))
-    return templates.TemplateResponse("overview.html", context)
+    return render_template(request, "overview.html", context)
 
 
 @router.get("/network")
@@ -547,10 +583,9 @@ async def nodes_page(request: Request, session: AsyncSession = Depends(get_db_se
     cert_warning = sum(1 for row in node_rows if row["identity_expiry_state"] == "warning")
 
     swim_members: dict[str, Any] = {}
-    placement: dict[str, Any] = {}
+    placement = await role_service.get_latest_placement(session)
     if view_mode == "map":
         swim_members = await cluster_service.list_swim_members(session)
-        placement = await role_service.get_latest_placement(session)
     placement_rows = placement.get("roles", []) if isinstance(placement, dict) else []
     node_assignments = placement.get("node_assignments", {}) if isinstance(placement, dict) else {}
 
@@ -653,11 +688,12 @@ async def nodes_page(request: Request, session: AsyncSession = Depends(get_db_se
         "cert_warning": cert_warning,
     }
     context.update(await _base_context(request, session))
-    return templates.TemplateResponse("nodes.html", context)
+    return render_template(request, "nodes.html", context)
 
 
 @router.post("/nodes/join-command")
 async def create_node_join_command(
+    _csrf: None = Depends(_verify_ui_csrf),
     peer: str = Form(default=""),
     role: str = Form(default="auto"),
     ttl_seconds: int = Form(default=1800),
@@ -688,10 +724,10 @@ async def create_node_join_command(
     return {
         "token_id": token.id,
         "role": token.role,
+        "join_token": token.token,
         "expires_at": token.expires_at.isoformat(),
         "install_command": _install_join_command(
             clean_peer,
-            token.token,
             token.role,
             join_port,
             repo_url,
@@ -1025,7 +1061,7 @@ async def node_detail_page(
         "endpoint_state_counts": endpoint_state_counts,
     }
     context.update(await _base_context(request, session))
-    return templates.TemplateResponse("node_detail.html", context)
+    return render_template(request, "node_detail.html", context)
 
 
 @router.get("/roles")
@@ -1063,12 +1099,14 @@ async def roles_page(request: Request, session: AsyncSession = Depends(get_db_se
         "request": request,
         "title": "Roles",
         "subtitle": "Role specs, deterministic placement, and current holders",
-        "generated_at": placement.get("generated_at", "") if isinstance(placement, dict) else "",
+        "generated_at": _format_timestamp(
+            _parse_datetime(placement.get("generated_at", "") if isinstance(placement, dict) else "")
+        ),
         "warnings": placement.get("warnings", []) if isinstance(placement, dict) else [],
         "role_rows": role_rows,
     }
     context.update(await _base_context(request, session))
-    return templates.TemplateResponse("roles.html", context)
+    return render_template(request, "roles.html", context)
 
 
 @router.get("/roles/{role_name}")
@@ -1115,19 +1153,19 @@ async def role_detail_page(
         "holder_nodes": holder_nodes,
     }
     context.update(await _base_context(request, session))
-    return templates.TemplateResponse("role_detail.html", context)
+    return render_template(request, "role_detail.html", context)
 
 
 @router.get("/workloads")
 async def workloads_page(request: Request, session: AsyncSession = Depends(get_db_session)) -> Any:
     subtab = (request.query_params.get("tab") or "services").strip().lower()
-    if subtab not in {"services", "replicas", "scheduler", "rollouts"}:
+    if subtab not in {"services", "replicas", "scheduler", "rollouts", "survivor", "state"}:
         subtab = "services"
 
     services = await service_service.list_services(session, limit=2000)
     now = datetime.now(timezone.utc)
     replicas = []
-    if subtab in {"services", "replicas", "rollouts"}:
+    if subtab in {"services", "replicas", "rollouts", "survivor", "state"}:
         replicas = await replica_service.list_replicas(session, limit=2000)
     rollout_rows = (
         service_service.build_rollout_rows(services, replicas, now=now)
@@ -1201,6 +1239,10 @@ async def workloads_page(request: Request, session: AsyncSession = Depends(get_d
     )
     rollout_watch_blocked_replicas = sum(int(row["blocking_count"]) for row in rollout_watch_rows)
     plan = await scheduler_service.get_cached_plan(session) if subtab == "scheduler" else None
+    survivor_report = await survivor_service.build_survivor_report(session) if subtab == "survivor" else None
+    service_state_rows = (
+        await service_state_service.list_service_states(session) if subtab == "state" else []
+    )
 
     context = {
         "request": request,
@@ -1218,9 +1260,11 @@ async def workloads_page(request: Request, session: AsyncSession = Depends(get_d
         "rollout_watch_active": rollout_watch_active,
         "rollout_watch_blocked_replicas": rollout_watch_blocked_replicas,
         "plan": plan,
+        "survivor_report": survivor_report,
+        "service_state_rows": service_state_rows,
     }
     context.update(await _base_context(request, session))
-    return templates.TemplateResponse("workloads.html", context)
+    return render_template(request, "workloads.html", context)
 
 
 @router.get("/services")
@@ -1242,15 +1286,29 @@ async def scheduler_page() -> Any:
 async def events_page(request: Request, session: AsyncSession = Depends(get_db_session)) -> Any:
     events = await event_service.list_events(session, limit=50)
     stream_since = events[0].created_at.isoformat() if events else ""
+    event_rows = [
+        {
+            "id": event.id,
+            "name": event.name,
+            "level": event.level,
+            "category": event.category,
+            "created_at": _format_timestamp(event.created_at),
+            "fields": {
+                str(key): _format_event_field_value(str(key), value)
+                for key, value in (event.fields or {}).items()
+            },
+        }
+        for event in events
+    ]
     context = {
         "request": request,
         "title": "Events",
         "subtitle": "Audit timeline and live stream",
-        "events": events,
+        "events": event_rows,
         "events_stream_since": stream_since,
     }
     context.update(await _base_context(request, session))
-    return templates.TemplateResponse("events.html", context)
+    return render_template(request, "events.html", context)
 
 
 @router.get("/infrastructure")
@@ -1533,7 +1591,7 @@ async def infrastructure_page(request: Request, session: AsyncSession = Depends(
         "swim_state_counts": swim_state_counts,
     }
     context.update(await _base_context(request, session))
-    return templates.TemplateResponse("infrastructure.html", context)
+    return render_template(request, "infrastructure.html", context)
 
 
 @router.get("/wireguard")
@@ -1579,6 +1637,7 @@ async def _build_settings_context(
 ) -> dict[str, Any]:
     settings_map = await cluster_settings.get_settings_map(session)
     username = await auth_service.get_username(session)
+    security_summary = await auth_service.get_security_summary(session)
     applications: list[Any] = []
     domain_routes: list[Any] = []
     domain_bindings: list[dict[str, Any]] = []
@@ -1635,6 +1694,9 @@ async def _build_settings_context(
     provider_configured = {
         key: bool(str(settings_map.get(key, "")).strip()) for key in provider_secret_keys
     }
+    provider_capabilities = []
+    if active_section == "providers":
+        provider_capabilities = await provider_service.list_capabilities(session)
 
     context = {
         "request": request,
@@ -1642,6 +1704,11 @@ async def _build_settings_context(
         "subtitle": "Authentication, routing, provider integrations, and support tools",
         "settings_section": active_section,
         "username": username,
+        "security_summary": security_summary,
+        "password_updated_at": _format_timestamp(
+            _parse_datetime(security_summary.get("password_updated_at"))
+        ),
+        "node_cert_validity_days": settings.node_cert_validity_days,
         "password_success": password_success,
         "password_error": password_error,
         "repo_success": repo_success,
@@ -1663,6 +1730,7 @@ async def _build_settings_context(
         "domain_ingress_target": ingress_target,
         "dns_record_rows": dns_record_rows,
         "provider_configured": provider_configured,
+        "provider_capabilities": provider_capabilities,
         "provider_cloudflare_zone_id": settings_map.get("provider_cloudflare_zone_id", ""),
         "snapshots": snapshots,
         "bundles": bundles,
@@ -1699,12 +1767,13 @@ async def settings_page(request: Request, session: AsyncSession = Depends(get_db
         routing_success=" ".join(routing_messages),
         provider_success="Provider settings updated." if provider_updated else "",
     )
-    return templates.TemplateResponse("settings.html", context)
+    return render_template(request, "settings.html", context)
 
 
 @router.post("/settings/password")
 async def change_password(
     request: Request,
+    _csrf: None = Depends(_verify_ui_csrf),
     session: AsyncSession = Depends(get_writable_db_session),
     current_password: str = Form(default=""),
     new_password: str = Form(default=""),
@@ -1731,10 +1800,12 @@ async def change_password(
             new_password=new_password,
         )
         if changed:
+            session_epoch = await auth_service.get_session_epoch(session)
             session_token = create_session_token(
                 username=auth_user,
                 secret_key=settings.auth_secret_key,
                 ttl_seconds=settings.auth_session_ttl_seconds,
+                session_epoch=session_epoch,
             )
             response = RedirectResponse(
                 url="/ui/settings?password_updated=1", status_code=status.HTTP_303_SEE_OTHER
@@ -1763,12 +1834,24 @@ async def change_password(
             )
         ),
     }
-    return templates.TemplateResponse("settings.html", context, status_code=status_code)
+    return render_template(request, "settings.html", context, status_code=status_code)
+
+
+@router.post("/settings/security/revoke-sessions")
+async def revoke_sessions(
+    _csrf: None = Depends(_verify_ui_csrf),
+    session: AsyncSession = Depends(get_writable_db_session),
+) -> Any:
+    await auth_service.revoke_all_sessions(session)
+    response = RedirectResponse(url="/auth/login", status_code=status.HTTP_303_SEE_OTHER)
+    response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+    return response
 
 
 @router.post("/settings/repo")
 async def update_repo_url(
     request: Request,
+    _csrf: None = Depends(_verify_ui_csrf),
     session: AsyncSession = Depends(get_writable_db_session),
     github_repo_url: str = Form(default=""),
 ) -> Any:
@@ -1793,12 +1876,13 @@ async def update_repo_url(
         repo_error=error,
         github_repo_url_override=clean_url or "https://github.com/Dinkum/uptime-mesh",
     )
-    return templates.TemplateResponse("settings.html", context, status_code=status_code)
+    return render_template(request, "settings.html", context, status_code=status_code)
 
 
 @router.post("/settings/routing/application")
 async def upsert_application(
     request: Request,
+    _csrf: None = Depends(_verify_ui_csrf),
     session: AsyncSession = Depends(get_writable_db_session),
     app_id: str = Form(default=""),
     name: str = Form(default=""),
@@ -1835,12 +1919,18 @@ async def upsert_application(
             "application_enabled": _as_form_bool(enabled),
         },
     )
-    return templates.TemplateResponse("settings.html", context, status_code=status.HTTP_400_BAD_REQUEST)
+    return render_template(
+        request,
+        "settings.html",
+        context,
+        status_code=status.HTTP_400_BAD_REQUEST,
+    )
 
 
 @router.post("/settings/routing/domain")
 async def upsert_domain_route(
     request: Request,
+    _csrf: None = Depends(_verify_ui_csrf),
     session: AsyncSession = Depends(get_writable_db_session),
     route_id: str = Form(default=""),
     domain: str = Form(default=""),
@@ -1874,12 +1964,18 @@ async def upsert_domain_route(
             "domain_enabled": _as_form_bool(enabled),
         },
     )
-    return templates.TemplateResponse("settings.html", context, status_code=status.HTTP_400_BAD_REQUEST)
+    return render_template(
+        request,
+        "settings.html",
+        context,
+        status_code=status.HTTP_400_BAD_REQUEST,
+    )
 
 
 @router.post("/settings/routing/domain/delete")
 async def delete_domain_route(
     request: Request,
+    _csrf: None = Depends(_verify_ui_csrf),
     session: AsyncSession = Depends(get_writable_db_session),
     route_id: str = Form(default=""),
 ) -> Any:
@@ -1891,7 +1987,8 @@ async def delete_domain_route(
             active_section="routing",
             routing_error="Domain route id is required.",
         )
-        return templates.TemplateResponse(
+        return render_template(
+            request,
             "settings.html",
             context,
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1908,12 +2005,18 @@ async def delete_domain_route(
         active_section="routing",
         routing_error="Domain route was not found.",
     )
-    return templates.TemplateResponse("settings.html", context, status_code=status.HTTP_404_NOT_FOUND)
+    return render_template(
+        request,
+        "settings.html",
+        context,
+        status_code=status.HTTP_404_NOT_FOUND,
+    )
 
 
 @router.post("/settings/providers")
 async def update_provider_settings(
     request: Request,
+    _csrf: None = Depends(_verify_ui_csrf),
     session: AsyncSession = Depends(get_writable_db_session),
     provider_openai_api_key: str = Form(default=""),
     provider_cloudflare_api_token: str = Form(default=""),

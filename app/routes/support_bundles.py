@@ -6,7 +6,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.dependencies import get_db_session
+from app.dependencies import get_db_session, get_incident_db_session
 from app.schemas.support_bundles import SupportBundleCreate, SupportBundleOut
 from app.services import support_bundles as support_bundle_service
 
@@ -25,7 +25,7 @@ async def list_support_bundles(
 async def request_support_bundle(
     payload: SupportBundleCreate,
     background_tasks: BackgroundTasks,
-    session: AsyncSession = Depends(get_db_session),
+    session: AsyncSession = Depends(get_incident_db_session),
 ) -> SupportBundleOut:
     if payload.id and await support_bundle_service.get_support_bundle(session, payload.id):
         raise HTTPException(status_code=409, detail="Support bundle id already exists")

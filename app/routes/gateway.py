@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.dependencies import get_db_session
-from app.schemas.gateway import GatewayRouteOut, GatewayStatusOut
+from app.schemas.gateway import GatewayRouteOut, GatewaySourceMapEntryOut, GatewayStatusOut
 from app.services import cluster_settings as cluster_settings_service
 from app.services import gateway as gateway_service
 
@@ -38,6 +38,13 @@ async def render_gateway_config(
         default_server_name=settings.runtime_gateway_server_name,
     )
     return PlainTextResponse(rendered.config, media_type="text/plain; charset=utf-8")
+
+
+@router.get("/nginx/source-map", response_model=list[GatewaySourceMapEntryOut])
+async def gateway_source_map(
+    session: AsyncSession = Depends(get_db_session),
+) -> list[GatewaySourceMapEntryOut]:
+    return await gateway_service.build_gateway_source_map(session)
 
 
 @router.get("/status", response_model=GatewayStatusOut)

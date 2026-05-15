@@ -327,7 +327,7 @@
     <section class="grid gap-6 lg:grid-cols-2">
       <article class="settings-card rounded-2xl p-6 lg:col-span-2">
         <h2 class="text-lg font-semibold">Applications</h2>
-        <p class="text-sm text-slate-500">Map external domains to internal application/service targets. `hello-world` is pre-seeded.</p>
+        <p class="text-sm text-slate-500">Map external domains to internal application and service targets.</p>
 
         {% if routing_success %}
           <div class="alert alert-success text-sm mt-3">
@@ -376,6 +376,7 @@
         </div>
 
         <form method="post" action="{{ ui_prefix }}/settings/routing/application" class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-5">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
           <label class="block">
             <span class="settings-label">Application ID</span>
             <input class="settings-input mono" type="text" name="app_id" placeholder="hello-world" value="{{ routing_form.app_id or '' }}" />
@@ -450,6 +451,7 @@
                   </td>
                   <td>
                     <form method="post" action="{{ ui_prefix }}/settings/routing/domain/delete" onsubmit="return window.confirm('Delete this domain route?');">
+                      <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
                       <input type="hidden" name="route_id" value="{{ binding.id }}" />
                       <button class="btn btn-xs btn-outline" type="submit">Delete</button>
                     </form>
@@ -465,6 +467,7 @@
         </div>
 
         <form method="post" action="{{ ui_prefix }}/settings/routing/domain" class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-5">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
           <label class="block">
             <span class="settings-label">Route ID</span>
             <input class="settings-input mono" type="text" name="route_id" placeholder="optional-id" value="{{ routing_form.route_id or '' }}" />
@@ -540,7 +543,7 @@
     <section class="grid gap-6 lg:grid-cols-2">
       <article class="settings-card rounded-2xl p-6 lg:col-span-2">
         <h2 class="text-lg font-semibold">Provider Credentials</h2>
-        <p class="text-sm text-slate-500">Configure external API providers for DNS automation, VPS provisioning, and Codex/OpenAI-assisted operations.</p>
+        <p class="text-sm text-slate-500">Configure external providers for DNS automation and VPS provisioning.</p>
 
         {% if provider_success %}
           <div class="alert alert-success text-sm mt-3">
@@ -581,7 +584,41 @@
           </div>
         </div>
 
+        <div class="overflow-x-auto mt-5">
+          <table class="table w-full align-middle">
+            <thead>
+              <tr>
+                <th>Provider</th>
+                <th>Status</th>
+                <th>Capabilities</th>
+                <th>Missing</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for provider in provider_capabilities %}
+                <tr>
+                  <td class="font-semibold">{{ provider.provider }}</td>
+                  <td>
+                    {% if provider.configured %}
+                      <span class="badge badge-success badge-outline">Ready</span>
+                    {% else %}
+                      <span class="badge badge-warning badge-outline">Needs Setup</span>
+                    {% endif %}
+                  </td>
+                  <td class="mono text-xs">{{ provider.capabilities | join(", ") }}</td>
+                  <td class="mono text-xs">{{ provider.missing_settings | join(", ") if provider.missing_settings else "-" }}</td>
+                </tr>
+              {% else %}
+                <tr>
+                  <td colspan="4" class="text-center text-slate-400">No providers registered.</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+
         <form method="post" action="{{ ui_prefix }}/settings/providers" class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-5" id="provider-settings-form">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
           <label class="block md:col-span-2">
             <span class="settings-label">Domain Ingress Target</span>
             <input class="settings-input mono" type="text" name="domain_ingress_target" value="{{ domain_ingress_target }}" placeholder="203.0.113.10 or ingress.example.net" />
@@ -659,6 +696,10 @@
           <span class="text-xs uppercase tracking-widest text-slate-500">Current Username</span>
           <p class="mono text-sm mt-1">{{ username }}</p>
         </div>
+        <div class="mt-3">
+          <span class="text-xs uppercase tracking-widest text-slate-500">Password Updated</span>
+          <p class="mono text-sm mt-1">{{ password_updated_at }}</p>
+        </div>
       </article>
 
       <article class="settings-card rounded-2xl p-6">
@@ -677,6 +718,7 @@
         {% endif %}
 
         <form method="post" action="{{ ui_prefix }}/settings/password" class="space-y-3 mt-4">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
           <label class="block">
             <span class="settings-label">Current Password</span>
             <input class="settings-input" type="password" name="current_password" required autocomplete="current-password" />
@@ -698,6 +740,28 @@
       </article>
 
       <article class="settings-card rounded-2xl p-6 lg:col-span-2">
+        <h2 class="text-lg font-semibold">Security Center</h2>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-3 mt-4 text-sm">
+          <div class="rounded-xl border border-slate-700/40 p-3">
+            <p class="text-slate-500">Session Family</p>
+            <p class="mono mt-1 break-all">{{ security_summary.session_epoch }}</p>
+          </div>
+          <div class="rounded-xl border border-slate-700/40 p-3">
+            <p class="text-slate-500">Node Credential TTL</p>
+            <p class="mono mt-1">{{ node_cert_validity_days }} days</p>
+          </div>
+          <div class="rounded-xl border border-slate-700/40 p-3">
+            <p class="text-slate-500">Recovery Export</p>
+            <a class="btn btn-xs btn-outline mt-1" href="/system/runbook">Download Runbook</a>
+          </div>
+        </div>
+        <form method="post" action="{{ ui_prefix }}/settings/security/revoke-sessions" class="mt-4" onsubmit="return window.confirm('Revoke all sessions? You will sign in again.');">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+          <button class="btn btn-error" type="submit">Revoke Sessions</button>
+        </form>
+      </article>
+
+      <article class="settings-card rounded-2xl p-6 lg:col-span-2">
         <h2 class="text-lg font-semibold">Repository</h2>
         <p class="text-sm text-slate-500">Source URL used by install and update scripts.</p>
 
@@ -714,6 +778,7 @@
         {% endif %}
 
         <form method="post" action="{{ ui_prefix }}/settings/repo" class="space-y-3 mt-4">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
           <label class="block">
             <span class="settings-label">GitHub Repository URL</span>
             <input

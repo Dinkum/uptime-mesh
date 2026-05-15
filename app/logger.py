@@ -71,7 +71,7 @@ class _UptimeFormatter(logging.Formatter):
 @dataclass(frozen=True)
 class Operation:
     logger: "BoundLogger"
-    name: str
+    operation_name: str
     message: str
     fields: Dict[str, Any]
     start_time: float = 0.0
@@ -81,7 +81,7 @@ class Operation:
         self.logger.info(
             "operation.start",
             self.message,
-            operation=self.name,
+            operation=self.operation_name,
             **self.fields,
         )
         return self
@@ -97,22 +97,22 @@ class Operation:
             self.logger.info(
                 "operation.complete",
                 "Completed",
-                operation=self.name,
+                operation=self.operation_name,
                 duration_ms=round(duration_ms, 1),
             )
         else:
             self.logger.exception(
                 "operation.error",
                 "Failed",
-                operation=self.name,
+                operation=self.operation_name,
                 duration_ms=round(duration_ms, 1),
                 error_type=exc_type.__name__,
             )
 
-    def _step(self, severity: int, name: str, message: str, **fields: Any) -> None:
+    def _step(self, severity: int, step_name: str, message: str, **fields: Any) -> None:
         payload = {
-            "operation": self.name,
-            "step": name,
+            "operation": self.operation_name,
+            "step": step_name,
             **fields,
         }
         if severity == logging.WARNING:
@@ -126,17 +126,17 @@ class Operation:
             return
         self.logger.info("operation.step", message, **payload)
 
-    def step(self, name: str, message: str, **fields: Any) -> None:
-        self._step(logging.INFO, name, message, **fields)
+    def step(self, step_name: str, message: str, **fields: Any) -> None:
+        self._step(logging.INFO, step_name, message, **fields)
 
-    def step_debug(self, name: str, message: str, **fields: Any) -> None:
-        self._step(logging.DEBUG, name, message, **fields)
+    def step_debug(self, step_name: str, message: str, **fields: Any) -> None:
+        self._step(logging.DEBUG, step_name, message, **fields)
 
-    def step_warning(self, name: str, message: str, **fields: Any) -> None:
-        self._step(logging.WARNING, name, message, **fields)
+    def step_warning(self, step_name: str, message: str, **fields: Any) -> None:
+        self._step(logging.WARNING, step_name, message, **fields)
 
-    def step_error(self, name: str, message: str, **fields: Any) -> None:
-        self._step(logging.ERROR, name, message, **fields)
+    def step_error(self, step_name: str, message: str, **fields: Any) -> None:
+        self._step(logging.ERROR, step_name, message, **fields)
 
     def child(self, parent_step: str, child_name: str, message: str, **fields: Any) -> None:
         self._step(
@@ -169,8 +169,13 @@ class BoundLogger:
         finally:
             _LOG_CONTEXT.reset(token)
 
-    def operation(self, name: str, message: str, **fields: Any) -> Operation:
-        return Operation(self, name=name, message=message, fields=fields)
+    def operation(self, operation_name: str, message: str, **fields: Any) -> Operation:
+        return Operation(
+            self,
+            operation_name=operation_name,
+            message=message,
+            fields=fields,
+        )
 
     def debug(self, event: str, message: str, **fields: Any) -> None:
         self._log(logging.DEBUG, event, message, **fields)

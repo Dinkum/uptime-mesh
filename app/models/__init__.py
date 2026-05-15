@@ -4,6 +4,7 @@ from app.models.endpoint import Endpoint
 from app.models.event import Event
 from app.models.join_token import JoinToken
 from app.models.node import Node
+from app.models.provider import ProviderAccount, ProviderAction, ProviderResource
 from app.models.replica import Replica
 from app.models.router_assignment import RouterAssignment
 from app.models.service import Service
@@ -17,6 +18,9 @@ __all__ = [
     "Event",
     "JoinToken",
     "Node",
+    "ProviderAccount",
+    "ProviderAction",
+    "ProviderResource",
     "Replica",
     "RouterAssignment",
     "Service",

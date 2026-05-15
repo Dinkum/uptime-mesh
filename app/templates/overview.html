@@ -1,6 +1,43 @@
 {% extends "layout.html" %}
 
 {% block content %}
+  <section class="mesh-card rounded-2xl p-6 mb-6">
+    <div class="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
+      <div>
+        <p class="text-sm text-slate-500">Readiness</p>
+        <h2 class="text-2xl font-semibold mt-1">{{ preflight.headline }}</h2>
+        {% if preflight.next_fix %}
+          <p class="text-sm text-slate-400 mt-2">Next fix: {{ preflight.next_fix }}</p>
+        {% endif %}
+      </div>
+      <div class="grid grid-cols-3 gap-3 min-w-72">
+        <div class="rounded-xl border border-emerald-400/25 p-3">
+          <p class="text-xs text-slate-500">Passes</p>
+          <p class="text-2xl font-semibold">{{ preflight.passes }}</p>
+        </div>
+        <div class="rounded-xl border border-amber-400/25 p-3">
+          <p class="text-xs text-slate-500">Warnings</p>
+          <p class="text-2xl font-semibold">{{ preflight.warnings }}</p>
+        </div>
+        <div class="rounded-xl border border-rose-400/25 p-3">
+          <p class="text-xs text-slate-500">Blockers</p>
+          <p class="text-2xl font-semibold">{{ preflight.blockers }}</p>
+        </div>
+      </div>
+    </div>
+    <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3 mt-5">
+      {% for check in preflight.checks[:6] %}
+        <div class="rounded-xl border border-slate-700/40 p-3">
+          <div class="flex items-center justify-between gap-3">
+            <span class="font-medium">{{ check.name }}</span>
+            <span class="badge badge-outline">{{ check.state }}</span>
+          </div>
+          <p class="text-xs text-slate-400 mt-2">{{ check.detail }}</p>
+        </div>
+      {% endfor %}
+    </div>
+  </section>
+
   <section class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-5">
     <a class="mesh-card rounded-2xl p-6 block hover:border-cyan-300/70 transition" href="{{ ui_prefix }}/nodes">
       <p class="text-sm text-slate-500">Nodes Online</p>

@@ -228,6 +228,26 @@ run_cli_with_write_retry() {
   return 1
 }
 
+run_cli_with_join_token() {
+  local token="$1"
+  local previous_token="${UPTIMEMESH_JOIN_TOKEN-}"
+  local had_previous=0
+  local rc=0
+  shift
+  if [[ -n "${UPTIMEMESH_JOIN_TOKEN+x}" ]]; then
+    had_previous=1
+  fi
+  export UPTIMEMESH_JOIN_TOKEN="${token}"
+  run_cli_with_write_retry "$@"
+  rc=$?
+  if [[ "${had_previous}" -eq 1 ]]; then
+    export UPTIMEMESH_JOIN_TOKEN="${previous_token}"
+  else
+    unset UPTIMEMESH_JOIN_TOKEN
+  fi
+  return "${rc}"
+}
+
 require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
     echo "missing required command: $1" >&2
@@ -637,7 +657,7 @@ Options:
   --api-url <url>            Cluster API URL (default: http://127.0.0.1:8010)
   --api-endpoint <url>       This node endpoint advertised to cluster
   --etcd-peer-url <url>      etcd peer URL for node membership (default: derived from node endpoint host:2380)
-  --token <join-token>       Join token for enrollment (required for join mode)
+  --token <join-token>       Join token for automation; prompt is preferred for interactive joins
   --port <port>              Local API port (default: 8010)
   --force                    Reinstall over an existing node install
   --detect-public-ip         Use external IP discovery (ipify) for advertised endpoint defaults
@@ -654,8 +674,8 @@ Examples:
   # Interactive wizard
   sudo ./install.sh --wizard
 
-  # Join an existing mesh (token required)
-  sudo ./install.sh --join 51.15.211.158 --token <join-token>
+  # Join an existing mesh (prompts for token)
+  sudo ./install.sh --join 51.15.211.158
 USAGE
 }
 
@@ -666,7 +686,7 @@ NODE_ROLE="auto"
 API_URL="http://127.0.0.1:8010"
 API_ENDPOINT=""
 ETCD_PEER_URL=""
-JOIN_TOKEN=""
+JOIN_TOKEN="${UPTIMEMESH_JOIN_TOKEN:-}"
 JOIN_TARGET=""
 JOIN_PORT="8010"
 BOOTSTRAP=0
@@ -714,7 +734,11 @@ prompt_default() {
   local prompt="$1"
   local default_value="$2"
   local reply=""
-  read -r -p "${prompt} [${default_value}]: " reply
+  if [[ -r /dev/tty ]]; then
+    read -r -p "${prompt} [${default_value}]: " reply </dev/tty
+  else
+    read -r -p "${prompt} [${default_value}]: " reply
+  fi
   if [[ -n "$reply" ]]; then
     printf '%s' "$reply"
   else
@@ -726,7 +750,11 @@ prompt_required() {
   local prompt="$1"
   local reply=""
   while true; do
-    read -r -p "${prompt}: " reply
+    if [[ -r /dev/tty ]]; then
+      read -r -p "${prompt}: " reply </dev/tty
+    else
+      read -r -p "${prompt}: " reply
+    fi
     if [[ -n "$reply" ]]; then
       printf '%s' "$reply"
       return 0
@@ -741,7 +769,11 @@ prompt_yes_no() {
   local reply=""
   local normalized=""
   while true; do
-    read -r -p "${prompt} [${default_value}]: " reply
+    if [[ -r /dev/tty ]]; then
+      read -r -p "${prompt} [${default_value}]: " reply </dev/tty
+    else
+      read -r -p "${prompt} [${default_value}]: " reply
+    fi
     if [[ -z "$reply" ]]; then
       reply="$default_value"
     fi
@@ -1286,8 +1318,12 @@ if [[ -z "$JOIN_TARGET" && -n "$JOIN_TOKEN" ]]; then
   exit 1
 fi
 if [[ -n "$JOIN_TARGET" && -z "$JOIN_TOKEN" ]]; then
-  echo "--join requires --token" >&2
-  exit 1
+  if [[ -r /dev/tty ]]; then
+    JOIN_TOKEN="$(prompt_required "Join token")"
+  else
+    echo "--join requires --token when no interactive terminal is available" >&2
+    exit 1
+  fi
 fi
 
 if [[ -f "${APP_DIR}/VERSION" && -f "${APP_DIR}/.env" && "$FORCE_INSTALL" -ne 1 ]]; then
@@ -1770,11 +1806,10 @@ if [[ "$BOOTSTRAP" -eq 1 ]]; then
   if [[ "$bootstrap_action" == "generated" ]]; then
     INITIAL_ADMIN_USERNAME="$(printf '%s' "$bootstrap_prep_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("username",""))')"
     INITIAL_ADMIN_PASSWORD="$(printf '%s' "$bootstrap_prep_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("password",""))')"
-    bootstrap_json="$(run_cli_with_write_retry uptime-mesh --api-url "${API_URL}" bootstrap --username "${INITIAL_ADMIN_USERNAME}" --password "${INITIAL_ADMIN_PASSWORD}")" || fail "failed to bootstrap first node"
+    bootstrap_json="$(UPTIMEMESH_PASSWORD="${INITIAL_ADMIN_PASSWORD}" run_cli_with_write_retry uptime-mesh --api-url "${API_URL}" bootstrap --username "${INITIAL_ADMIN_USERNAME}")" || fail "failed to bootstrap first node"
     worker_token="$(printf '%s' "$bootstrap_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["worker_token"]["token"])')"
     join_cmd=(
       uptime-mesh --api-url "${API_URL}" join
-      --token "${worker_token}"
       --node-id "${NODE_ID}"
       --name "${NODE_NAME}"
       --api-endpoint "${API_ENDPOINT}"
@@ -1786,7 +1821,7 @@ if [[ "$BOOTSTRAP" -eq 1 ]]; then
     if [[ -n "$ETCD_PEER_URL" ]]; then
       join_cmd+=(--etcd-peer-url "${ETCD_PEER_URL}")
     fi
-    run_cli_with_write_retry "${join_cmd[@]}" >/dev/null || fail "failed to enroll local node after bootstrap"
+    run_cli_with_join_token "${worker_token}" "${join_cmd[@]}" >/dev/null || fail "failed to enroll local node after bootstrap"
     INITIAL_ADMIN_GENERATED=1
     echo "Bootstrap complete."
   else
@@ -1795,7 +1830,6 @@ if [[ "$BOOTSTRAP" -eq 1 ]]; then
 elif [[ -n "$JOIN_TOKEN" ]]; then
   join_cmd=(
     uptime-mesh --api-url "${API_URL}" join
-    --token "${JOIN_TOKEN}"
     --node-id "${NODE_ID}"
     --name "${NODE_NAME}"
     --api-endpoint "${API_ENDPOINT}"
@@ -1807,7 +1841,7 @@ elif [[ -n "$JOIN_TOKEN" ]]; then
   if [[ -n "$ETCD_PEER_URL" ]]; then
     join_cmd+=(--etcd-peer-url "${ETCD_PEER_URL}")
   fi
-  run_cli_with_write_retry "${join_cmd[@]}" >/dev/null || fail "failed to join node with provided token"
+  run_cli_with_join_token "${JOIN_TOKEN}" "${join_cmd[@]}" >/dev/null || fail "failed to join node with provided token"
   echo "Join complete."
 else
   echo "Install complete (service running)."
@@ -1825,9 +1859,8 @@ fi
 
 echo "Status:"
 if [[ "$INITIAL_ADMIN_GENERATED" -eq 1 ]]; then
-  uptime-mesh --api-url "${API_URL}" nodes-status \
-    --username "${INITIAL_ADMIN_USERNAME}" \
-    --password "${INITIAL_ADMIN_PASSWORD}" || true
+  UPTIMEMESH_PASSWORD="${INITIAL_ADMIN_PASSWORD}" uptime-mesh --api-url "${API_URL}" nodes-status \
+    --username "${INITIAL_ADMIN_USERNAME}" || true
 else
   echo "nodes-status requires admin credentials; run it manually once credentials are available."
 fi

@@ -280,7 +280,7 @@
       <div class="mt-4 space-y-2 text-sm">
         {% for row in role_holder_rows %}
           <div class="flex items-center justify-between border border-slate-700/40 rounded-xl px-3 py-2">
-            <a class="mono hover:underline" href="{{ ui_prefix }}/roles/{{ row.role_name }}">{{ row.role_name }}</a>
+            <a class="link-soft mono" href="{{ ui_prefix }}/roles/{{ row.role_name }}">{{ row.role_name }}</a>
             <span class="badge {% if row.is_holder %}badge-success{% else %}badge-outline{% endif %}">{{ "holder" if row.is_holder else "not-holder" }}</span>
           </div>
         {% else %}

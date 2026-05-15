@@ -691,6 +691,7 @@ async def _claim_join_token_for_use(
             JoinToken.expires_at > claimed_at,
         )
         .values(used_at=claimed_at)
+        .execution_options(synchronize_session=False)
     )
     if int(getattr(result, "rowcount", 0) or 0) != 1:
         return False

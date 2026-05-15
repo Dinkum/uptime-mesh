@@ -17,6 +17,7 @@ from app.schemas.replicas import (
     ReplicaUpdate,
 )
 from app.services import nodes as node_service
+from app.services import docker as docker_service
 from app.services import lxd as lxd_service
 from app.services import replicas as replica_service
 from app.services import services as service_service
@@ -31,6 +32,13 @@ def _raise_replica_lxd_http_error(exc: lxd_service.LXDOperationError) -> NoRetur
         logger=_logger,
         event="replica.lxd_error",
         message="Replica action failed due to LXD operation error",
+    )
+
+
+def _raise_replica_docker_http_error(exc: docker_service.DockerOperationError) -> NoReturn:
+    raise HTTPException(
+        status_code=502,
+        detail=f"Docker operation failed ({exc.action}): {exc.detail}",
     )
 
 
@@ -68,6 +76,8 @@ async def create_replica(
         replica = await replica_service.create_replica(session, payload)
     except lxd_service.LXDOperationError as exc:
         _raise_replica_lxd_http_error(exc)
+    except docker_service.DockerOperationError as exc:
+        _raise_replica_docker_http_error(exc)
     return ReplicaOut.model_validate(replica)
 
 
@@ -84,6 +94,8 @@ async def update_replica(
         updated = await replica_service.update_replica(session, replica, payload)
     except lxd_service.LXDOperationError as exc:
         _raise_replica_lxd_http_error(exc)
+    except docker_service.DockerOperationError as exc:
+        _raise_replica_docker_http_error(exc)
     return ReplicaOut.model_validate(updated)
 
 
@@ -102,6 +114,8 @@ async def move_replica(
         updated = await replica_service.move_replica(session, replica, payload.target_node_id)
     except lxd_service.LXDOperationError as exc:
         _raise_replica_lxd_http_error(exc)
+    except docker_service.DockerOperationError as exc:
+        _raise_replica_docker_http_error(exc)
     return ReplicaOut.model_validate(updated)
 
 
@@ -117,6 +131,8 @@ async def restart_replica(
         updated = await replica_service.restart_replica(session, replica)
     except lxd_service.LXDOperationError as exc:
         _raise_replica_lxd_http_error(exc)
+    except docker_service.DockerOperationError as exc:
+        _raise_replica_docker_http_error(exc)
     return ReplicaOut.model_validate(updated)
 
 
@@ -164,3 +180,5 @@ async def delete_replica(
         await replica_service.delete_replica(session, replica)
     except lxd_service.LXDOperationError as exc:
         _raise_replica_lxd_http_error(exc)
+    except docker_service.DockerOperationError as exc:
+        _raise_replica_docker_http_error(exc)

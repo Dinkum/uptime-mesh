@@ -253,3 +253,10 @@ async def get_writable_db_session(
     session: AsyncSession = Depends(get_db_session),
 ) -> AsyncSession:
     return await ensure_cluster_writable(session)
+
+
+async def get_incident_db_session(
+    session: AsyncSession = Depends(get_db_session),
+) -> AsyncSession:
+    # Explicit allowlist for diagnostic writes that must work while the cluster write guard is closed.
+    return session

@@ -28,6 +28,7 @@ from app.routes import (
     gateway,
     monitoring,
     nodes,
+    providers,
     replicas,
     roles,
     router_assignments,
@@ -41,11 +42,34 @@ from app.routes import (
 )
 from app.runtime import RuntimeController
 from app.security import SESSION_COOKIE_NAME, decode_session_token
+from app.services import auth as auth_service
 from app.services import cluster_settings as cluster_settings_service
 
 settings = get_settings()
 configure_logging(settings.log_level, settings.log_file)
 logger = get_logger("api")
+
+
+async def _decode_session_cookie(token: str | None) -> str | None:
+    if not token:
+        return None
+    sessionmaker = get_sessionmaker(settings.database_url)
+    try:
+        async with sessionmaker() as session:
+            session_epoch = await auth_service.get_session_epoch(session)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "auth.session_epoch.unavailable",
+            "Could not load auth session epoch",
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+        return None
+    return decode_session_token(
+        token,
+        settings.auth_secret_key,
+        session_epoch=session_epoch,
+    )
 
 
 @asynccontextmanager
@@ -134,7 +158,7 @@ async def auth_guard(
         "/favicon.ico",
     }
     token = request.cookies.get(SESSION_COOKIE_NAME)
-    username = decode_session_token(token or "", settings.auth_secret_key)
+    username = await _decode_session_cookie(token)
     if username:
         request.state.auth_user = username
 
@@ -218,6 +242,7 @@ app.include_router(auth.router)
 app.include_router(cluster.router)
 app.include_router(etcd.router)
 app.include_router(nodes.router)
+app.include_router(providers.router)
 app.include_router(services.router)
 app.include_router(replicas.router)
 app.include_router(endpoints.router)

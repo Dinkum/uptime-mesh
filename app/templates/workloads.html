@@ -20,6 +20,8 @@
     <p class="mesh-subtabs-label">Workloads Sections</p>
     <nav class="mesh-subtabs">
       <a class="mesh-subtab{% if workloads_subtab == 'services' %} active{% endif %}" href="{{ ui_prefix }}/workloads?tab=services">Services</a>
+      <a class="mesh-subtab{% if workloads_subtab == 'survivor' %} active{% endif %}" href="{{ ui_prefix }}/workloads?tab=survivor">Survivor Tests</a>
+      <a class="mesh-subtab{% if workloads_subtab == 'state' %} active{% endif %}" href="{{ ui_prefix }}/workloads?tab=state">Service State</a>
       <a class="mesh-subtab{% if workloads_subtab == 'rollouts' %} active{% endif %}" href="{{ ui_prefix }}/workloads?tab=rollouts">Rollout Watch</a>
       <a class="mesh-subtab{% if workloads_subtab == 'replicas' %} active{% endif %}" href="{{ ui_prefix }}/workloads?tab=replicas">Replicas</a>
       <a class="mesh-subtab{% if workloads_subtab == 'scheduler' %} active{% endif %}" href="{{ ui_prefix }}/workloads?tab=scheduler">Scheduler Plan</a>
@@ -83,6 +85,144 @@
             {% else %}
               <tr>
                 <td colspan="7" class="text-center text-slate-400">No services defined yet.</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  {% elif workloads_subtab == "survivor" %}
+    <section class="mesh-card rounded-2xl p-6">
+      <h2 class="text-lg font-semibold">Survivor Tests</h2>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-4">
+        <div class="rounded-xl border border-slate-700/40 p-3">
+          <p class="text-slate-500 text-xs">Protected</p>
+          <p class="mono mt-1 text-lg">{{ survivor_report.protected if survivor_report else 0 }}</p>
+        </div>
+        <div class="rounded-xl border border-slate-700/40 p-3">
+          <p class="text-slate-500 text-xs">Degraded</p>
+          <p class="mono mt-1 text-lg">{{ survivor_report.degraded if survivor_report else 0 }}</p>
+        </div>
+        <div class="rounded-xl border border-slate-700/40 p-3">
+          <p class="text-slate-500 text-xs">At Risk</p>
+          <p class="mono mt-1 text-lg">{{ survivor_report.at_risk if survivor_report else 0 }}</p>
+        </div>
+        <div class="rounded-xl border border-slate-700/40 p-3">
+          <p class="text-slate-500 text-xs">Incidents</p>
+          <p class="mono mt-1 text-lg">{{ survivor_report.incidents if survivor_report else 0 }}</p>
+        </div>
+      </div>
+      <div class="overflow-x-auto mt-4">
+        <table class="table w-full align-middle">
+          <thead>
+            <tr>
+              <th>Service</th>
+              <th>State</th>
+              <th>Healthy</th>
+              <th>Capacity</th>
+              <th>Worst Loss</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% if survivor_report %}
+            {% for row in survivor_report.services %}
+              {% set failed = row.failures | selectattr("serving", "equalto", false) | list %}
+              {% set weak = row.failures | rejectattr("capacity_ok") | list %}
+              <tr>
+                <td>
+                  <p class="font-semibold">{{ row.service_name }}</p>
+                  <p class="mono text-[11px] text-slate-500">{{ row.service_id }}</p>
+                </td>
+                <td>
+                  {% if row.state == "protected" %}
+                    <span class="badge badge-success badge-outline">Protected</span>
+                  {% elif row.state == "degraded_but_serving" %}
+                    <span class="badge badge-warning badge-outline">Degraded</span>
+                  {% elif row.state == "at_risk" %}
+                    <span class="badge badge-warning badge-outline">At Risk</span>
+                  {% else %}
+                    <span class="badge badge-error badge-outline">Incident</span>
+                  {% endif %}
+                </td>
+                <td class="mono text-xs">{{ row.healthy_replicas }} / {{ row.total_replicas }} replicas · {{ row.healthy_nodes }} nodes</td>
+                <td class="mono text-xs">{{ row.serving_capacity }} / {{ row.current_demand }}</td>
+                <td class="mono text-xs">
+                  {% if failed %}
+                    {{ failed[0].lost_node_id }}
+                  {% elif weak %}
+                    {{ weak[0].lost_node_id }}
+                  {% else %}
+                    -
+                  {% endif %}
+                </td>
+                <td class="text-xs text-slate-300">
+                  {% if row.recommended_actions %}
+                    {{ row.recommended_actions[0] }}
+                  {% elif row.warnings %}
+                    {{ row.warnings[0] }}
+                  {% else %}
+                    Ready
+                  {% endif %}
+                </td>
+              </tr>
+            {% else %}
+              <tr>
+                <td colspan="6" class="text-center text-slate-400">No services defined yet.</td>
+              </tr>
+            {% endfor %}
+            {% else %}
+              <tr>
+                <td colspan="6" class="text-center text-slate-400">No services defined yet.</td>
+              </tr>
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  {% elif workloads_subtab == "state" %}
+    <section class="mesh-card rounded-2xl p-6">
+      <h2 class="text-lg font-semibold">Service State</h2>
+      <div class="overflow-x-auto mt-4">
+        <table class="table w-full align-middle">
+          <thead>
+            <tr>
+              <th>Service</th>
+              <th>Desired</th>
+              <th>Observed</th>
+              <th>Survivor</th>
+              <th>Next Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in service_state_rows %}
+              <tr>
+                <td>
+                  <p class="font-semibold">{{ row.service_name }}</p>
+                  <p class="mono text-[11px] text-slate-500">{{ row.service_id }}</p>
+                </td>
+                <td class="mono text-xs">{{ row.desired.runtime }} · replicas {{ row.desired.desired_replicas }} · {{ row.desired.protection }}</td>
+                <td class="mono text-xs">{{ row.observed.healthy_replicas }}/{{ row.observed.total_replicas }} replicas · {{ row.observed.healthy_endpoints }} endpoints</td>
+                <td>
+                  {% if row.survivor.state == "protected" %}
+                    <span class="badge badge-success badge-outline">Protected</span>
+                  {% elif row.survivor.state == "user_impacting_incident" %}
+                    <span class="badge badge-error badge-outline">Incident</span>
+                  {% else %}
+                    <span class="badge badge-warning badge-outline">{{ row.survivor.state.replace("_", " ").title() }}</span>
+                  {% endif %}
+                </td>
+                <td class="text-xs text-slate-300">
+                  {% if row.actions %}
+                    {{ row.actions[0].detail }}
+                  {% else %}
+                    Ready
+                  {% endif %}
+                </td>
+              </tr>
+            {% else %}
+              <tr>
+                <td colspan="5" class="text-center text-slate-400">No services defined yet.</td>
               </tr>
             {% endfor %}
           </tbody>

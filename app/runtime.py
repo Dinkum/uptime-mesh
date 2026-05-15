@@ -21,6 +21,7 @@ from app.services import discovery as discovery_service
 from app.services import events as events_service
 from app.services import gateway as gateway_service
 from app.services import monitoring as monitoring_service
+from app.services import replicas as replica_service
 from app.services import scheduler as scheduler_service
 from app.services import snapshots as snapshot_service
 from app.services import support_bundles as support_bundle_service
@@ -143,6 +144,8 @@ class RuntimeController:
         )
 
     async def start(self) -> None:
+        await self._startup_reconcile()
+
         if not self.enabled:
             _logger.info("runtime.disabled", "Runtime controller is disabled")
             return
@@ -235,6 +238,24 @@ class RuntimeController:
                 "Python node agent loop is disabled; Go agent is the canonical runtime",
                 runtime_enable=self._settings.runtime_enable,
                 go_agent_binary="agent/cmd/uptimemesh-agent",
+            )
+
+    async def _startup_reconcile(self) -> None:
+        try:
+            async with self._sessionmaker() as session:
+                drift_count = await replica_service.reconcile_runtime_intents(session)
+            if drift_count:
+                _logger.warning(
+                    "runtime.reconcile.drift",
+                    "Flagged runtime intents that need reconciliation",
+                    replicas=drift_count,
+                )
+        except Exception as exc:  # noqa: BLE001
+            _logger.exception(
+                "runtime.reconcile.error",
+                "Startup runtime reconciliation failed",
+                error_type=type(exc).__name__,
+                error=str(exc),
             )
 
     async def stop(self) -> None:

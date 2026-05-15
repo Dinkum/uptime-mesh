@@ -12,10 +12,11 @@ from app.logger import get_logger
 from app.models.replica import Replica
 from app.models.service import Service
 from app.schemas.replicas import ReplicaCreate, ReplicaUpdate
-from app.schemas.services import ServiceCreate, ServiceUpdate
+from app.schemas.services import ServiceCreate, ServiceUpdate, service_spec_to_dict
 from app.services import lxd as lxd_service
 from app.services import replicas as replica_service
 from app.services.events import record_event
+from app.services.runtime_drivers import normalize_service_spec
 
 _logger = get_logger("services.services")
 _settings = get_settings()
@@ -261,11 +262,15 @@ async def create_service(session: AsyncSession, payload: ServiceCreate) -> Servi
         service_id=payload.id,
         service_name=payload.name,
     ) as op:
+        try:
+            service_spec = normalize_service_spec(service_spec_to_dict(payload.spec))
+        except ValueError as exc:
+            raise lxd_service.LXDOperationError("service.spec", str(exc)) from exc
         service = Service(
             id=payload.id,
             name=payload.name,
             description=payload.description,
-            spec=payload.spec,
+            spec=service_spec,
         )
         session.add(service)
         op.step("db.insert", "Prepared service row")
@@ -301,7 +306,10 @@ async def update_service(
             changed = True
             op.step("description.update", "Updated service description")
         if payload.spec is not None:
-            service.spec = payload.spec
+            try:
+                service.spec = normalize_service_spec(service_spec_to_dict(payload.spec))
+            except ValueError as exc:
+                raise lxd_service.LXDOperationError("service.spec", str(exc)) from exc
             service.generation += 1
             changed = True
             op.step("spec.update", "Updated service spec", generation=service.generation)

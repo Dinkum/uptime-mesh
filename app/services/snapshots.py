@@ -4,7 +4,6 @@ import hashlib
 import asyncio
 import json
 import os
-import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List
@@ -20,10 +19,10 @@ from app.models.snapshot_run import SnapshotRun
 from app.schemas.snapshots import SnapshotRunCreate
 from app.services import etcd as etcd_service
 from app.services.events import record_event
+from app.validation import artifact_id, path_under
 
 _logger = get_logger("services.snapshots")
 _settings = get_settings()
-_ARTIFACT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 
 class SnapshotRestoreRejected(RuntimeError):
@@ -38,25 +37,15 @@ def _utcnow_iso() -> str:
 
 
 def _snapshot_path(snapshot_id: str) -> Path:
-    clean_id = snapshot_id.strip()
-    if not _ARTIFACT_ID_RE.fullmatch(clean_id):
-        raise ValueError("snapshot id must be a safe artifact slug")
+    clean_id = artifact_id(snapshot_id, field_name="snapshot id")
     base = Path(_settings.etcd_snapshot_dir).resolve()
-    path = (base / f"{clean_id}.db").resolve()
-    if not path.is_relative_to(base):
-        raise ValueError("snapshot path escapes snapshot directory")
-    return path
+    return path_under(base, base / f"{clean_id}.db", field_name="snapshot path")
 
 
 def _snapshot_restore_dir(snapshot_id: str, timestamp: str) -> Path:
-    clean_id = snapshot_id.strip()
-    if not _ARTIFACT_ID_RE.fullmatch(clean_id):
-        raise ValueError("snapshot id must be a safe artifact slug")
+    clean_id = artifact_id(snapshot_id, field_name="snapshot id")
     base = (Path(_settings.etcd_snapshot_dir) / "restore").resolve()
-    path = (base / clean_id / timestamp).resolve()
-    if not path.is_relative_to(base):
-        raise ValueError("snapshot restore path escapes snapshot directory")
-    return path
+    return path_under(base, base / clean_id / timestamp, field_name="snapshot restore path")
 
 
 def _snapshot_temp_path(final_path: Path) -> Path:
@@ -67,10 +56,7 @@ def snapshot_artifact_path(snapshot: SnapshotRun) -> Path:
     if not snapshot.location:
         raise ValueError("snapshot has no artifact location")
     base = Path(_settings.etcd_snapshot_dir).resolve()
-    path = Path(snapshot.location).resolve()
-    if not path.is_relative_to(base):
-        raise ValueError("snapshot artifact path escapes snapshot directory")
-    return path
+    return path_under(base, Path(snapshot.location), field_name="snapshot artifact path")
 
 
 def validate_snapshot_artifact(snapshot: SnapshotRun) -> Path:

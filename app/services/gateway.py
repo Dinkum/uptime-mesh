@@ -13,10 +13,17 @@ from app.logger import get_logger
 from app.models.endpoint import Endpoint
 from app.models.replica import Replica
 from app.models.service import Service
-from app.schemas.gateway import GatewayRouteEndpointOut, GatewayRouteOut
+from app.schemas.gateway import GatewayRouteEndpointOut, GatewayRouteOut, GatewaySourceMapEntryOut
 from app.services import applications as applications_service
 from app.services import cluster_settings
 from app.utils import sanitize_label
+from app.validation import (
+    dns_name,
+    nginx_listen,
+    nginx_path,
+    nginx_upstream_name,
+    upstream_endpoint,
+)
 
 _logger = get_logger("services.gateway")
 
@@ -34,26 +41,32 @@ def _sanitize_name(raw: str, fallback: str) -> str:
     value = re.sub(r"_+", "_", value).strip("_")
     if not value:
         value = sanitize_label(fallback, max_len=63).replace("-", "_")
-    return value or "item"
+    if value and value[0].isdigit():
+        value = f"u_{value}"
+    return nginx_upstream_name(value or "item")
 
 
 def _normalize_path(raw: str, fallback: str) -> str:
     value = raw.strip()
     if not value:
         value = fallback
-    if not value.startswith("/"):
-        value = "/" + value
-    return re.sub(r"/{2,}", "/", value)
+    return nginx_path(re.sub(r"/{2,}", "/", value))
 
 
 def _normalize_host(raw: str, fallback: str = "_") -> str:
     value = raw.strip().lower()
-    return value or fallback
+    return dns_name(value or fallback, allow_wildcard=True)
 
 
 def _normalize_listen(raw: str) -> str:
-    value = raw.strip()
-    return value or "0.0.0.0:80"
+    return nginx_listen(raw.strip() or "0.0.0.0:80")
+
+
+def _nginx_endpoint(address: str, endpoint_port: int) -> str:
+    clean_address, clean_port = upstream_endpoint(address, endpoint_port)
+    if ":" in clean_address and not clean_address.startswith("["):
+        return f"[{clean_address}]:{clean_port}"
+    return f"{clean_address}:{clean_port}"
 
 
 def _resolve_gateway_route(
@@ -119,12 +132,22 @@ async def list_gateway_routes(
             service_name = str(row.service_name)
             service_names[service_id] = service_name
             service_spec = row.service_spec if isinstance(row.service_spec, dict) else {}
-            service_endpoints.setdefault(service_id, set()).add((str(row.address), int(row.port)))
-            enabled, host, path = _resolve_gateway_route(
-                service_id=service_id,
-                service_name=service_name,
-                service_spec=service_spec,
-            )
+            try:
+                endpoint = upstream_endpoint(str(row.address), row.port)
+                enabled, host, path = _resolve_gateway_route(
+                    service_id=service_id,
+                    service_name=service_name,
+                    service_spec=service_spec,
+                )
+            except ValueError as exc:
+                op.step_warning(
+                    "route.invalid",
+                    "Skipped gateway row with invalid generated config input",
+                    service_id=service_id,
+                    error=str(exc),
+                )
+                continue
+            service_endpoints.setdefault(service_id, set()).add(endpoint)
             if not enabled:
                 continue
 
@@ -147,7 +170,7 @@ async def list_gateway_routes(
                 }
                 grouped[service_id] = payload
 
-            payload["endpoints"].add((str(row.address), int(row.port)))
+            payload["endpoints"].add(endpoint)
 
         domain_route_count = 0
         domain_route_skipped = 0
@@ -162,8 +185,18 @@ async def list_gateway_routes(
             if not endpoints:
                 domain_route_skipped += 1
                 continue
-            host = _normalize_host(str(binding.get("domain") or "_"), fallback="_")
-            path = _normalize_path(str(binding.get("path") or "/"), fallback="/")
+            try:
+                host = _normalize_host(str(binding.get("domain") or "_"), fallback="_")
+                path = _normalize_path(str(binding.get("path") or "/"), fallback="/")
+            except ValueError as exc:
+                domain_route_skipped += 1
+                op.step_warning(
+                    "route.domain_invalid",
+                    "Skipped domain route with invalid generated config input",
+                    route_id=str(binding.get("id") or ""),
+                    error=str(exc),
+                )
+                continue
             route_key = (host, path)
             if route_key in seen_routes:
                 collisions.add(route_key)
@@ -224,6 +257,57 @@ async def list_gateway_routes(
         return routes
 
 
+async def build_gateway_source_map(session: AsyncSession) -> list[GatewaySourceMapEntryOut]:
+    routes = await list_gateway_routes(session)
+    entries: list[GatewaySourceMapEntryOut] = []
+    for route in routes:
+        source_type = "service.gateway"
+        source_id = route.service_id
+        if route.host != "_":
+            entries.append(
+                GatewaySourceMapEntryOut(
+                    directive="server_name",
+                    value=route.host,
+                    source_type=source_type,
+                    source_id=source_id,
+                    service_id=route.service_id,
+                    field="gateway.host",
+                )
+            )
+        entries.append(
+            GatewaySourceMapEntryOut(
+                directive="location",
+                value=route.path,
+                source_type=source_type,
+                source_id=source_id,
+                service_id=route.service_id,
+                field="gateway.path",
+            )
+        )
+        entries.append(
+            GatewaySourceMapEntryOut(
+                directive="upstream",
+                value=route.upstream,
+                source_type="compiled",
+                source_id=route.service_id,
+                service_id=route.service_id,
+                field="service.name",
+            )
+        )
+        for endpoint in route.endpoints:
+            entries.append(
+                GatewaySourceMapEntryOut(
+                    directive="server",
+                    value=_nginx_endpoint(endpoint.address, endpoint.port),
+                    source_type="endpoint",
+                    source_id=f"{endpoint.address}:{endpoint.port}",
+                    service_id=route.service_id,
+                    field="Endpoint.address:port",
+                )
+            )
+    return entries
+
+
 def render_nginx_config(
     *,
     routes: list[GatewayRouteOut],
@@ -235,6 +319,10 @@ def render_nginx_config(
 
     grouped: dict[str, list[GatewayRouteOut]] = defaultdict(list)
     for route in routes:
+        nginx_upstream_name(route.upstream)
+        nginx_path(route.path)
+        for endpoint in route.endpoints:
+            upstream_endpoint(endpoint.address, endpoint.port)
         grouped[_normalize_host(route.host, fallback=server_name_fallback)].append(route)
 
     lines = [
@@ -256,7 +344,8 @@ def render_nginx_config(
     for route in routes:
         lines.append(f"    upstream {route.upstream} {{")
         for endpoint in route.endpoints:
-            lines.append(f"        server {endpoint.address}:{endpoint.port} max_fails=2 fail_timeout=3s;")
+            target = _nginx_endpoint(endpoint.address, endpoint.port)
+            lines.append(f"        server {target} max_fails=2 fail_timeout=3s;")
         lines.append("        keepalive 32;")
         lines.append("    }")
 

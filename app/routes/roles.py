@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import get_db_session, get_writable_db_session
@@ -15,6 +15,13 @@ from app.services import cluster as cluster_service
 from app.services import roles as role_service
 
 router = APIRouter(prefix="/roles", tags=["roles"])
+
+
+def _bearer_token(authorization: str) -> str:
+    scheme, _, token = authorization.strip().partition(" ")
+    if scheme.casefold() == "bearer" and token.strip():
+        return token.strip()
+    return ""
 
 
 @router.get("/specs", response_model=List[RoleSpecOut])
@@ -47,12 +54,13 @@ async def put_role_spec(
 async def get_role_placement(
     request: Request,
     node_id: str = "",
-    lease_token: str = "",
     recompute: bool = False,
+    authorization: str = Header(default=""),
     session: AsyncSession = Depends(get_db_session),
 ) -> RolePlacementOut:
     auth_user = getattr(request.state, "auth_user", "")
     if not auth_user:
+        lease_token = _bearer_token(authorization)
         valid = await cluster_service.validate_node_lease_token(
             session,
             node_id=node_id,

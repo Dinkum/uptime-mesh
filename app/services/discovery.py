@@ -14,6 +14,7 @@ from app.models.replica import Replica
 from app.models.service import Service
 from app.schemas.discovery import DiscoveryEndpointOut, DiscoveryServiceOut
 from app.utils import sanitize_label
+from app.validation import corefile_forwarders, corefile_listen, dns_name, ip_address, port
 
 _logger = get_logger("services.discovery")
 
@@ -29,18 +30,11 @@ def _normalize_domain(domain: str) -> str:
     value = domain.strip().lower().rstrip(".")
     if not value:
         return "mesh.local"
-    return value
+    return dns_name(value)
 
 
 def _normalize_forwarders(raw: str) -> list[str]:
-    forwarders: list[str] = []
-    for item in raw.split():
-        value = item.strip()
-        if value:
-            forwarders.append(value)
-    if not forwarders:
-        return ["/etc/resolv.conf"]
-    return forwarders
+    return corefile_forwarders(raw)
 
 
 async def list_discovery_services(
@@ -80,11 +74,13 @@ async def list_discovery_services(
             endpoint_label = sanitize_dns_label(str(row.endpoint_id), fallback="ep")
             endpoint_host = f"{endpoint_label}.{service_host}"
             endpoint_fqdn = f"{endpoint_host}.{dns_domain}."
+            endpoint_address = ip_address(str(row.address), field_name="discovery endpoint address")
+            endpoint_port = port(row.port, field_name="discovery endpoint port")
             endpoint = DiscoveryEndpointOut(
                 endpoint_id=str(row.endpoint_id),
                 replica_id=str(row.replica_id),
-                address=str(row.address),
-                port=int(row.port),
+                address=endpoint_address,
+                port=endpoint_port,
                 host=endpoint_host,
                 host_fqdn=endpoint_fqdn,
             )
@@ -240,12 +236,14 @@ async def render_zone_file(
             for endpoint in service.endpoints:
                 endpoint_count += 1
                 service_addresses[endpoint.address] += 1
-                lines.append(f"{endpoint.host} IN A {endpoint.address}")
+                record_type = "AAAA" if ":" in endpoint.address else "A"
+                lines.append(f"{endpoint.host} IN {record_type} {endpoint.address}")
                 lines.append(
                     f"_tcp.{service.service} IN SRV 10 10 {endpoint.port} {endpoint.host_fqdn}"
                 )
             for address in service_addresses:
-                lines.append(f"{service.service} IN A {address}")
+                record_type = "AAAA" if ":" in address else "A"
+                lines.append(f"{service.service} IN {record_type} {address}")
 
         zone = "\n".join(lines).rstrip() + "\n"
         op.step(
@@ -266,7 +264,7 @@ def render_corefile(
     forwarders: str,
 ) -> str:
     dns_domain = _normalize_domain(domain)
-    listen_addr = listen.strip() or ".:53"
+    listen_addr = corefile_listen(listen)
     zone_path = Path(zone_file_path).expanduser()
     if not zone_path.is_absolute():
         zone_path = (Path.cwd() / zone_path).resolve()

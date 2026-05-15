@@ -44,5 +44,23 @@ reportMissingTypeStubs = false
 [tool.setuptools.packages.find]
 include = ["app*", "migrations*"]
 
+[tool.setuptools.package-data]
+app = ["templates/*.html"]
+migrations = ["script.py.mako"]
+
+[tool.setuptools.data-files]
+"." = ["alembic.ini", "go.mod", "version.json", "install.sh", "requirements.lock"]
+"agent/cmd/uptimemesh-agent" = [
+  "agent/cmd/uptimemesh-agent/main.go",
+]
+"ops" = [
+  "ops/agent-update.sh",
+  "ops/bootstrap.sh",
+  "ops/install.sh",
+  "ops/node-update.sh",
+  "ops/update.sh",
+  "ops/watchdog.py",
+]
+
 [tool.setuptools.dynamic]
 version = {attr = "app.versioning.__version__"}
