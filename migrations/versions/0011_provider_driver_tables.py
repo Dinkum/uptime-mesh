@@ -24,7 +24,11 @@ def _tables() -> set[str]:
 def _indexes(table_name: str) -> set[str]:
     if table_name not in _tables():
         return set()
-    return {item["name"] for item in sa.inspect(op.get_bind()).get_indexes(table_name)}
+    return {
+        name
+        for item in sa.inspect(op.get_bind()).get_indexes(table_name)
+        if isinstance(name := item.get("name"), str)
+    }
 
 
 def upgrade() -> None:

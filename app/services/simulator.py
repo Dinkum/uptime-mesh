@@ -8,7 +8,7 @@ from app.models.node import Node
 from app.models.service import Service
 from app.schemas.nodes import NodeCreate
 from app.schemas.replicas import ReplicaCreate
-from app.schemas.services import ServiceCreate
+from app.schemas.services import ServiceCreate, ServiceSpec
 from app.services import nodes, replicas, services
 
 
@@ -46,13 +46,18 @@ async def seed_local_simulator(session: AsyncSession) -> dict[str, object]:
                 id=service_id,
                 name="Simulator Web",
                 description="Local simulator workload",
-                spec={
-                    "type": "container",
-                    "container": {"image": "ghcr.io/dinkum/simulator-web:1.0.0", "port": 8080},
-                    "gateway": {"enabled": True, "host": "simulator.local", "path": "/"},
-                    "availability": {"protection": "survive_one_failure"},
-                    "scheduling": {"desired_replicas": 2, "anti_affinity": True},
-                },
+                spec=ServiceSpec.model_validate(
+                    {
+                        "type": "container",
+                        "container": {
+                            "image": "ghcr.io/dinkum/simulator-web:1.0.0",
+                            "port": 8080,
+                        },
+                        "gateway": {"enabled": True, "host": "simulator.local", "path": "/"},
+                        "availability": {"protection": "survive_one_failure"},
+                        "scheduling": {"desired_replicas": 2, "anti_affinity": True},
+                    }
+                ),
             ),
         )
         created_service = True

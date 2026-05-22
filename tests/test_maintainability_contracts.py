@@ -1,21 +1,28 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import hashlib
 import re
 from pathlib import Path
+from typing import cast
 
 from app.config import Settings
 from app.identity import heartbeat_signing_message
+from app.models.node import Node
+from app.models.replica import Replica
+from app.models.service import Service
 from app.models.snapshot_run import SnapshotRun
 from app.models.support_bundle import SupportBundle
-from app.schemas.services import ServiceCreate
+from app.schemas.services import ServiceCreate, ServiceSpec
 from app.security import create_session_token, decode_session_token
 from app.services.gateway import render_nginx_config
+from app.services import scheduler as scheduler_service
 from app.schemas.gateway import GatewayRouteEndpointOut, GatewayRouteOut
 from app.services.snapshots import _snapshot_restore_dir
 from app.services.snapshots import snapshot_artifact_path
 from app.services.support_bundles import support_bundle_artifact_path
+from sqlalchemy.ext.asyncio import AsyncSession
 
 ROOT = Path(__file__).resolve().parents[1]
 GO_AGENT = ROOT / "agent/cmd/uptimemesh-agent/main.go"
@@ -110,7 +117,11 @@ def test_session_tokens_are_bound_to_session_epoch() -> None:
 
 def test_service_spec_rejects_unknown_and_unsafe_config_inputs() -> None:
     try:
-        ServiceCreate(id="svc-web", name="Web", spec={"type": "container", "unexpected": True})
+        ServiceCreate(
+            id="svc-web",
+            name="Web",
+            spec=ServiceSpec.model_validate({"type": "container", "unexpected": True}),
+        )
     except ValueError as exc:
         assert "unexpected" in str(exc)
     else:
@@ -120,11 +131,13 @@ def test_service_spec_rejects_unknown_and_unsafe_config_inputs() -> None:
         ServiceCreate(
             id="svc-web",
             name="Web",
-            spec={
-                "type": "container",
-                "container": {"image": "example/web:1.0.0", "port": 8080},
-                "gateway": {"enabled": True, "host": "bad;host", "path": "/"},
-            },
+            spec=ServiceSpec.model_validate(
+                {
+                    "type": "container",
+                    "container": {"image": "example/web:1.0.0", "port": 8080},
+                    "gateway": {"enabled": True, "host": "bad;host", "path": "/"},
+                }
+            ),
         )
     except ValueError as exc:
         assert "gateway.host" in str(exc)
@@ -196,10 +209,42 @@ def test_manifest_script_checksums_match_scripts() -> None:
 
 
 def test_scheduler_dry_run_does_not_mutate_loaded_replica_objects() -> None:
-    source = (ROOT / "app/services/scheduler.py").read_text()
-    assert "if not dry_run:\n            replica.node_id = target_node.id" in source
-    assert "if not dry_run:\n            replica.status = status" in source
-    assert "generated_on_cache_miss" in source
+    service = Service(
+        id="svc-web",
+        name="Web",
+        spec={"scheduling": {"desired_replicas": 1}},
+        generation=2,
+    )
+    nodes = [
+        Node(id="node-a", name="Node A", roles=[], labels={}, status={"ready": True}),
+        Node(id="node-b", name="Node B", roles=[], labels={}, status={"ready": True}),
+    ]
+    replica = Replica(
+        id="replica-a",
+        service_id=service.id,
+        node_id="node-a",
+        desired_state="running",
+        status={"healthy": False, "applied_generation": 1},
+    )
+    original_status = dict(replica.status)
+
+    result = asyncio.run(
+        scheduler_service._reconcile_loaded_service(
+            cast(AsyncSession, None),
+            service=service,
+            replicas=[replica],
+            nodes=nodes,
+            dry_run=True,
+        )
+    )
+
+    assert [action.action for action in result.actions] == [
+        "move_unhealthy",
+        "queue_rolling_update",
+    ]
+    assert replica.node_id == "node-a"
+    assert replica.status == original_status
+    assert result.dry_run is True
 
 
 def test_agent_reports_explicit_role_runtime_capabilities() -> None:

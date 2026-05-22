@@ -40,6 +40,10 @@ line-length = 100
 [tool.pyright]
 pythonVersion = "3.11"
 reportMissingTypeStubs = false
+reportMissingModuleSource = false
+exclude = ["build", "dist", ".venv"]
+venvPath = "."
+venv = ".venv"
 
 [tool.setuptools.packages.find]
 include = ["app*", "migrations*"]

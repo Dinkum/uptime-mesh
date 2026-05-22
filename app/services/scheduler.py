@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -150,15 +150,6 @@ def _delete_rank(replica: Replica, counts: Dict[str, int]) -> tuple[int, int, da
     return (counts.get(replica.node_id, 0), unhealthy_score, updated_at)
 
 
-def _empty_plan() -> SchedulerBulkResultOut:
-    return SchedulerBulkResultOut(
-        dry_run=True,
-        generated_at=datetime.now(timezone.utc),
-        results=[],
-        cache_state="empty",
-    )
-
-
 def _strip_generated_at(value: object) -> object:
     if isinstance(value, dict):
         return {
@@ -269,6 +260,219 @@ async def reconcile_service(
     )
 
 
+@dataclass
+class _SchedulerPlan:
+    service: Service
+    policy: SchedulingPolicy
+    nodes: list[Node]
+    replicas: list[Replica]
+    dry_run: bool
+    warnings: List[str] = field(default_factory=list)
+    actions: List[SchedulerActionOut] = field(default_factory=list)
+    node_by_id: Dict[str, Node] = field(init=False)
+    eligible_nodes: list[Node] = field(init=False)
+    replica_counts: Dict[str, int] = field(init=False)
+    actual_replicas: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.node_by_id = {node.id: node for node in self.nodes}
+        self.eligible_nodes = [
+            node for node in self.nodes if _node_is_eligible(node, self.policy.node_selector)
+        ]
+        self.replica_counts = {}
+        for replica in self.replicas:
+            self.replica_counts[replica.node_id] = self.replica_counts.get(replica.node_id, 0) + 1
+        for eligible_node in self.eligible_nodes:
+            self.replica_counts.setdefault(eligible_node.id, 0)
+        self.actual_replicas = len(self.replicas)
+        if not self.eligible_nodes:
+            self.warnings.append("No eligible nodes available for scheduler policy.")
+
+    def choose_target_node(self, exclude_node_id: Optional[str] = None) -> Optional[Node]:
+        return _choose_target_node(
+            eligible_nodes=self.eligible_nodes,
+            counts=self.replica_counts,
+            anti_affinity=self.policy.anti_affinity,
+            exclude_node_id=exclude_node_id,
+        )
+
+    def count_replica_move(self, source_node_id: str, target_node_id: str) -> None:
+        self.replica_counts[source_node_id] = max(0, self.replica_counts.get(source_node_id, 0) - 1)
+        self.replica_counts[target_node_id] = self.replica_counts.get(target_node_id, 0) + 1
+
+    def record_action(
+        self,
+        action: str,
+        detail: str,
+        **fields: str | None,
+    ) -> None:
+        self.actions.append(
+            SchedulerActionOut(
+                action=action,
+                service_id=self.service.id,
+                detail=detail,
+                **fields,
+            )
+        )
+
+    async def reschedule_unhealthy(self, session: AsyncSession) -> None:
+        for replica in list(self.replicas):
+            node = self.node_by_id.get(replica.node_id)
+            if not _replica_is_unhealthy(replica, node, self.policy):
+                continue
+
+            target_node = self.choose_target_node(exclude_node_id=replica.node_id)
+            if target_node is None:
+                self.warnings.append(
+                    f"Replica {replica.id} is unhealthy but no target node is available."
+                )
+                continue
+
+            if target_node.id == replica.node_id:
+                self.warnings.append(
+                    f"Replica {replica.id} stayed on node {replica.node_id}; no better target."
+                )
+                continue
+
+            source_node_id = replica.node_id
+            moved_replica = replica
+            if not self.dry_run:
+                moved_replica = await replica_service.move_replica(session, replica, target_node.id)
+
+            self.count_replica_move(source_node_id, target_node.id)
+            if not self.dry_run:
+                moved_replica.node_id = target_node.id
+
+            self.record_action(
+                "move_unhealthy",
+                replica_id=moved_replica.id,
+                source_node_id=source_node_id,
+                target_node_id=target_node.id,
+                detail="Rescheduled unhealthy replica",
+            )
+
+    async def scale_up(self, session: AsyncSession) -> None:
+        while self.actual_replicas < self.policy.desired_replicas:
+            target_node = self.choose_target_node()
+            if target_node is None:
+                self.warnings.append("Unable to scale up: no eligible nodes.")
+                break
+
+            replica_id = f"{self.service.id}-replica-{uuid4().hex[:8]}"
+            replica_status = {
+                "healthy": True,
+                "managed_by": "scheduler",
+                "applied_generation": self.service.generation,
+            }
+
+            if not self.dry_run:
+                created_replica = await replica_service.create_replica(
+                    session,
+                    ReplicaCreate(
+                        id=replica_id,
+                        service_id=self.service.id,
+                        node_id=target_node.id,
+                        desired_state="running",
+                        status=replica_status,
+                    ),
+                )
+                self.replicas.append(created_replica)
+
+            self.replica_counts[target_node.id] = self.replica_counts.get(target_node.id, 0) + 1
+            self.actual_replicas += 1
+            self.record_action(
+                "scale_up",
+                replica_id=replica_id,
+                target_node_id=target_node.id,
+                detail="Created replica to satisfy desired count",
+            )
+
+    async def scale_down(self, session: AsyncSession) -> None:
+        while self.actual_replicas > self.policy.desired_replicas and self.replicas:
+            candidate = max(
+                self.replicas,
+                key=lambda replica: _delete_rank(replica, self.replica_counts),
+            )
+
+            if not self.dry_run:
+                await replica_service.delete_replica(session, candidate)
+
+            self.replicas = [replica for replica in self.replicas if replica.id != candidate.id]
+            self.replica_counts[candidate.node_id] = max(
+                0, self.replica_counts.get(candidate.node_id, 0) - 1
+            )
+            self.actual_replicas -= 1
+            self.record_action(
+                "scale_down",
+                replica_id=candidate.id,
+                source_node_id=candidate.node_id,
+                detail="Removed extra replica",
+            )
+
+    async def queue_rolling_updates(self, session: AsyncSession) -> None:
+        rolling_window = max(1, self.policy.max_surge + self.policy.max_unavailable)
+        outdated_replicas = [
+            replica
+            for replica in self.replicas
+            if _to_int(dict(replica.status or {}).get("applied_generation"), 0)
+            != self.service.generation
+        ]
+
+        for replica in outdated_replicas[:rolling_window]:
+            status = dict(replica.status or {})
+            status["desired_generation"] = self.service.generation
+            status["update_state"] = "pending"
+
+            queued_replica = replica
+            if not self.dry_run:
+                queued_replica = await replica_service.update_replica(
+                    session,
+                    replica,
+                    ReplicaUpdate(status=status),
+                )
+                queued_replica.status = status
+
+            self.record_action(
+                "queue_rolling_update",
+                replica_id=queued_replica.id,
+                source_node_id=queued_replica.node_id,
+                detail="Queued replica for rolling update",
+            )
+
+    def result(self) -> SchedulerResultOut:
+        return SchedulerResultOut(
+            service_id=self.service.id,
+            desired_replicas=self.policy.desired_replicas,
+            actual_replicas=self.actual_replicas,
+            eligible_nodes=len(self.eligible_nodes),
+            dry_run=self.dry_run,
+            warnings=self.warnings,
+            actions=self.actions,
+            generated_at=datetime.now(timezone.utc),
+        )
+
+
+async def _record_scheduler_result(
+    session: AsyncSession,
+    result: SchedulerResultOut,
+) -> None:
+    await event_service.record_event(
+        session,
+        event_id=str(uuid4()),
+        category="scheduler",
+        name="scheduler.reconcile",
+        level="INFO",
+        fields={
+            "service_id": result.service_id,
+            "desired_replicas": result.desired_replicas,
+            "actual_replicas": result.actual_replicas,
+            "action_count": len(result.actions),
+            "warning_count": len(result.warnings),
+        },
+    )
+    await session.commit()
+
+
 async def _reconcile_loaded_service(
     session: AsyncSession,
     *,
@@ -278,193 +482,22 @@ async def _reconcile_loaded_service(
     dry_run: bool,
 ) -> SchedulerResultOut:
     spec = dict(service.spec or {})
-    policy = _extract_policy(spec, current_replicas=len(replicas))
-
-    node_by_id = {node.id: node for node in nodes}
-    eligible_nodes = [node for node in nodes if _node_is_eligible(node, policy.node_selector)]
-
-    warnings: List[str] = []
-    actions: List[SchedulerActionOut] = []
-
-    if not eligible_nodes:
-        warnings.append("No eligible nodes available for scheduler policy.")
-
-    replica_counts: Dict[str, int] = {}
-    for replica in replicas:
-        replica_counts[replica.node_id] = replica_counts.get(replica.node_id, 0) + 1
-
-    for eligible_node in eligible_nodes:
-        replica_counts.setdefault(eligible_node.id, 0)
-
-    for replica in list(replicas):
-        node = node_by_id.get(replica.node_id)
-        if not _replica_is_unhealthy(replica, node, policy):
-            continue
-
-        target_node = _choose_target_node(
-            eligible_nodes=eligible_nodes,
-            counts=replica_counts,
-            anti_affinity=policy.anti_affinity,
-            exclude_node_id=replica.node_id,
-        )
-
-        if target_node is None:
-            warnings.append(f"Replica {replica.id} is unhealthy but no target node is available.")
-            continue
-
-        if target_node.id == replica.node_id:
-            warnings.append(
-                f"Replica {replica.id} stayed on node {replica.node_id}; no better target."
-            )
-            continue
-
-        source_node_id = replica.node_id
-        if not dry_run:
-            replica = await replica_service.move_replica(session, replica, target_node.id)
-
-        replica_counts[source_node_id] = max(0, replica_counts.get(source_node_id, 0) - 1)
-        replica_counts[target_node.id] = replica_counts.get(target_node.id, 0) + 1
-        if not dry_run:
-            replica.node_id = target_node.id
-
-        actions.append(
-            SchedulerActionOut(
-                action="move_unhealthy",
-                service_id=service.id,
-                replica_id=replica.id,
-                source_node_id=source_node_id,
-                target_node_id=target_node.id,
-                detail="Rescheduled unhealthy replica",
-            )
-        )
-
-    actual_replicas = len(replicas)
-
-    while actual_replicas < policy.desired_replicas:
-        target_node = _choose_target_node(
-            eligible_nodes=eligible_nodes,
-            counts=replica_counts,
-            anti_affinity=policy.anti_affinity,
-        )
-
-        if target_node is None:
-            warnings.append("Unable to scale up: no eligible nodes.")
-            break
-
-        replica_id = f"{service.id}-replica-{uuid4().hex[:8]}"
-        replica_status = {
-            "healthy": True,
-            "managed_by": "scheduler",
-            "applied_generation": service.generation,
-        }
-
-        if not dry_run:
-            created_replica = await replica_service.create_replica(
-                session,
-                ReplicaCreate(
-                    id=replica_id,
-                    service_id=service.id,
-                    node_id=target_node.id,
-                    desired_state="running",
-                    status=replica_status,
-                ),
-            )
-            replicas.append(created_replica)
-
-        replica_counts[target_node.id] = replica_counts.get(target_node.id, 0) + 1
-        actual_replicas += 1
-
-        actions.append(
-            SchedulerActionOut(
-                action="scale_up",
-                service_id=service.id,
-                replica_id=replica_id,
-                target_node_id=target_node.id,
-                detail="Created replica to satisfy desired count",
-            )
-        )
-
-    while actual_replicas > policy.desired_replicas and replicas:
-        candidate = sorted(
-            replicas, key=lambda replica: _delete_rank(replica, replica_counts), reverse=True
-        )[0]
-
-        if not dry_run:
-            await replica_service.delete_replica(session, candidate)
-
-        replicas = [replica for replica in replicas if replica.id != candidate.id]
-        replica_counts[candidate.node_id] = max(0, replica_counts.get(candidate.node_id, 0) - 1)
-        actual_replicas -= 1
-
-        actions.append(
-            SchedulerActionOut(
-                action="scale_down",
-                service_id=service.id,
-                replica_id=candidate.id,
-                source_node_id=candidate.node_id,
-                detail="Removed extra replica",
-            )
-        )
-
-    rolling_window = max(1, policy.max_surge + policy.max_unavailable)
-    outdated_replicas = [
-        replica
-        for replica in replicas
-        if _to_int(dict(replica.status or {}).get("applied_generation"), 0) != service.generation
-    ]
-
-    for replica in outdated_replicas[:rolling_window]:
-        status = dict(replica.status or {})
-        status["desired_generation"] = service.generation
-        status["update_state"] = "pending"
-
-        if not dry_run:
-            replica = await replica_service.update_replica(
-                session,
-                replica,
-                ReplicaUpdate(status=status),
-            )
-
-        if not dry_run:
-            replica.status = status
-        actions.append(
-            SchedulerActionOut(
-                action="queue_rolling_update",
-                service_id=service.id,
-                replica_id=replica.id,
-                source_node_id=replica.node_id,
-                detail="Queued replica for rolling update",
-            )
-        )
-
-    generated_at = datetime.now(timezone.utc)
-    result = SchedulerResultOut(
-        service_id=service.id,
-        desired_replicas=policy.desired_replicas,
-        actual_replicas=actual_replicas,
-        eligible_nodes=len(eligible_nodes),
+    plan = _SchedulerPlan(
+        service=service,
+        policy=_extract_policy(spec, current_replicas=len(replicas)),
+        nodes=nodes,
+        replicas=replicas,
         dry_run=dry_run,
-        warnings=warnings,
-        actions=actions,
-        generated_at=generated_at,
     )
 
+    await plan.reschedule_unhealthy(session)
+    await plan.scale_up(session)
+    await plan.scale_down(session)
+    await plan.queue_rolling_updates(session)
+    result = plan.result()
+
     if not dry_run:
-        await event_service.record_event(
-            session,
-            event_id=str(uuid4()),
-            category="scheduler",
-            name="scheduler.reconcile",
-            level="INFO",
-            fields={
-                "service_id": service.id,
-                "desired_replicas": result.desired_replicas,
-                "actual_replicas": result.actual_replicas,
-                "action_count": len(result.actions),
-                "warning_count": len(result.warnings),
-            },
-        )
-        await session.commit()
+        await _record_scheduler_result(session, result)
 
     return result
 

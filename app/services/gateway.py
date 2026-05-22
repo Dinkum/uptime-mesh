@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import re
 from collections import defaultdict
-from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -34,6 +33,72 @@ class GatewayRenderResult:
     routes: list[GatewayRouteOut]
     route_count: int
     upstream_count: int
+
+
+@dataclass
+class GatewayRouteDraft:
+    service_id: str
+    service_name: str
+    host: str
+    path: str
+    upstream: str
+    endpoints: set[tuple[str, int]] = field(default_factory=set)
+
+    def to_route(self) -> GatewayRouteOut:
+        endpoints = [
+            GatewayRouteEndpointOut(address=address, port=port)
+            for address, port in sorted(self.endpoints)
+        ]
+        return GatewayRouteOut(
+            service_id=self.service_id,
+            service_name=self.service_name,
+            host=self.host,
+            path=self.path,
+            upstream=self.upstream,
+            endpoint_count=len(endpoints),
+            endpoints=endpoints,
+        )
+
+
+@dataclass
+class GatewayRouteAccumulator:
+    grouped: dict[str, GatewayRouteDraft] = field(default_factory=dict)
+    collisions: set[tuple[str, str]] = field(default_factory=set)
+    seen: set[tuple[str, str]] = field(default_factory=set)
+
+    def add(
+        self,
+        group_key: str,
+        *,
+        service_id: str,
+        service_name: str,
+        host: str,
+        path: str,
+        upstream_seed: str,
+        upstream_fallback: str,
+        endpoints: set[tuple[str, int]],
+        merge_existing: bool,
+    ) -> bool:
+        route_key = (host, path)
+        draft = self.grouped.get(group_key)
+        if route_key in self.seen and not (merge_existing and draft is not None):
+            self.collisions.add(route_key)
+            return False
+        self.seen.add(route_key)
+        if draft is None:
+            draft = GatewayRouteDraft(
+                service_id=service_id,
+                service_name=service_name,
+                host=host,
+                path=path,
+                upstream=_sanitize_name(upstream_seed, fallback=upstream_fallback),
+            )
+            self.grouped[group_key] = draft
+        draft.endpoints.update(endpoints)
+        return True
+
+    def routes(self) -> list[GatewayRouteOut]:
+        return [draft.to_route() for draft in self.grouped.values()]
 
 
 def _sanitize_name(raw: str, fallback: str) -> str:
@@ -122,9 +187,7 @@ async def list_gateway_routes(
             domain_routes=domain_routes,
         )
 
-        grouped: dict[str, dict[str, Any]] = {}
-        collisions: set[tuple[str, str]] = set()
-        seen_routes: set[tuple[str, str]] = set()
+        route_accumulator = GatewayRouteAccumulator()
         service_endpoints: dict[str, set[tuple[str, int]]] = {}
         service_names: dict[str, str] = {}
         for row in rows:
@@ -151,26 +214,18 @@ async def list_gateway_routes(
             if not enabled:
                 continue
 
-            route_key = (host, path)
-            if route_key in seen_routes and service_id not in grouped:
-                collisions.add(route_key)
-                continue
-            seen_routes.add(route_key)
-
-            payload = grouped.get(service_id)
-            if payload is None:
-                upstream = f"svc_{_sanitize_name(service_name, fallback=service_id)}_{service_id[:8]}"
-                payload = {
-                    "service_id": service_id,
-                    "service_name": service_name,
-                    "host": host,
-                    "path": path,
-                    "upstream": _sanitize_name(upstream, fallback=f"svc_{service_id[:8]}"),
-                    "endpoints": set(),
-                }
-                grouped[service_id] = payload
-
-            payload["endpoints"].add(endpoint)
+            upstream_seed = f"svc_{_sanitize_name(service_name, fallback=service_id)}_{service_id[:8]}"
+            route_accumulator.add(
+                service_id,
+                service_id=service_id,
+                service_name=service_name,
+                host=host,
+                path=path,
+                upstream_seed=upstream_seed,
+                upstream_fallback=f"svc_{service_id[:8]}",
+                endpoints={endpoint},
+                merge_existing=True,
+            )
 
         domain_route_count = 0
         domain_route_skipped = 0
@@ -197,49 +252,32 @@ async def list_gateway_routes(
                     error=str(exc),
                 )
                 continue
-            route_key = (host, path)
-            if route_key in seen_routes:
-                collisions.add(route_key)
-                domain_route_skipped += 1
-                continue
-            seen_routes.add(route_key)
             app_id = str(binding.get("application_id") or "app")
             service_name = service_names.get(service_id, service_id)
             upstream_seed = f"app_{_sanitize_name(app_id, fallback='app')}_{service_id[:8]}"
-            grouped[f"{service_id}:{host}:{path}"] = {
-                "service_id": service_id,
-                "service_name": service_name,
-                "host": host,
-                "path": path,
-                "upstream": _sanitize_name(upstream_seed, fallback=f"app_{service_id[:8]}"),
-                "endpoints": set(endpoints),
-            }
+            added = route_accumulator.add(
+                f"{service_id}:{host}:{path}",
+                service_id=service_id,
+                service_name=service_name,
+                host=host,
+                path=path,
+                upstream_seed=upstream_seed,
+                upstream_fallback=f"app_{service_id[:8]}",
+                endpoints=set(endpoints),
+                merge_existing=False,
+            )
+            if not added:
+                domain_route_skipped += 1
+                continue
             domain_route_count += 1
 
-        routes: list[GatewayRouteOut] = []
-        for value in grouped.values():
-            raw_endpoints = sorted(list(value["endpoints"]))
-            endpoints = [
-                GatewayRouteEndpointOut(address=address, port=port) for address, port in raw_endpoints
-            ]
-            routes.append(
-                GatewayRouteOut(
-                    service_id=str(value["service_id"]),
-                    service_name=str(value["service_name"]),
-                    host=str(value["host"]),
-                    path=str(value["path"]),
-                    upstream=str(value["upstream"]),
-                    endpoint_count=len(endpoints),
-                    endpoints=endpoints,
-                )
-            )
-
+        routes = route_accumulator.routes()
         routes.sort(key=lambda item: (item.host, -len(item.path), item.service_name))
-        if collisions:
+        if route_accumulator.collisions:
             op.step_warning(
                 "route.collision",
                 "Skipped duplicate host/path routes across services",
-                collisions=len(collisions),
+                collisions=len(route_accumulator.collisions),
             )
         op.step(
             "route.domain_bindings",

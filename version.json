@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
-  "version": "0.0.8",
+  "version": "0.0.9",
   "channels": {
     "stable": {
-      "version": "0.0.8",
+      "version": "0.0.9",
       "bootstrap": {
         "path": "ops/bootstrap.sh",
         "sha256": "25ae217c36a0615153ec58d990233c8c6061fadc2ddb0a667dcede3ab3623345"
@@ -18,7 +18,7 @@
       },
       "agent": {
         "name": "uptimemesh-agent",
-        "version": "0.2.3"
+        "version": "0.2.4"
       }
     }
   }

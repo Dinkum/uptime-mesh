@@ -72,6 +72,12 @@ def endpoint_for_container(*, node: Any, spec: DockerContainerSpec) -> tuple[str
     return _node_endpoint_host(node), spec.host_port
 
 
+def _required_int(value: Any, *, action: str, field: str) -> int:
+    if value is None:
+        raise DockerOperationError(action, f"{field} is required")
+    return int(value)
+
+
 def build_container_spec(
     *,
     service_name: str,
@@ -87,9 +93,10 @@ def build_container_spec(
     health_map = health if isinstance(health, dict) else {}
     status = getattr(node, "status", {}) or {}
     docker_host = str(container_map.get("docker_host") or status.get("docker_host") or "").strip()
-    port = int(container_map.get("port"))
+    port = _required_int(container_map.get("port"), action="container.spec", field="container.port")
     host_port = int(container_map.get("host_port") or port)
-    env = container_map.get("env") if isinstance(container_map.get("env"), dict) else {}
+    env_raw = container_map.get("env")
+    env = env_raw if isinstance(env_raw, dict) else {}
     labels = {
         "uptimemesh.service": service_name,
         "uptimemesh.replica": replica_id,
@@ -109,6 +116,14 @@ def build_container_spec(
         health_command=str(health_map.get("command") or "").strip(),
         desired_running=desired_state.lower() == "running",
     )
+
+
+def _timeout_output(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
 
 
 def _run_docker(
@@ -134,8 +149,8 @@ def _run_docker(
     except FileNotFoundError as exc:
         raise DockerUnavailableError("docker.command", str(exc)) from exc
     except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout or ""
-        stderr = exc.stderr or f"timed out after {timeout_seconds}s"
+        stdout = _timeout_output(exc.stdout)
+        stderr = _timeout_output(exc.stderr) or f"timed out after {timeout_seconds}s"
         raise DockerOperationError("docker.timeout", stderr.strip() or stdout.strip()) from exc
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 

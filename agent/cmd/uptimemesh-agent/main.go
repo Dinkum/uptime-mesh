@@ -33,7 +33,7 @@ import (
 )
 
 const (
-	agentVersion           = "0.2.3"
+	agentVersion           = "0.2.4"
 	swimGossipFanout       = 3
 	swimIndirectRelayLimit = 32
 	swimMaxPeerStates      = 1024
@@ -142,6 +142,19 @@ type wgPeerIntent struct {
 	persistentKeepalive int
 }
 
+type wgTunnelStatus struct {
+	label          string
+	iface          string
+	listenPort     int
+	routerIP       string
+	peer           wgPeerIntent
+	peerConfigured bool
+	configured     bool
+	publicKey      string
+	up             bool
+	healthy        bool
+}
+
 type clusterPeerDTO struct {
 	NodeID string `json:"node_id"`
 	MeshIP string `json:"mesh_ip"`
@@ -178,6 +191,38 @@ type SwimPeerState struct {
 	Flags         map[string]any
 }
 
+type swimProbeResult struct {
+	targetNodeID        string
+	ok                  bool
+	indirectUsed        bool
+	indirectSucceeded   bool
+	indirectHelperCount int
+}
+
+func (a *Agent) swimPeerLocked(
+	nodeID string,
+	initialState string,
+	initialIncarnation int64,
+	lastChanged time.Time,
+) (*SwimPeerState, bool) {
+	peer := a.swimPeers[nodeID]
+	if peer != nil {
+		return peer, true
+	}
+	if len(a.swimPeers) >= swimMaxPeerStates {
+		return nil, false
+	}
+	peer = &SwimPeerState{
+		NodeID:      nodeID,
+		State:       initialState,
+		Incarnation: initialIncarnation,
+		LastChanged: lastChanged,
+		Flags:       map[string]any{},
+	}
+	a.swimPeers[nodeID] = peer
+	return peer, true
+}
+
 type loadSnapshot struct {
 	takenAt                 time.Time
 	cpuIdle                 uint64
@@ -202,6 +247,13 @@ type loadSnapshot struct {
 	networkTxDropErrPackets uint64
 	networkCapacityBps      float64
 	rttMs                   float64
+}
+
+type loadComponent struct {
+	value  float64
+	good   float64
+	bad    float64
+	weight float64
 }
 
 func main() {
@@ -315,6 +367,24 @@ func main() {
 	}
 }
 
+func defaultIntBelow(value *int, min int, fallback int) {
+	if *value < min {
+		*value = fallback
+	}
+}
+
+func capInt(value *int, max int) {
+	if *value > max {
+		*value = max
+	}
+}
+
+func defaultIntOutside(value *int, min int, max int, fallback int) {
+	if *value < min || *value > max {
+		*value = fallback
+	}
+}
+
 func loadConfig(envFile string) (Config, error) {
 	env := loadEnvFile(envFile)
 	get := func(key string, fallback string) string {
@@ -408,72 +478,34 @@ func loadConfig(envFile string) (Config, error) {
 	if cfg.NodeID == "" {
 		return Config{}, errors.New("RUNTIME_NODE_ID is required")
 	}
-	if cfg.HeartbeatIntervalSeconds < 5 {
-		cfg.HeartbeatIntervalSeconds = 5
-	}
-	if cfg.HeartbeatTTLSeconds < 10 {
-		cfg.HeartbeatTTLSeconds = 10
-	}
-	if cfg.APIRequestTimeoutSeconds < 1 {
-		cfg.APIRequestTimeoutSeconds = 5
-	}
-	if cfg.APIRequestTimeoutSeconds > 60 {
-		cfg.APIRequestTimeoutSeconds = 60
-	}
-	if cfg.CommandTimeoutSeconds < 1 {
-		cfg.CommandTimeoutSeconds = 30
-	}
-	if cfg.CommandTimeoutSeconds > 300 {
-		cfg.CommandTimeoutSeconds = 300
-	}
+	defaultIntBelow(&cfg.HeartbeatIntervalSeconds, 5, 5)
+	defaultIntBelow(&cfg.HeartbeatTTLSeconds, 10, 10)
+	defaultIntBelow(&cfg.APIRequestTimeoutSeconds, 1, 5)
+	capInt(&cfg.APIRequestTimeoutSeconds, 60)
+	defaultIntBelow(&cfg.CommandTimeoutSeconds, 1, 30)
+	capInt(&cfg.CommandTimeoutSeconds, 300)
 	if cfg.PingTimeoutSeconds < 1 {
 		cfg.PingTimeoutSeconds = 1
 	}
 	if cfg.PingTimeoutSeconds > 30 {
 		cfg.PingTimeoutSeconds = 30
 	}
-	if cfg.FailoverThreshold < 1 {
-		cfg.FailoverThreshold = 1
-	}
-	if cfg.FailbackStableCount < 1 {
-		cfg.FailbackStableCount = 1
-	}
-	if cfg.PrimaryListenPort < 0 || cfg.PrimaryListenPort > 65535 {
-		cfg.PrimaryListenPort = 51820
-	}
-	if cfg.SecondaryListenPort < 0 || cfg.SecondaryListenPort > 65535 {
-		cfg.SecondaryListenPort = 51821
-	}
-	if cfg.PeerPort < 1 || cfg.PeerPort > 65535 {
-		cfg.PeerPort = 51820
-	}
-	if cfg.PersistentKeepaliveSeconds < 0 {
-		cfg.PersistentKeepaliveSeconds = 0
-	}
-	if cfg.SWIMPort < 1 || cfg.SWIMPort > 65535 {
-		cfg.SWIMPort = 7946
-	}
-	if cfg.SWIMProbeTimeoutMs < 50 {
-		cfg.SWIMProbeTimeoutMs = 500
-	}
-	if cfg.SWIMIndirectProbeCount < 0 {
-		cfg.SWIMIndirectProbeCount = 0
-	}
-	if cfg.SWIMSuspectThreshold < 1 {
-		cfg.SWIMSuspectThreshold = 2
-	}
+	defaultIntBelow(&cfg.FailoverThreshold, 1, 1)
+	defaultIntBelow(&cfg.FailbackStableCount, 1, 1)
+	defaultIntOutside(&cfg.PrimaryListenPort, 0, 65535, 51820)
+	defaultIntOutside(&cfg.SecondaryListenPort, 0, 65535, 51821)
+	defaultIntOutside(&cfg.PeerPort, 1, 65535, 51820)
+	defaultIntBelow(&cfg.PersistentKeepaliveSeconds, 0, 0)
+	defaultIntOutside(&cfg.SWIMPort, 1, 65535, 7946)
+	defaultIntBelow(&cfg.SWIMProbeTimeoutMs, 50, 500)
+	defaultIntBelow(&cfg.SWIMIndirectProbeCount, 0, 0)
+	defaultIntBelow(&cfg.SWIMSuspectThreshold, 1, 2)
 	if cfg.SWIMDeadThreshold < cfg.SWIMSuspectThreshold+1 {
 		cfg.SWIMDeadThreshold = cfg.SWIMSuspectThreshold + 1
 	}
-	if cfg.SWIMCooldownSeconds < 0 {
-		cfg.SWIMCooldownSeconds = 30
-	}
-	if cfg.BackendListenPort < 1 || cfg.BackendListenPort > 65535 {
-		cfg.BackendListenPort = 8081
-	}
-	if cfg.ProxyListenPort < 1 || cfg.ProxyListenPort > 65535 {
-		cfg.ProxyListenPort = 8080
-	}
+	defaultIntBelow(&cfg.SWIMCooldownSeconds, 0, 30)
+	defaultIntOutside(&cfg.BackendListenPort, 1, 65535, 8081)
+	defaultIntOutside(&cfg.ProxyListenPort, 1, 65535, 8080)
 	return cfg, nil
 }
 
@@ -776,6 +808,16 @@ func (a *Agent) readNodePrivateKey() (crypto.PrivateKey, error) {
 	return privateKey, nil
 }
 
+func waitRetry(ctx context.Context, backoff *time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(*backoff):
+	}
+	*backoff *= 2
+	return nil
+}
+
 func (a *Agent) doGETWithRetry(ctx context.Context, targetURL string, attempts int, bearerToken string) (*http.Response, error) {
 	if attempts < 1 {
 		attempts = 1
@@ -803,12 +845,9 @@ func (a *Agent) doGETWithRetry(ctx context.Context, targetURL string, attempts i
 			lastErr = err
 		}
 		if attempt < attempts {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(backoff):
+			if err := waitRetry(ctx, &backoff); err != nil {
+				return nil, err
 			}
-			backoff *= 2
 		}
 	}
 	if lastErr == nil {
@@ -891,37 +930,21 @@ func (a *Agent) handleSWIMMessage(remote *net.UDPAddr, msg swimMessage) {
 	if strings.TrimSpace(msg.From) != "" && msg.From != a.cfg.NodeID && updatesFromRemote {
 		now := time.Now().UTC()
 		a.mu.Lock()
-		peer := a.swimPeers[msg.From]
-		if peer == nil {
-			if len(a.swimPeers) >= swimMaxPeerStates {
-				a.mu.Unlock()
-				a.log.Warn("agent.swim", "peer.drop", "Dropped SWIM peer because peer-state limit is reached", map[string]any{
-					"peer_limit": swimMaxPeerStates,
-				})
-				return
-			}
-			peer = &SwimPeerState{
-				NodeID:      msg.From,
-				State:       "healthy",
-				LastChanged: now,
-				Flags:       map[string]any{},
-			}
-			a.swimPeers[msg.From] = peer
+		peer, ok := a.swimPeerLocked(msg.From, "healthy", 0, now)
+		if !ok {
+			a.mu.Unlock()
+			a.log.Warn("agent.swim", "peer.drop", "Dropped SWIM peer because peer-state limit is reached", map[string]any{
+				"peer_limit": swimMaxPeerStates,
+			})
+			return
 		}
 		peer.LastSeen = now
 		if remote != nil {
 			peer.MeshIP = remote.IP.String()
 		}
 		stateBefore := strings.ToLower(strings.TrimSpace(peer.State))
-		if msg.Incarnation > peer.Incarnation {
+		if msg.Incarnation >= peer.Incarnation {
 			peer.Incarnation = msg.Incarnation
-			if msg.State != "" {
-				peer.State = strings.ToLower(strings.TrimSpace(msg.State))
-			}
-			if msg.Flags != nil {
-				peer.Flags = msg.Flags
-			}
-		} else if msg.Incarnation == peer.Incarnation {
 			if msg.State != "" {
 				peer.State = strings.ToLower(strings.TrimSpace(msg.State))
 			}
@@ -991,21 +1014,7 @@ func (a *Agent) handleSWIMMessage(remote *net.UDPAddr, msg swimMessage) {
 			}
 			a.sendSWIMMessage(&relayAddr, ack)
 		}(relay, msg)
-	case "ack":
-		if strings.TrimSpace(msg.Nonce) == "" {
-			return
-		}
-		a.mu.Lock()
-		ch := a.swimPending[msg.Nonce]
-		delete(a.swimPending, msg.Nonce)
-		a.mu.Unlock()
-		if ch != nil {
-			select {
-			case ch <- msg:
-			default:
-			}
-		}
-	case "indirect-ack":
+	case "ack", "indirect-ack":
 		if strings.TrimSpace(msg.Nonce) == "" {
 			return
 		}
@@ -1160,19 +1169,10 @@ func (a *Agent) mergeSWIMGossip(peers map[string]map[string]any) {
 		}
 
 		a.mu.Lock()
-		peer := a.swimPeers[nodeID]
-		if peer == nil {
-			if len(a.swimPeers) >= swimMaxPeerStates {
-				a.mu.Unlock()
-				continue
-			}
-			peer = &SwimPeerState{
-				NodeID:      nodeID,
-				State:       "unknown",
-				Incarnation: -1,
-				Flags:       map[string]any{},
-			}
-			a.swimPeers[nodeID] = peer
+		peer, ok := a.swimPeerLocked(nodeID, "unknown", -1, time.Time{})
+		if !ok {
+			a.mu.Unlock()
+			continue
 		}
 
 		if incomingIncarnation > peer.Incarnation {
@@ -1329,6 +1329,79 @@ func (a *Agent) indirectProbeSWIM(targetNodeID string, targetIP string, helpers 
 	}
 }
 
+func (a *Agent) runSWIMProbe(candidates []*SwimPeerState, now time.Time) swimProbeResult {
+	if len(candidates) == 0 {
+		return swimProbeResult{}
+	}
+	index := int(now.UnixNano() % int64(len(candidates)))
+	target := candidates[index]
+	result := swimProbeResult{
+		targetNodeID: target.NodeID,
+		ok:           a.pingPeerSWIM(target.NodeID, target.MeshIP),
+	}
+	if !result.ok && a.cfg.SWIMIndirectProbeCount > 0 {
+		helpers := a.selectIndirectHelpers(
+			candidates,
+			target.NodeID,
+			index+1,
+			a.cfg.SWIMIndirectProbeCount,
+		)
+		result.indirectHelperCount = len(helpers)
+		if len(helpers) > 0 {
+			result.indirectUsed = true
+			if a.indirectProbeSWIM(target.NodeID, target.MeshIP, helpers) {
+				result.ok = true
+				result.indirectSucceeded = true
+				a.log.Info("agent.swim", "probe.indirect_ok", "Recovered peer via indirect probes", map[string]any{
+					"target_node_id": target.NodeID,
+					"helpers":        result.indirectHelperCount,
+				})
+			}
+		}
+	}
+	if result.indirectUsed && !result.indirectSucceeded {
+		a.log.Debug("agent.swim", "probe.indirect_miss", "Indirect probes did not recover target", map[string]any{
+			"target_node_id": target.NodeID,
+			"helpers":        result.indirectHelperCount,
+		})
+	}
+	a.recordSWIMProbeResult(result, now)
+	return result
+}
+
+func (a *Agent) recordSWIMProbeResult(result swimProbeResult, now time.Time) {
+	if strings.TrimSpace(result.targetNodeID) == "" {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	peer := a.swimPeers[result.targetNodeID]
+	if peer == nil {
+		return
+	}
+	stateBefore := strings.ToLower(strings.TrimSpace(peer.State))
+	if result.ok {
+		peer.State = "healthy"
+		peer.Failures = 0
+		peer.Suspect = false
+		peer.LastSeen = now
+	} else {
+		peer.Failures++
+		peer.State = "degraded"
+		if peer.Failures >= a.cfg.SWIMDeadThreshold {
+			peer.State = "dead"
+			peer.Suspect = false
+			peer.CooldownUntil = now.Add(time.Duration(a.cfg.SWIMCooldownSeconds) * time.Second)
+		} else if peer.Failures >= a.cfg.SWIMSuspectThreshold {
+			peer.Suspect = true
+		}
+	}
+	stateAfter := strings.ToLower(strings.TrimSpace(peer.State))
+	if stateAfter != "" && stateAfter != stateBefore {
+		peer.LastChanged = now
+	}
+}
+
 func (a *Agent) fetchClusterPeers(ctx context.Context, leaseToken string) ([]clusterPeerDTO, error) {
 	u := fmt.Sprintf(
 		"%s/cluster/peers?node_id=%s",
@@ -1408,17 +1481,9 @@ func (a *Agent) reconcileSWIM(
 			continue
 		}
 		meshIP := strings.TrimSpace(row.MeshIP)
-		peer := a.swimPeers[nodeID]
-		if peer == nil {
-			if len(a.swimPeers) >= swimMaxPeerStates {
-				continue
-			}
-			peer = &SwimPeerState{
-				NodeID: nodeID,
-				State:  "unknown",
-				Flags:  map[string]any{},
-			}
-			a.swimPeers[nodeID] = peer
+		peer, ok := a.swimPeerLocked(nodeID, "unknown", 0, time.Time{})
+		if !ok {
+			continue
 		}
 		if meshIP != "" {
 			peer.MeshIP = meshIP
@@ -1427,76 +1492,10 @@ func (a *Agent) reconcileSWIM(
 	}
 	a.mu.Unlock()
 
-	probed := ""
-	indirectUsed := false
-	indirectSucceeded := false
-	indirectHelperCount := 0
-	if len(candidates) > 0 {
-		index := int(now.UnixNano() % int64(len(candidates)))
-		target := candidates[index]
-		probed = target.NodeID
-		ok := a.pingPeerSWIM(target.NodeID, target.MeshIP)
-		if !ok && a.cfg.SWIMIndirectProbeCount > 0 {
-			helpers := a.selectIndirectHelpers(
-				candidates,
-				target.NodeID,
-				index+1,
-				a.cfg.SWIMIndirectProbeCount,
-			)
-			indirectHelperCount = len(helpers)
-			if len(helpers) > 0 {
-				indirectUsed = true
-				if a.indirectProbeSWIM(target.NodeID, target.MeshIP, helpers) {
-					ok = true
-					indirectSucceeded = true
-					a.log.Info("agent.swim", "probe.indirect_ok", "Recovered peer via indirect probes", map[string]any{
-						"target_node_id": target.NodeID,
-						"helpers":        indirectHelperCount,
-					})
-				}
-			}
-		}
-		if indirectUsed && !indirectSucceeded {
-			a.log.Debug("agent.swim", "probe.indirect_miss", "Indirect probes did not recover target", map[string]any{
-				"target_node_id": target.NodeID,
-				"helpers":        indirectHelperCount,
-			})
-		}
-		a.mu.Lock()
-		peer := a.swimPeers[target.NodeID]
-		if peer != nil {
-			stateBefore := strings.ToLower(strings.TrimSpace(peer.State))
-			if ok {
-				peer.State = "healthy"
-				peer.Failures = 0
-				peer.Suspect = false
-				peer.LastSeen = now
-			} else {
-				peer.Failures++
-				if peer.Failures >= a.cfg.SWIMDeadThreshold {
-					peer.State = "dead"
-					peer.Suspect = false
-					peer.CooldownUntil = now.Add(time.Duration(a.cfg.SWIMCooldownSeconds) * time.Second)
-				} else if peer.Failures >= a.cfg.SWIMSuspectThreshold {
-					peer.Suspect = true
-					peer.State = "degraded"
-				} else {
-					peer.State = "degraded"
-				}
-			}
-			stateAfter := strings.ToLower(strings.TrimSpace(peer.State))
-			if stateAfter != "" && stateAfter != stateBefore {
-				peer.LastChanged = now
-			}
-		}
-		a.mu.Unlock()
-	}
+	probe := a.runSWIMProbe(candidates, now)
 
 	peerStates := map[string]map[string]any{}
-	healthy := 0
-	degraded := 0
-	dead := 0
-	unknown := 0
+	peerCounts := map[string]int{"healthy": 0, "degraded": 0, "dead": 0, "unknown": 0}
 	a.mu.Lock()
 	for nodeID, peer := range a.swimPeers {
 		state := strings.ToLower(strings.TrimSpace(peer.State))
@@ -1505,7 +1504,7 @@ func (a *Agent) reconcileSWIM(
 		}
 		// Do not emit control-plane discovered peers before the first direct/indirect probe result.
 		if state == "unknown" && peer.Failures == 0 && peer.LastSeen.IsZero() {
-			unknown++
+			peerCounts["unknown"]++
 			continue
 		}
 		if state == "dead" && !peer.CooldownUntil.IsZero() && now.After(peer.CooldownUntil) {
@@ -1519,16 +1518,11 @@ func (a *Agent) reconcileSWIM(
 			"failures":    peer.Failures,
 			"last_seen":   peer.LastSeen.UTC().Format(time.RFC3339Nano),
 		}
-		switch state {
-		case "healthy":
-			healthy++
-		case "dead":
-			dead++
-		case "unknown":
-			unknown++
-		default:
-			degraded++
+		bucket := state
+		if _, ok := peerCounts[bucket]; !ok {
+			bucket = "degraded"
 		}
+		peerCounts[bucket]++
 	}
 	localState := "healthy"
 	totalLoad := a.loadScores["total"]
@@ -1551,15 +1545,15 @@ func (a *Agent) reconcileSWIM(
 
 	patch["swim_state"] = localState
 	patch["swim_incarnation"] = localIncarnation
-	patch["swim_probe_target"] = probed
-	patch["swim_indirect_used"] = indirectUsed
-	patch["swim_indirect_success"] = indirectSucceeded
-	patch["swim_indirect_helper_count"] = indirectHelperCount
+	patch["swim_probe_target"] = probe.targetNodeID
+	patch["swim_indirect_used"] = probe.indirectUsed
+	patch["swim_indirect_success"] = probe.indirectSucceeded
+	patch["swim_indirect_helper_count"] = probe.indirectHelperCount
 	patch["swim_peer_count"] = len(peerStates)
-	patch["swim_healthy_peers"] = healthy
-	patch["swim_degraded_peers"] = degraded
-	patch["swim_dead_peers"] = dead
-	patch["swim_unknown_peers"] = unknown
+	patch["swim_healthy_peers"] = peerCounts["healthy"]
+	patch["swim_degraded_peers"] = peerCounts["degraded"]
+	patch["swim_dead_peers"] = peerCounts["dead"]
+	patch["swim_unknown_peers"] = peerCounts["unknown"]
 	patch["swim_peers"] = peerStates
 
 	a.reportSWIM(ctx, leaseToken, localIncarnation, localState, peerStates)
@@ -1597,12 +1591,9 @@ func (a *Agent) reportSWIM(
 		resp, doErr := a.client.Do(req)
 		if doErr != nil {
 			if attempt < 3 {
-				select {
-				case <-ctx.Done():
+				if err := waitRetry(ctx, &backoff); err != nil {
 					return
-				case <-time.After(backoff):
 				}
-				backoff *= 2
 				continue
 			}
 			a.log.Warn("agent.swim", "report.error", "Failed to publish SWIM report", map[string]any{
@@ -1613,12 +1604,9 @@ func (a *Agent) reportSWIM(
 		bodyText, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		_ = resp.Body.Close()
 		if resp.StatusCode >= 500 && attempt < 3 {
-			select {
-			case <-ctx.Done():
+			if err := waitRetry(ctx, &backoff); err != nil {
 				return
-			case <-time.After(backoff):
 			}
-			backoff *= 2
 			continue
 		}
 		if resp.StatusCode >= 300 {
@@ -1632,12 +1620,30 @@ func (a *Agent) reportSWIM(
 	}
 }
 
+func internalCDNDegraded(errText string) map[string]any {
+	return map[string]any{
+		"internal_cdn_state": "degraded",
+		"internal_cdn_error": errText,
+	}
+}
+
+func internalCDNHealthy(version string, hash string, sizeBytes int, path string, unchanged bool) map[string]any {
+	patch := map[string]any{
+		"internal_cdn_state":      "healthy",
+		"internal_cdn_version":    version,
+		"internal_cdn_hash":       hash,
+		"internal_cdn_size_bytes": sizeBytes,
+		"internal_cdn_path":       path,
+	}
+	if unchanged {
+		patch["internal_cdn_unchanged"] = true
+	}
+	return patch
+}
+
 func (a *Agent) syncInternalCDN(ctx context.Context, leaseToken string) map[string]any {
-	patch := map[string]any{}
 	if strings.TrimSpace(leaseToken) == "" {
-		patch["internal_cdn_state"] = "degraded"
-		patch["internal_cdn_error"] = "lease token is empty"
-		return patch
+		return internalCDNDegraded("lease token is empty")
 	}
 	a.mu.RLock()
 	knownHash := strings.TrimSpace(a.internalCDNHash)
@@ -1663,28 +1669,20 @@ func (a *Agent) syncInternalCDN(ctx context.Context, leaseToken string) map[stri
 	}
 	resp, err := a.doGETWithRetry(ctx, u, 3, leaseToken)
 	if err != nil {
-		patch["internal_cdn_state"] = "degraded"
-		patch["internal_cdn_error"] = err.Error()
-		return patch
+		return internalCDNDegraded(err.Error())
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		patch["internal_cdn_state"] = "degraded"
-		patch["internal_cdn_error"] = fmt.Sprintf("http_%d:%s", resp.StatusCode, strings.TrimSpace(string(body)))
-		return patch
+		return internalCDNDegraded(fmt.Sprintf("http_%d:%s", resp.StatusCode, strings.TrimSpace(string(body))))
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
-		patch["internal_cdn_state"] = "degraded"
-		patch["internal_cdn_error"] = err.Error()
-		return patch
+		return internalCDNDegraded(err.Error())
 	}
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
-		patch["internal_cdn_state"] = "degraded"
-		patch["internal_cdn_error"] = err.Error()
-		return patch
+		return internalCDNDegraded(err.Error())
 	}
 	version := strings.TrimSpace(fmt.Sprintf("%v", payload["version"]))
 	hashSHA := strings.TrimSpace(fmt.Sprintf("%v", payload["hash_sha256"]))
@@ -1692,42 +1690,26 @@ func (a *Agent) syncInternalCDN(ctx context.Context, leaseToken string) map[stri
 	sizeBytes, _ := payload["size_bytes"].(float64)
 	if hashSHA != "" && hashSHA == knownHash {
 		if _, statErr := os.Stat(indexPath); statErr == nil {
-			patch["internal_cdn_state"] = "healthy"
-			patch["internal_cdn_version"] = firstNonEmpty(version, a.internalCDNVersion)
-			patch["internal_cdn_hash"] = hashSHA
-			patch["internal_cdn_size_bytes"] = int(sizeBytes)
-			patch["internal_cdn_path"] = indexPath
-			patch["internal_cdn_unchanged"] = true
-			return patch
+			return internalCDNHealthy(firstNonEmpty(version, a.internalCDNVersion), hashSHA, int(sizeBytes), indexPath, true)
 		}
 	}
 	if bodyBase64 == "" {
-		patch["internal_cdn_state"] = "degraded"
-		patch["internal_cdn_error"] = "missing_content_payload"
-		return patch
+		return internalCDNDegraded("missing_content_payload")
 	}
 	raw, err := base64.StdEncoding.DecodeString(bodyBase64)
 	if err != nil {
-		patch["internal_cdn_state"] = "degraded"
-		patch["internal_cdn_error"] = "invalid_base64_content"
-		return patch
+		return internalCDNDegraded("invalid_base64_content")
 	}
 	sum := sha256.Sum256(raw)
 	computed := fmt.Sprintf("%x", sum[:])
 	if hashSHA != "" && hashSHA != computed {
-		patch["internal_cdn_state"] = "degraded"
-		patch["internal_cdn_error"] = "hash_mismatch"
-		return patch
+		return internalCDNDegraded("hash_mismatch")
 	}
 	if err := os.MkdirAll(targetDir, 0o755); err != nil {
-		patch["internal_cdn_state"] = "degraded"
-		patch["internal_cdn_error"] = err.Error()
-		return patch
+		return internalCDNDegraded(err.Error())
 	}
 	if err := writeFileAtomic(indexPath, raw, 0o644); err != nil {
-		patch["internal_cdn_state"] = "degraded"
-		patch["internal_cdn_error"] = err.Error()
-		return patch
+		return internalCDNDegraded(err.Error())
 	}
 
 	a.mu.Lock()
@@ -1735,12 +1717,7 @@ func (a *Agent) syncInternalCDN(ctx context.Context, leaseToken string) map[stri
 	a.internalCDNHash = computed
 	a.mu.Unlock()
 
-	patch["internal_cdn_state"] = "healthy"
-	patch["internal_cdn_version"] = version
-	patch["internal_cdn_hash"] = computed
-	patch["internal_cdn_size_bytes"] = len(raw)
-	patch["internal_cdn_path"] = indexPath
-	return patch
+	return internalCDNHealthy(version, computed, len(raw), indexPath, false)
 }
 
 func clamp01(value float64) float64 {
@@ -1758,6 +1735,32 @@ func normalizeRange(value float64, good float64, bad float64) float64 {
 		return 0
 	}
 	return clamp01((value - good) / (bad - good))
+}
+
+func weightedLoadScore(components ...loadComponent) float64 {
+	peak := 0.0
+	weighted := 0.0
+	for _, component := range components {
+		normalized := normalizeRange(component.value, component.good, component.bad)
+		if normalized > peak {
+			peak = normalized
+		}
+		weighted += component.weight * normalized
+	}
+	return round1(100 * max4(peak, weighted, 0, 0))
+}
+
+func totalLoadScore(scores ...float64) float64 {
+	mx := 0.0
+	product := 1.0
+	for _, score := range scores {
+		if score > mx {
+			mx = score
+		}
+		product *= (1 - clamp01(score/100))
+	}
+	union := 100 * (1 - product)
+	return round1(max4(mx, 0.70*mx+0.30*union, 0, 0))
 }
 
 func round1(value float64) float64 {
@@ -2247,12 +2250,11 @@ func computeLoadScores(prev *loadSnapshot, curr *loadSnapshot) map[string]float6
 			throttlePct = (throttledDelta / usageDelta) * 100
 		}
 	}
-	cpuU := normalizeRange(cpuUtilPct, 55, 95)
-	cpuQ := normalizeRange(runQPerCore, 0.5, 2.0)
-	cpuT := normalizeRange(throttlePct, 1, 20)
-	cpuPeak := max4(cpuU, cpuQ, cpuT, 0)
-	cpuWeighted := 0.55*cpuU + 0.30*cpuQ + 0.15*cpuT
-	cpuScore := round1(100 * max4(cpuPeak, cpuWeighted, 0, 0))
+	cpuScore := weightedLoadScore(
+		loadComponent{value: cpuUtilPct, good: 55, bad: 95, weight: 0.55},
+		loadComponent{value: runQPerCore, good: 0.5, bad: 2.0, weight: 0.30},
+		loadComponent{value: throttlePct, good: 1, bad: 20, weight: 0.15},
+	)
 
 	// RAM components: memory pressure, swap usage, major fault rate.
 	memUsedPct := 0.0
@@ -2267,12 +2269,11 @@ func computeLoadScores(prev *loadSnapshot, curr *loadSnapshot) map[string]float6
 	if prev != nil && elapsedSeconds > 0 && curr.majorFaults >= prev.majorFaults {
 		majorFaultRate = float64(curr.majorFaults-prev.majorFaults) / elapsedSeconds
 	}
-	ramM := normalizeRange(memUsedPct, 65, 95)
-	ramS := normalizeRange(swapUsedPct, 5, 40)
-	ramF := normalizeRange(majorFaultRate, 50, 500)
-	ramPeak := max4(ramM, ramS, ramF, 0)
-	ramWeighted := 0.70*ramM + 0.20*ramS + 0.10*ramF
-	ramScore := round1(100 * max4(ramPeak, ramWeighted, 0, 0))
+	ramScore := weightedLoadScore(
+		loadComponent{value: memUsedPct, good: 65, bad: 95, weight: 0.70},
+		loadComponent{value: swapUsedPct, good: 5, bad: 40, weight: 0.20},
+		loadComponent{value: majorFaultRate, good: 50, bad: 500, weight: 0.10},
+	)
 
 	// Disk components: filesystem usage, device busy %, latency proxy.
 	diskBusyPct := 0.0
@@ -2291,12 +2292,11 @@ func computeLoadScores(prev *loadSnapshot, curr *loadSnapshot) map[string]float6
 			awaitMs = busyDeltaMS / opsDelta
 		}
 	}
-	diskD := normalizeRange(curr.diskUsedPct, 70, 95)
-	diskB := normalizeRange(diskBusyPct, 60, 95)
-	diskA := normalizeRange(awaitMs, 10, 80)
-	diskPeak := max4(diskD, diskB, diskA, 0)
-	diskWeighted := 0.45*diskD + 0.35*diskB + 0.20*diskA
-	diskScore := round1(100 * max4(diskPeak, diskWeighted, 0, 0))
+	diskScore := weightedLoadScore(
+		loadComponent{value: curr.diskUsedPct, good: 70, bad: 95, weight: 0.45},
+		loadComponent{value: diskBusyPct, good: 60, bad: 95, weight: 0.35},
+		loadComponent{value: awaitMs, good: 10, bad: 80, weight: 0.20},
+	)
 
 	// Network components: bandwidth utilization, packet error/drop %, RTT.
 	networkUtilPct := 0.0
@@ -2320,25 +2320,14 @@ func computeLoadScores(prev *loadSnapshot, curr *loadSnapshot) map[string]float6
 		}
 	}
 	rttMs := curr.rttMs
-	netU := normalizeRange(networkUtilPct, 60, 95)
-	netL := normalizeRange(networkLossErrPct, 0.1, 2.0)
-	netR := normalizeRange(rttMs, 20, 150)
-	netPeak := max4(netU, netL, netR, 0)
-	netWeighted := 0.50*netU + 0.30*netL + 0.20*netR
-	netScore := round1(100 * max4(netPeak, netWeighted, 0, 0))
+	netScore := weightedLoadScore(
+		loadComponent{value: networkUtilPct, good: 60, bad: 95, weight: 0.50},
+		loadComponent{value: networkLossErrPct, good: 0.1, bad: 2.0, weight: 0.30},
+		loadComponent{value: rttMs, good: 20, bad: 150, weight: 0.20},
+	)
 
 	// TOTAL load aggregation per agreed formula.
-	scoreList := []float64{cpuScore, ramScore, diskScore, netScore}
-	mx := 0.0
-	product := 1.0
-	for _, score := range scoreList {
-		if score > mx {
-			mx = score
-		}
-		product *= (1 - clamp01(score/100))
-	}
-	union := 100 * (1 - product)
-	totalScore := round1(max4(mx, 0.70*mx+0.30*union, 0, 0))
+	totalScore := totalLoadScore(cpuScore, ramScore, diskScore, netScore)
 
 	return map[string]float64{
 		"cpu":   cpuScore,
@@ -2551,15 +2540,8 @@ func (a *Agent) reconcileRoleRuntimes(ctx context.Context) map[string]any {
 	backendEnabled := hasRole(roles, "backend_server")
 	proxyEnabled := hasRole(roles, "reverse_proxy")
 
-	backendPatch := a.reconcileBackendRuntime(ctx, backendEnabled)
-	for key, value := range backendPatch {
-		patch[key] = value
-	}
-
-	proxyPatch := a.reconcileProxyRuntime(ctx, proxyEnabled, backendTargets)
-	for key, value := range proxyPatch {
-		patch[key] = value
-	}
+	mergeStatusPatch(patch, a.reconcileBackendRuntime(ctx, backendEnabled))
+	mergeStatusPatch(patch, a.reconcileProxyRuntime(ctx, proxyEnabled, backendTargets))
 
 	state := "healthy"
 	if fmt.Sprintf("%v", patch["backend_runtime_state"]) == "degraded" || fmt.Sprintf("%v", patch["proxy_runtime_state"]) == "degraded" {
@@ -2569,6 +2551,75 @@ func (a *Agent) reconcileRoleRuntimes(ctx context.Context) map[string]any {
 	patch["role_runtime_backend_enabled"] = backendEnabled
 	patch["role_runtime_proxy_enabled"] = proxyEnabled
 	return patch
+}
+
+func (a *Agent) failRoleRuntime(
+	patch map[string]any,
+	role string,
+	stateKey string,
+	errorKey string,
+	event string,
+	message string,
+	templateHash string,
+	code int,
+	errValue any,
+	fields map[string]any,
+) {
+	patch[stateKey] = "degraded"
+	patch[errorKey] = errValue
+	setRoleActuationStatus(patch, role, false, templateHash, code, fmt.Sprintf("%v", errValue))
+	logFields := map[string]any{
+		"apply_ok":         false,
+		"template_hash":    templateHash,
+		"reload_exit_code": code,
+		"error":            errValue,
+	}
+	for key, value := range fields {
+		logFields[key] = value
+	}
+	a.log.Warn("agent.roles", event, message, logFields)
+}
+
+func (a *Agent) failBackendRuntime(
+	patch map[string]any,
+	templateHash string,
+	code int,
+	errValue any,
+	fields map[string]any,
+) {
+	a.failRoleRuntime(
+		patch,
+		"backend_server",
+		"backend_runtime_state",
+		"backend_runtime_error",
+		"role.backend_server.apply",
+		"Backend role apply failed",
+		templateHash,
+		code,
+		errValue,
+		fields,
+	)
+}
+
+func (a *Agent) failProxyRuntime(
+	patch map[string]any,
+	templateHash string,
+	code int,
+	errValue any,
+	fields map[string]any,
+) {
+	a.failRoleRuntime(
+		patch,
+		"reverse_proxy",
+		"proxy_runtime_state",
+		"proxy_runtime_error",
+		"role.reverse_proxy.apply",
+		"Reverse proxy role apply failed",
+		templateHash,
+		code,
+		errValue,
+		fields,
+	)
 }
 
 func (a *Agent) reconcileBackendRuntime(ctx context.Context, enabled bool) map[string]any {
@@ -2587,16 +2638,7 @@ func (a *Agent) reconcileBackendRuntime(ctx context.Context, enabled bool) map[s
 	}
 	contentRoot := filepath.Join(contentBase, "active")
 	if err := os.MkdirAll(contentRoot, 0o755); err != nil {
-		patch["backend_runtime_state"] = "degraded"
-		patch["backend_runtime_error"] = err.Error()
-		setRoleActuationStatus(patch, "backend_server", false, templateHash, -1, err.Error())
-		a.log.Warn("agent.roles", "role.backend_server.apply", "Backend role apply failed", map[string]any{
-			"apply_ok":         false,
-			"template_hash":    templateHash,
-			"reload_exit_code": -1,
-			"error":            err.Error(),
-			"path":             contentRoot,
-		})
+		a.failBackendRuntime(patch, templateHash, -1, err.Error(), map[string]any{"path": contentRoot})
 		return patch
 	}
 
@@ -2631,16 +2673,7 @@ server {
 	backup, backupErr := os.ReadFile(configPath)
 	hadBackup := backupErr == nil
 	if err := writeFileAtomic(configPath, []byte(config), 0o644); err != nil {
-		patch["backend_runtime_state"] = "degraded"
-		patch["backend_runtime_error"] = err.Error()
-		setRoleActuationStatus(patch, "backend_server", false, templateHash, -1, err.Error())
-		a.log.Warn("agent.roles", "role.backend_server.apply", "Backend role apply failed", map[string]any{
-			"apply_ok":         false,
-			"template_hash":    templateHash,
-			"reload_exit_code": -1,
-			"error":            err.Error(),
-			"path":             configPath,
-		})
+		a.failBackendRuntime(patch, templateHash, -1, err.Error(), map[string]any{"path": configPath})
 		return patch
 	}
 
@@ -2651,44 +2684,15 @@ server {
 		} else {
 			_ = os.Remove(configPath)
 		}
-		patch["backend_runtime_state"] = "degraded"
-		patch["backend_runtime_error"] = firstNonEmpty(errText, out, fmt.Sprintf("exit_%d", code))
-		setRoleActuationStatus(
-			patch,
-			"backend_server",
-			false,
-			templateHash,
-			code,
-			fmt.Sprintf("%v", patch["backend_runtime_error"]),
-		)
-		a.log.Warn("agent.roles", "role.backend_server.apply", "Backend role apply failed", map[string]any{
-			"apply_ok":         false,
-			"template_hash":    templateHash,
-			"reload_exit_code": code,
-			"error":            patch["backend_runtime_error"],
-			"config_path":      configPath,
-		})
+		runtimeError := firstNonEmpty(errText, out, fmt.Sprintf("exit_%d", code))
+		a.failBackendRuntime(patch, templateHash, code, runtimeError, map[string]any{"config_path": configPath})
 		return patch
 	}
 
 	code, out, errText = a.runCommand(ctx, "backend.nginx_enable", "systemctl", "enable", "--now", "nginx")
 	if code != 0 {
-		patch["backend_runtime_state"] = "degraded"
-		patch["backend_runtime_error"] = firstNonEmpty(errText, out, fmt.Sprintf("exit_%d", code))
-		setRoleActuationStatus(
-			patch,
-			"backend_server",
-			false,
-			templateHash,
-			code,
-			fmt.Sprintf("%v", patch["backend_runtime_error"]),
-		)
-		a.log.Warn("agent.roles", "role.backend_server.apply", "Backend role apply failed", map[string]any{
-			"apply_ok":         false,
-			"template_hash":    templateHash,
-			"reload_exit_code": code,
-			"error":            patch["backend_runtime_error"],
-		})
+		runtimeError := firstNonEmpty(errText, out, fmt.Sprintf("exit_%d", code))
+		a.failBackendRuntime(patch, templateHash, code, runtimeError, nil)
 		return patch
 	}
 
@@ -2699,22 +2703,8 @@ server {
 			if hadBackup {
 				_ = writeFileAtomic(configPath, backup, 0o644)
 			}
-			patch["backend_runtime_state"] = "degraded"
-			patch["backend_runtime_error"] = firstNonEmpty(errText, out, fmt.Sprintf("exit_%d", code))
-			setRoleActuationStatus(
-				patch,
-				"backend_server",
-				false,
-				templateHash,
-				code,
-				fmt.Sprintf("%v", patch["backend_runtime_error"]),
-			)
-			a.log.Warn("agent.roles", "role.backend_server.apply", "Backend role apply failed", map[string]any{
-				"apply_ok":         false,
-				"template_hash":    templateHash,
-				"reload_exit_code": code,
-				"error":            patch["backend_runtime_error"],
-			})
+			runtimeError := firstNonEmpty(errText, out, fmt.Sprintf("exit_%d", code))
+			a.failBackendRuntime(patch, templateHash, code, runtimeError, nil)
 			return patch
 		}
 	}
@@ -2750,15 +2740,7 @@ func (a *Agent) reconcileProxyRuntime(ctx context.Context, enabled bool, upstrea
 	}
 	upstreams = dedupeStrings(upstreams)
 	if len(upstreams) == 0 {
-		patch["proxy_runtime_state"] = "degraded"
-		patch["proxy_runtime_error"] = "no_backend_targets"
-		setRoleActuationStatus(patch, "reverse_proxy", false, templateHash, -1, "no_backend_targets")
-		a.log.Warn("agent.roles", "role.reverse_proxy.apply", "Reverse proxy role apply failed", map[string]any{
-			"apply_ok":         false,
-			"template_hash":    templateHash,
-			"reload_exit_code": -1,
-			"error":            "no_backend_targets",
-		})
+		a.failProxyRuntime(patch, templateHash, -1, "no_backend_targets", nil)
 		return patch
 	}
 
@@ -2791,55 +2773,22 @@ func (a *Agent) reconcileProxyRuntime(ctx context.Context, enabled bool, upstrea
 	configBody := []byte(builder.String())
 	candidatePath := configPath + ".candidate"
 	if err := writeFileAtomic(candidatePath, configBody, 0o644); err != nil {
-		patch["proxy_runtime_state"] = "degraded"
-		patch["proxy_runtime_error"] = err.Error()
-		setRoleActuationStatus(patch, "reverse_proxy", false, templateHash, -1, err.Error())
-		a.log.Warn("agent.roles", "role.reverse_proxy.apply", "Reverse proxy role apply failed", map[string]any{
-			"apply_ok":         false,
-			"template_hash":    templateHash,
-			"reload_exit_code": -1,
-			"error":            err.Error(),
-			"path":             configPath,
-		})
+		a.failProxyRuntime(patch, templateHash, -1, err.Error(), map[string]any{"path": configPath})
 		return patch
 	}
 
 	code, out, errText := a.runCommand(ctx, "proxy.caddy_validate", "caddy", "validate", "--config", candidatePath, "--adapter", "caddyfile")
 	if code != 0 {
 		_ = os.Remove(candidatePath)
-		patch["proxy_runtime_state"] = "degraded"
-		patch["proxy_runtime_error"] = firstNonEmpty(errText, out, fmt.Sprintf("exit_%d", code))
-		setRoleActuationStatus(
-			patch,
-			"reverse_proxy",
-			false,
-			templateHash,
-			code,
-			fmt.Sprintf("%v", patch["proxy_runtime_error"]),
-		)
-		a.log.Warn("agent.roles", "role.reverse_proxy.apply", "Reverse proxy role apply failed", map[string]any{
-			"apply_ok":         false,
-			"template_hash":    templateHash,
-			"reload_exit_code": code,
-			"error":            patch["proxy_runtime_error"],
-			"config_path":      configPath,
-		})
+		runtimeError := firstNonEmpty(errText, out, fmt.Sprintf("exit_%d", code))
+		a.failProxyRuntime(patch, templateHash, code, runtimeError, map[string]any{"config_path": configPath})
 		return patch
 	}
 	backup, backupErr := os.ReadFile(configPath)
 	hadBackup := backupErr == nil
 	if err := writeFileAtomic(configPath, configBody, 0o644); err != nil {
 		_ = os.Remove(candidatePath)
-		patch["proxy_runtime_state"] = "degraded"
-		patch["proxy_runtime_error"] = err.Error()
-		setRoleActuationStatus(patch, "reverse_proxy", false, templateHash, -1, err.Error())
-		a.log.Warn("agent.roles", "role.reverse_proxy.apply", "Reverse proxy role apply failed", map[string]any{
-			"apply_ok":         false,
-			"template_hash":    templateHash,
-			"reload_exit_code": -1,
-			"error":            err.Error(),
-			"path":             configPath,
-		})
+		a.failProxyRuntime(patch, templateHash, -1, err.Error(), map[string]any{"path": configPath})
 		return patch
 	}
 	_ = os.Remove(candidatePath)
@@ -2849,22 +2798,8 @@ func (a *Agent) reconcileProxyRuntime(ctx context.Context, enabled bool, upstrea
 		if hadBackup {
 			_ = writeFileAtomic(configPath, backup, 0o644)
 		}
-		patch["proxy_runtime_state"] = "degraded"
-		patch["proxy_runtime_error"] = firstNonEmpty(errText, out, fmt.Sprintf("exit_%d", code))
-		setRoleActuationStatus(
-			patch,
-			"reverse_proxy",
-			false,
-			templateHash,
-			code,
-			fmt.Sprintf("%v", patch["proxy_runtime_error"]),
-		)
-		a.log.Warn("agent.roles", "role.reverse_proxy.apply", "Reverse proxy role apply failed", map[string]any{
-			"apply_ok":         false,
-			"template_hash":    templateHash,
-			"reload_exit_code": code,
-			"error":            patch["proxy_runtime_error"],
-		})
+		runtimeError := firstNonEmpty(errText, out, fmt.Sprintf("exit_%d", code))
+		a.failProxyRuntime(patch, templateHash, code, runtimeError, nil)
 		return patch
 	}
 
@@ -2875,22 +2810,8 @@ func (a *Agent) reconcileProxyRuntime(ctx context.Context, enabled bool, upstrea
 			if hadBackup {
 				_ = writeFileAtomic(configPath, backup, 0o644)
 			}
-			patch["proxy_runtime_state"] = "degraded"
-			patch["proxy_runtime_error"] = firstNonEmpty(errText, out, fmt.Sprintf("exit_%d", code))
-			setRoleActuationStatus(
-				patch,
-				"reverse_proxy",
-				false,
-				templateHash,
-				code,
-				fmt.Sprintf("%v", patch["proxy_runtime_error"]),
-			)
-			a.log.Warn("agent.roles", "role.reverse_proxy.apply", "Reverse proxy role apply failed", map[string]any{
-				"apply_ok":         false,
-				"template_hash":    templateHash,
-				"reload_exit_code": code,
-				"error":            patch["proxy_runtime_error"],
-			})
+			runtimeError := firstNonEmpty(errText, out, fmt.Sprintf("exit_%d", code))
+			a.failProxyRuntime(patch, templateHash, code, runtimeError, nil)
 			return patch
 		}
 	}
@@ -3011,6 +2932,35 @@ func levelSymbol(levelName string) string {
 	}
 }
 
+func mergeStatusPatch(dst, src map[string]any) {
+	for key, value := range src {
+		dst[key] = value
+	}
+}
+
+func (a *Agent) rememberStatusPatch(statusPatch map[string]any) {
+	a.mu.Lock()
+	a.lastStatusPatch = map[string]any{}
+	for key, value := range statusPatch {
+		a.lastStatusPatch[key] = value
+	}
+	a.mu.Unlock()
+}
+
+func (a *Agent) finishTick(start time.Time, err error) string {
+	a.mu.Lock()
+	a.lastTickAt = time.Now().UTC()
+	a.lastTickDurationMs = time.Since(start).Milliseconds()
+	if err != nil {
+		a.lastTickError = err.Error()
+	} else {
+		a.lastTickError = ""
+	}
+	activeIface := a.state.ActiveIface
+	a.mu.Unlock()
+	return activeIface
+}
+
 func (a *Agent) tick(ctx context.Context) error {
 	start := time.Now()
 	a.mu.RLock()
@@ -3056,77 +3006,37 @@ func (a *Agent) tick(ctx context.Context) error {
 		}
 	}
 
-	loadPatch := a.reconcileLoadScores()
-	for k, v := range loadPatch {
-		statusPatch[k] = v
-	}
+	mergeStatusPatch(statusPatch, a.reconcileLoadScores())
 
 	if a.cfg.EnableWireGuard {
-		wgPatch := a.reconcileWireGuard(ctx)
-		for k, v := range wgPatch {
-			statusPatch[k] = v
-		}
+		mergeStatusPatch(statusPatch, a.reconcileWireGuard(ctx))
 	} else {
 		a.log.Info("agent.wireguard", "reconcile.skip", "WireGuard reconcile disabled", nil)
 	}
 	if a.cfg.SWIMEnabled {
-		swimPatch := a.reconcileSWIM(ctx, leaseToken, peersRaw, peersErr)
-		for k, v := range swimPatch {
-			statusPatch[k] = v
-		}
+		mergeStatusPatch(statusPatch, a.reconcileSWIM(ctx, leaseToken, peersRaw, peersErr))
 	}
-	rolePatch := a.syncRoleAssignment(ctx, leaseToken, peersFetched, peersRaw, peersErr)
-	for k, v := range rolePatch {
-		statusPatch[k] = v
-	}
-	cdnPatch := a.syncInternalCDN(ctx, leaseToken)
-	for k, v := range cdnPatch {
-		statusPatch[k] = v
-	}
-	roleRuntimePatch := a.reconcileRoleRuntimes(ctx)
-	for k, v := range roleRuntimePatch {
-		statusPatch[k] = v
-	}
-	a.mu.Lock()
-	a.lastStatusPatch = map[string]any{}
-	for key, value := range statusPatch {
-		a.lastStatusPatch[key] = value
-	}
-	a.mu.Unlock()
+	mergeStatusPatch(statusPatch, a.syncRoleAssignment(ctx, leaseToken, peersFetched, peersRaw, peersErr))
+	mergeStatusPatch(statusPatch, a.syncInternalCDN(ctx, leaseToken))
+	mergeStatusPatch(statusPatch, a.reconcileRoleRuntimes(ctx))
+	a.rememberStatusPatch(statusPatch)
 
 	if leaseErr != nil {
-		a.mu.Lock()
-		a.lastTickAt = time.Now().UTC()
-		a.lastTickDurationMs = time.Since(start).Milliseconds()
-		a.lastTickError = leaseErr.Error()
-		a.mu.Unlock()
+		a.finishTick(start, leaseErr)
 		return leaseErr
 	}
 	if privateKeyErr != nil {
-		a.mu.Lock()
-		a.lastTickAt = time.Now().UTC()
-		a.lastTickDurationMs = time.Since(start).Milliseconds()
-		a.lastTickError = privateKeyErr.Error()
-		a.mu.Unlock()
+		a.finishTick(start, privateKeyErr)
 		return privateKeyErr
 	}
 	if err := a.sendHeartbeat(ctx, leaseToken, privateKey, statusPatch); err != nil {
-		a.mu.Lock()
-		a.lastTickAt = time.Now().UTC()
-		a.lastTickDurationMs = time.Since(start).Milliseconds()
-		a.lastTickError = err.Error()
-		a.mu.Unlock()
+		a.finishTick(start, err)
 		a.log.Error("agent.heartbeat", "publish.fail", "Heartbeat publish failed", map[string]any{
 			"error": err.Error(),
 		})
 		return err
 	}
-	a.mu.Lock()
-	a.lastTickAt = time.Now().UTC()
-	a.lastTickDurationMs = time.Since(start).Milliseconds()
-	a.lastTickError = ""
-	activeIface = a.state.ActiveIface
-	a.mu.Unlock()
+	activeIface = a.finishTick(start, nil)
 
 	a.log.Info("agent.loop", "tick.complete", "Completed loop tick", map[string]any{
 		"duration_ms":  time.Since(start).Milliseconds(),
@@ -3135,117 +3045,147 @@ func (a *Agent) tick(ctx context.Context) error {
 	return nil
 }
 
+func wireGuardTunnel(
+	label string,
+	iface string,
+	listenPort int,
+	routerIP string,
+	localAddress string,
+	peer wgPeerIntent,
+) wgTunnelStatus {
+	peerConfigured := strings.TrimSpace(peer.publicKey) != ""
+	return wgTunnelStatus{
+		label:          label,
+		iface:          iface,
+		listenPort:     listenPort,
+		routerIP:       routerIP,
+		peer:           peer,
+		peerConfigured: peerConfigured,
+		configured:     peerConfigured || strings.TrimSpace(localAddress) != "",
+	}
+}
+
+func (a *Agent) observeWireGuardTunnel(
+	ctx context.Context,
+	tunnel wgTunnelStatus,
+	localAddress string,
+) wgTunnelStatus {
+	if !tunnel.configured {
+		return tunnel
+	}
+	if err := a.ensureWireGuardInterface(
+		ctx,
+		tunnel.iface,
+		tunnel.listenPort,
+		localAddress,
+		tunnel.peer,
+	); err != nil {
+		a.log.Warn("agent.wireguard", "interface."+tunnel.label+"_error", "Failed to reconcile "+tunnel.label+" WireGuard interface", map[string]any{
+			"iface": tunnel.iface,
+			"error": err.Error(),
+		})
+	}
+	tunnel.publicKey = a.wireGuardPublicKey(ctx, tunnel.iface)
+	tunnel.up = a.interfaceUp(ctx, tunnel.iface)
+	tunnel.healthy = tunnel.up
+	if tunnel.healthy && strings.TrimSpace(tunnel.routerIP) != "" {
+		tunnel.healthy = a.pingRouter(ctx, tunnel.iface, tunnel.routerIP)
+	}
+	return tunnel
+}
+
+func trackWireGuardHealth(healthy bool, failures *int, successes *int) {
+	if healthy {
+		*failures = 0
+		*successes++
+		return
+	}
+	*failures++
+	*successes = 0
+}
+
+func (a *Agent) resetUnconfiguredWireGuard() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if strings.TrimSpace(a.state.ActiveIface) == "" {
+		a.state.ActiveIface = a.cfg.PrimaryIface
+	}
+	a.state.PrimaryFailures = 0
+	a.state.PrimarySuccesses = 0
+	a.state.SecondaryFailures = 0
+	a.state.SecondarySuccesses = 0
+	return a.state.ActiveIface
+}
+
+func wireGuardFailoverState(activeIface string, secondaryIface string) string {
+	if activeIface == secondaryIface {
+		return "failover_secondary"
+	}
+	return "primary"
+}
+
+func wireGuardStatusPatch(
+	primary wgTunnelStatus,
+	secondary wgTunnelStatus,
+	activeIface string,
+	failoverState string,
+) map[string]any {
+	return map[string]any{
+		"wg_primary_tunnel":             upDown(primary.up),
+		"wg_secondary_tunnel":           upDown(secondary.up),
+		"wg_primary_health":             primary.healthy,
+		"wg_secondary_health":           secondary.healthy,
+		"wg_primary_router_reachable":   primary.healthy,
+		"wg_secondary_router_reachable": secondary.healthy,
+		"wg_active_route":               activeIface,
+		"wg_failover_state":             failoverState,
+		"wg_primary_public_key":         primary.publicKey,
+		"wg_secondary_public_key":       secondary.publicKey,
+		"wg_public_key":                 firstNonEmpty(primary.publicKey, secondary.publicKey),
+		"wg_primary_peer_endpoint":      primary.peer.endpoint,
+		"wg_secondary_peer_endpoint":    secondary.peer.endpoint,
+		"wg_primary_peer_configured":    primary.peerConfigured,
+		"wg_secondary_peer_configured":  secondary.peerConfigured,
+	}
+}
+
 func (a *Agent) reconcileWireGuard(ctx context.Context) map[string]any {
 	primaryPeer, secondaryPeer := a.peerIntents()
 	localAddress := normalizeAddress(a.cfg.WGLocalAddress)
-	primaryPeerConfigured := strings.TrimSpace(primaryPeer.publicKey) != ""
-	secondaryPeerConfigured := strings.TrimSpace(secondaryPeer.publicKey) != ""
-	primaryIfaceConfigured := primaryPeerConfigured || strings.TrimSpace(localAddress) != ""
-	secondaryIfaceConfigured := secondaryPeerConfigured || strings.TrimSpace(localAddress) != ""
-	primaryPublicKey := ""
-	secondaryPublicKey := ""
+	primary := wireGuardTunnel(
+		"primary",
+		a.cfg.PrimaryIface,
+		a.cfg.PrimaryListenPort,
+		a.cfg.PrimaryRouterIP,
+		localAddress,
+		primaryPeer,
+	)
+	secondary := wireGuardTunnel(
+		"secondary",
+		a.cfg.SecondaryIface,
+		a.cfg.SecondaryListenPort,
+		a.cfg.SecondaryRouterIP,
+		localAddress,
+		secondaryPeer,
+	)
 
-	if !primaryIfaceConfigured && !secondaryIfaceConfigured {
-		a.mu.Lock()
-		if strings.TrimSpace(a.state.ActiveIface) == "" {
-			a.state.ActiveIface = a.cfg.PrimaryIface
-		}
-		activeIface := a.state.ActiveIface
-		a.state.PrimaryFailures = 0
-		a.state.PrimarySuccesses = 0
-		a.state.SecondaryFailures = 0
-		a.state.SecondarySuccesses = 0
-		a.mu.Unlock()
-
+	if !primary.configured && !secondary.configured {
+		activeIface := a.resetUnconfiguredWireGuard()
 		a.log.Info("agent.wireguard", "reconcile.skip_unconfigured", "Skipped WireGuard reconcile (no peer public keys configured)", map[string]any{
 			"primary_iface":           a.cfg.PrimaryIface,
 			"secondary_iface":         a.cfg.SecondaryIface,
-			"primary_peer_endpoint":   primaryPeer.endpoint,
-			"secondary_peer_endpoint": secondaryPeer.endpoint,
+			"primary_peer_endpoint":   primary.peer.endpoint,
+			"secondary_peer_endpoint": secondary.peer.endpoint,
 		})
-		return map[string]any{
-			"wg_primary_tunnel":             "down",
-			"wg_secondary_tunnel":           "down",
-			"wg_primary_health":             false,
-			"wg_secondary_health":           false,
-			"wg_primary_router_reachable":   false,
-			"wg_secondary_router_reachable": false,
-			"wg_active_route":               activeIface,
-			"wg_failover_state":             "unconfigured",
-			"wg_primary_public_key":         "",
-			"wg_secondary_public_key":       "",
-			"wg_public_key":                 "",
-			"wg_primary_peer_endpoint":      primaryPeer.endpoint,
-			"wg_secondary_peer_endpoint":    secondaryPeer.endpoint,
-			"wg_primary_peer_configured":    false,
-			"wg_secondary_peer_configured":  false,
-		}
+		return wireGuardStatusPatch(primary, secondary, activeIface, "unconfigured")
 	}
 
-	if primaryIfaceConfigured {
-		if err := a.ensureWireGuardInterface(
-			ctx,
-			a.cfg.PrimaryIface,
-			a.cfg.PrimaryListenPort,
-			localAddress,
-			primaryPeer,
-		); err != nil {
-			a.log.Warn("agent.wireguard", "interface.primary_error", "Failed to reconcile primary WireGuard interface", map[string]any{
-				"iface": a.cfg.PrimaryIface,
-				"error": err.Error(),
-			})
-		}
-	}
-	if secondaryIfaceConfigured {
-		if err := a.ensureWireGuardInterface(
-			ctx,
-			a.cfg.SecondaryIface,
-			a.cfg.SecondaryListenPort,
-			localAddress,
-			secondaryPeer,
-		); err != nil {
-			a.log.Warn("agent.wireguard", "interface.secondary_error", "Failed to reconcile secondary WireGuard interface", map[string]any{
-				"iface": a.cfg.SecondaryIface,
-				"error": err.Error(),
-			})
-		}
-	}
-
-	if primaryIfaceConfigured {
-		primaryPublicKey = a.wireGuardPublicKey(ctx, a.cfg.PrimaryIface)
-	}
-	if secondaryIfaceConfigured {
-		secondaryPublicKey = a.wireGuardPublicKey(ctx, a.cfg.SecondaryIface)
-	}
-
-	primaryUp := primaryIfaceConfigured && a.interfaceUp(ctx, a.cfg.PrimaryIface)
-	secondaryUp := secondaryIfaceConfigured && a.interfaceUp(ctx, a.cfg.SecondaryIface)
-
-	primaryHealthy := primaryUp
-	secondaryHealthy := secondaryUp
-
-	if primaryHealthy && strings.TrimSpace(a.cfg.PrimaryRouterIP) != "" {
-		primaryHealthy = a.pingRouter(ctx, a.cfg.PrimaryIface, a.cfg.PrimaryRouterIP)
-	}
-	if secondaryHealthy && strings.TrimSpace(a.cfg.SecondaryRouterIP) != "" {
-		secondaryHealthy = a.pingRouter(ctx, a.cfg.SecondaryIface, a.cfg.SecondaryRouterIP)
-	}
+	primary = a.observeWireGuardTunnel(ctx, primary, localAddress)
+	secondary = a.observeWireGuardTunnel(ctx, secondary, localAddress)
 
 	a.mu.Lock()
-	if primaryHealthy {
-		a.state.PrimaryFailures = 0
-		a.state.PrimarySuccesses++
-	} else {
-		a.state.PrimaryFailures++
-		a.state.PrimarySuccesses = 0
-	}
-	if secondaryHealthy {
-		a.state.SecondaryFailures = 0
-		a.state.SecondarySuccesses++
-	} else {
-		a.state.SecondaryFailures++
-		a.state.SecondarySuccesses = 0
-	}
+	trackWireGuardHealth(primary.healthy, &a.state.PrimaryFailures, &a.state.PrimarySuccesses)
+	trackWireGuardHealth(secondary.healthy, &a.state.SecondaryFailures, &a.state.SecondarySuccesses)
 
 	activeBefore := a.state.ActiveIface
 	activeAfter := activeBefore
@@ -3254,7 +3194,7 @@ func (a *Agent) reconcileWireGuard(ctx context.Context) map[string]any {
 
 	switch activeBefore {
 	case a.cfg.PrimaryIface:
-		if !primaryHealthy && secondaryHealthy && a.state.PrimaryFailures >= a.cfg.FailoverThreshold {
+		if !primary.healthy && secondary.healthy && a.state.PrimaryFailures >= a.cfg.FailoverThreshold {
 			activeAfter = a.cfg.SecondaryIface
 			failoverEvent = "failover.engage"
 			eventFields = map[string]any{
@@ -3264,14 +3204,14 @@ func (a *Agent) reconcileWireGuard(ctx context.Context) map[string]any {
 			}
 		}
 	case a.cfg.SecondaryIface:
-		if !secondaryHealthy && primaryHealthy {
+		if !secondary.healthy && primary.healthy {
 			activeAfter = a.cfg.PrimaryIface
 			failoverEvent = "failover.recover"
 			eventFields = map[string]any{
 				"from": a.cfg.SecondaryIface,
 				"to":   a.cfg.PrimaryIface,
 			}
-		} else if a.cfg.FailbackEnabled && primaryHealthy && a.state.PrimarySuccesses >= a.cfg.FailbackStableCount {
+		} else if a.cfg.FailbackEnabled && primary.healthy && a.state.PrimarySuccesses >= a.cfg.FailbackStableCount {
 			activeAfter = a.cfg.PrimaryIface
 			failoverEvent = "failback.engage"
 			eventFields = map[string]any{
@@ -3289,7 +3229,7 @@ func (a *Agent) reconcileWireGuard(ctx context.Context) map[string]any {
 	secondarySuccesses := a.state.SecondarySuccesses
 	a.mu.Unlock()
 
-	if activeAfter != activeBefore && (primaryIfaceConfigured || secondaryIfaceConfigured) {
+	if activeAfter != activeBefore && (primary.configured || secondary.configured) {
 		switch failoverEvent {
 		case "failover.engage":
 			a.log.Warn("agent.wireguard", failoverEvent, "Switched active route to secondary", eventFields)
@@ -3299,37 +3239,17 @@ func (a *Agent) reconcileWireGuard(ctx context.Context) map[string]any {
 			a.log.Info("agent.wireguard", failoverEvent, "Switched back to primary route", eventFields)
 		}
 	}
-	if primaryIfaceConfigured || secondaryIfaceConfigured {
+	if primary.configured || secondary.configured {
 		a.applyRouteMetrics(ctx, activeAfter)
 	}
 
-	failoverState := "primary"
-	if activeAfter == a.cfg.SecondaryIface {
-		failoverState = "failover_secondary"
-	}
-
-	patch := map[string]any{
-		"wg_primary_tunnel":             upDown(primaryUp),
-		"wg_secondary_tunnel":           upDown(secondaryUp),
-		"wg_primary_health":             primaryHealthy,
-		"wg_secondary_health":           secondaryHealthy,
-		"wg_primary_router_reachable":   primaryHealthy,
-		"wg_secondary_router_reachable": secondaryHealthy,
-		"wg_active_route":               activeAfter,
-		"wg_failover_state":             failoverState,
-		"wg_primary_public_key":         primaryPublicKey,
-		"wg_secondary_public_key":       secondaryPublicKey,
-		"wg_public_key":                 firstNonEmpty(primaryPublicKey, secondaryPublicKey),
-		"wg_primary_peer_endpoint":      primaryPeer.endpoint,
-		"wg_secondary_peer_endpoint":    secondaryPeer.endpoint,
-		"wg_primary_peer_configured":    primaryPeerConfigured,
-		"wg_secondary_peer_configured":  secondaryPeerConfigured,
-	}
+	failoverState := wireGuardFailoverState(activeAfter, a.cfg.SecondaryIface)
+	patch := wireGuardStatusPatch(primary, secondary, activeAfter, failoverState)
 	a.log.Info("agent.wireguard", "reconcile.status", "Reconciled WireGuard status", map[string]any{
-		"primary_up":          primaryUp,
-		"secondary_up":        secondaryUp,
-		"primary_healthy":     primaryHealthy,
-		"secondary_healthy":   secondaryHealthy,
+		"primary_up":          primary.up,
+		"secondary_up":        secondary.up,
+		"primary_healthy":     primary.healthy,
+		"secondary_healthy":   secondary.healthy,
 		"active_iface":        activeAfter,
 		"failover_state":      failoverState,
 		"primary_failures":    primaryFailures,
@@ -3661,6 +3581,19 @@ func (a *Agent) runCommandWithTimeout(ctx context.Context, timeout time.Duration
 	return 0, out, errText
 }
 
+func (a *Agent) setHeartbeatError(errText string) {
+	a.mu.Lock()
+	a.lastHeartbeatError = errText
+	a.mu.Unlock()
+}
+
+func (a *Agent) markHeartbeatPublished() {
+	a.mu.Lock()
+	a.lastHeartbeatAt = time.Now().UTC()
+	a.lastHeartbeatError = ""
+	a.mu.Unlock()
+}
+
 func (a *Agent) sendHeartbeat(
 	ctx context.Context,
 	leaseToken string,
@@ -3668,9 +3601,7 @@ func (a *Agent) sendHeartbeat(
 	statusPatch map[string]any,
 ) error {
 	if leaseToken == "" {
-		a.mu.Lock()
-		a.lastHeartbeatError = "lease token is empty"
-		a.mu.Unlock()
+		a.setHeartbeatError("lease token is empty")
 		return errors.New("lease token is empty")
 	}
 
@@ -3681,16 +3612,12 @@ func (a *Agent) sendHeartbeat(
 		signedAt := time.Now().Unix()
 		message, err := heartbeatSigningMessage(a.cfg.NodeID, leaseToken, signedAt, a.cfg.HeartbeatTTLSeconds, statusPatch)
 		if err != nil {
-			a.mu.Lock()
-			a.lastHeartbeatError = err.Error()
-			a.mu.Unlock()
+			a.setHeartbeatError(err.Error())
 			return fmt.Errorf("build message: %w", err)
 		}
 		signature, err := signMessage(privateKey, message)
 		if err != nil {
-			a.mu.Lock()
-			a.lastHeartbeatError = err.Error()
-			a.mu.Unlock()
+			a.setHeartbeatError(err.Error())
 			return fmt.Errorf("sign message: %w", err)
 		}
 
@@ -3704,17 +3631,13 @@ func (a *Agent) sendHeartbeat(
 		}
 		body, err := json.Marshal(bodyMap)
 		if err != nil {
-			a.mu.Lock()
-			a.lastHeartbeatError = err.Error()
-			a.mu.Unlock()
+			a.setHeartbeatError(err.Error())
 			return err
 		}
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 		if err != nil {
-			a.mu.Lock()
-			a.lastHeartbeatError = err.Error()
-			a.mu.Unlock()
+			a.setHeartbeatError(err.Error())
 			return err
 		}
 		req.Header.Set("Content-Type", "application/json")
@@ -3724,17 +3647,12 @@ func (a *Agent) sendHeartbeat(
 		if err != nil {
 			lastErr = err
 			if attempt < 3 {
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-time.After(backoff):
+				if err := waitRetry(ctx, &backoff); err != nil {
+					return err
 				}
-				backoff *= 2
 				continue
 			}
-			a.mu.Lock()
-			a.lastHeartbeatError = err.Error()
-			a.mu.Unlock()
+			a.setHeartbeatError(err.Error())
 			return err
 		}
 
@@ -3743,24 +3661,16 @@ func (a *Agent) sendHeartbeat(
 		latencyMs := time.Since(start).Milliseconds()
 		if resp.StatusCode >= 500 && attempt < 3 {
 			lastErr = fmt.Errorf("heartbeat http %d", resp.StatusCode)
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(backoff):
+			if err := waitRetry(ctx, &backoff); err != nil {
+				return err
 			}
-			backoff *= 2
 			continue
 		}
 		if resp.StatusCode >= 300 {
-			a.mu.Lock()
-			a.lastHeartbeatError = fmt.Sprintf("heartbeat http %d", resp.StatusCode)
-			a.mu.Unlock()
+			a.setHeartbeatError(fmt.Sprintf("heartbeat http %d", resp.StatusCode))
 			return fmt.Errorf("heartbeat http %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
 		}
-		a.mu.Lock()
-		a.lastHeartbeatAt = time.Now().UTC()
-		a.lastHeartbeatError = ""
-		a.mu.Unlock()
+		a.markHeartbeatPublished()
 
 		a.log.Info("agent.heartbeat", "publish.ok", "Published signed heartbeat", map[string]any{
 			"node_id":        a.cfg.NodeID,

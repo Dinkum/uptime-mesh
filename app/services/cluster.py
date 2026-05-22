@@ -8,7 +8,7 @@ import secrets
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Mapping, Optional, Tuple
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -217,6 +217,85 @@ async def _record_heartbeat_reject_event(
             "Failed to persist heartbeat reject event",
             node_id=node_id,
             reason=reason,
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+
+
+async def _reject_heartbeat(
+    session: AsyncSession,
+    *,
+    node_id: str,
+    reason: str,
+    message: str,
+    fields: Optional[Mapping[str, object]] = None,
+    log_fields: Optional[Mapping[str, object]] = None,
+) -> None:
+    await _record_heartbeat_reject_event(
+        session,
+        node_id=node_id,
+        reason=reason,
+        fields=dict(fields or {}),
+    )
+    _logger.warning(
+        "heartbeat.reject",
+        message,
+        node_id=node_id,
+        **(log_fields or {}),
+    )
+
+
+def _apply_heartbeat_status(
+    node: Node,
+    *,
+    status_patch: dict[str, object],
+    signed_at: int,
+    ttl_seconds: int,
+    now: datetime,
+) -> datetime:
+    lease_expires_at = now + timedelta(seconds=ttl_seconds)
+    node.heartbeat_at = now
+    node.lease_expires_at = lease_expires_at
+    if status_patch:
+        merged = dict(node.status or {})
+        merged.update(status_patch)
+        node.status = merged
+    status = dict(node.status or {})
+    status["last_heartbeat_signed_at"] = signed_at
+    node.status = status
+    return lease_expires_at
+
+
+async def _publish_node_lease(
+    op,
+    *,
+    node: Node,
+    node_id: str,
+    now: datetime,
+    lease_expires_at: datetime,
+    ttl_seconds: int,
+) -> None:
+    if not _etcd_configured():
+        return
+    try:
+        lease_payload = {
+            "node_id": node_id,
+            "name": node.name,
+            "roles": node.roles,
+            "heartbeat_at": now.isoformat(),
+            "lease_expires_at": lease_expires_at.isoformat(),
+            "lease_state": _lease_state(lease_expires_at, now=now),
+        }
+        await etcd_service.put_json_with_lease(
+            key=f"leases/{node_id}",
+            payload=lease_payload,
+            ttl_seconds=ttl_seconds,
+        )
+        op.step_debug("etcd.lease_upsert", "Upserted node lease to etcd", ttl_seconds=ttl_seconds)
+    except Exception as exc:  # noqa: BLE001
+        op.step_warning(
+            "etcd.lease_upsert",
+            "Failed to upsert node lease to etcd",
             error_type=type(exc).__name__,
             error=str(exc),
         )
@@ -699,6 +778,217 @@ async def _claim_join_token_for_use(
     return True
 
 
+async def _reject_join_request(
+    session: AsyncSession,
+    payload: NodeJoinRequest,
+    *,
+    event_name: str,
+    role: str,
+    fields: dict[str, object],
+    log_message: str,
+    log_fields: dict[str, object] | None = None,
+) -> None:
+    await _record_node_event(
+        session,
+        node_id=payload.node_id,
+        name=event_name,
+        level="WARNING",
+        fields=fields,
+    )
+    await session.commit()
+    _logger.warning(
+        "node.join.reject",
+        log_message,
+        node_id=payload.node_id,
+        role=role,
+        **(log_fields or {}),
+    )
+
+
+async def _resolve_join_role(
+    session: AsyncSession,
+    *,
+    requested_role: str,
+    token_role: str,
+) -> tuple[str, str, list[str]]:
+    resolved_role = requested_role if requested_role != "auto" else token_role
+    role_source = "payload" if requested_role != "auto" else "token"
+    if resolved_role == "auto":
+        resolved_role = await _choose_auto_role(session)
+        role_source = "auto"
+    assigned_roles = [resolved_role] if resolved_role in _RUNTIME_NODE_ROLES else []
+    return resolved_role, role_source, assigned_roles
+
+
+def _joined_node_status(payload: NodeJoinRequest, *, now: datetime, role: str, role_source: str) -> dict[str, object]:
+    status = dict(payload.status)
+    status["enrolled_at"] = now.isoformat()
+    status["node_role"] = role
+    status["node_role_source"] = role_source
+    return status
+
+
+def _apply_joined_node_state(
+    session: AsyncSession,
+    *,
+    node: Node | None,
+    payload: NodeJoinRequest,
+    assigned_roles: list[str],
+    status: dict[str, object],
+    heartbeat_at: datetime,
+    lease_expires_at: datetime,
+    identity_fingerprint: str,
+    node_cert_pem: str,
+    identity_expires_at: datetime,
+) -> str:
+    values = {
+        "name": payload.name,
+        "roles": assigned_roles,
+        "labels": payload.labels,
+        "mesh_ip": payload.mesh_ip,
+        "status": status,
+        "api_endpoint": payload.api_endpoint,
+        "heartbeat_at": heartbeat_at,
+        "lease_expires_at": lease_expires_at,
+        "identity_fingerprint": identity_fingerprint,
+        "identity_cert_pem": node_cert_pem,
+        "identity_expires_at": identity_expires_at,
+    }
+    if node is None:
+        session.add(Node(id=payload.node_id, **values))
+        return "node.join"
+
+    values["status"] = {**(node.status or {}), **status}
+    for key, value in values.items():
+        setattr(node, key, value)
+    return "node.rejoin"
+
+
+async def _publish_joined_node_to_etcd(
+    op,
+    *,
+    payload: NodeJoinRequest,
+    resolved_role: str,
+    assigned_roles: list[str],
+    identity_fingerprint: str,
+    lease_expires_at: datetime,
+    updated_at: datetime,
+) -> None:
+    if not _etcd_configured():
+        return
+    try:
+        await etcd_service.put_value(
+            key=f"nodes/{payload.node_id}",
+            value=json.dumps(
+                {
+                    "node_id": payload.node_id,
+                    "name": payload.name,
+                    "role": resolved_role,
+                    "roles": assigned_roles,
+                    "labels": payload.labels,
+                    "mesh_ip": payload.mesh_ip,
+                    "api_endpoint": payload.api_endpoint,
+                    "identity_fingerprint": identity_fingerprint,
+                    "lease_expires_at": lease_expires_at.isoformat(),
+                    "updated_at": updated_at.isoformat(),
+                },
+                separators=(",", ":"),
+            ),
+        )
+        op.step("etcd.node_upsert", "Upserted node record to etcd")
+    except Exception as exc:  # noqa: BLE001
+        op.step_warning(
+            "etcd.node_upsert",
+            "Failed to upsert node record to etcd",
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+
+
+async def _ensure_joined_node_etcd_member(
+    op,
+    *,
+    payload: NodeJoinRequest,
+    resolved_role: str,
+) -> None:
+    if resolved_role not in _RUNTIME_NODE_ROLES or not _etcd_configured():
+        return
+    peer_url = _resolve_etcd_peer_url(payload)
+    if not peer_url:
+        op.step_warning(
+            "etcd.member_add",
+            "Skipped etcd member add due to missing peer URL",
+            node_id=payload.node_id,
+        )
+        return
+
+    try:
+        members = await etcd_service.member_list()
+        member_id = next((item.member_id for item in members if item.name == payload.node_id), "")
+        if not member_id:
+            added = await etcd_service.member_add(
+                name=payload.node_id,
+                peer_urls=[peer_url],
+                is_learner=False,
+            )
+            member_id = added.member_id
+            op.step(
+                "etcd.member_add",
+                "Added node as etcd member",
+                member_id=member_id,
+                peer_url=peer_url,
+            )
+        else:
+            op.step(
+                "etcd.member_exists",
+                "Node already exists in etcd membership",
+                member_id=member_id,
+                peer_url=peer_url,
+            )
+        asyncio.create_task(
+            _persist_node_etcd_member_metadata(
+                node_id=payload.node_id,
+                member_id=member_id,
+                peer_url=peer_url,
+            )
+        )
+        op.step(
+            "etcd.member_metadata.queue",
+            "Queued best-effort etcd member metadata persistence",
+            member_id=member_id,
+            peer_url=peer_url,
+        )
+    except Exception as exc:  # noqa: BLE001
+        op.step_warning(
+            "etcd.member_add",
+            "Failed to ensure node etcd member",
+            error_type=type(exc).__name__,
+            error=str(exc),
+            peer_url=peer_url,
+        )
+
+
+async def _reconcile_join_side_effects(
+    session: AsyncSession,
+    op,
+    *,
+    payload: NodeJoinRequest,
+    resolved_role: str,
+) -> None:
+    if resolved_role not in _RUNTIME_NODE_ROLES:
+        return
+    created_assignments, updated_assignments = await _reconcile_router_assignments(
+        session,
+        changed_node_id=payload.node_id,
+    )
+    op.step(
+        "router_assignment.reconcile",
+        "Reconciled router assignments after node join",
+        created=created_assignments,
+        updated=updated_assignments,
+    )
+
+
 async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional[NodeJoinOut]:
     requested_role = _canonical_role(payload.role)
     async with _logger.operation(
@@ -717,36 +1007,26 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
             "Resolved cluster-internal signing secrets",
             persisted_missing_keys=secrets_persisted,
         )
-        join_token = await _get_join_token_for_use(
-            session,
-            payload.token,
-        )
+
+        join_token = await _get_join_token_for_use(session, payload.token)
         if join_token is None:
-            await _record_node_event(
+            await _reject_join_request(
                 session,
-                node_id=payload.node_id,
-                name="node.join.reject.invalid_token",
-                level="WARNING",
-                fields={
-                    "requested_role": requested_role,
-                },
-            )
-            await session.commit()
-            _logger.warning(
-                "node.join.reject",
-                "Rejected node join with invalid token",
-                node_id=payload.node_id,
+                payload,
+                event_name="node.join.reject.invalid_token",
                 role=requested_role,
+                fields={"requested_role": requested_role},
+                log_message="Rejected node join with invalid token",
             )
             return None
         op.step("token.validate", "Validated join token", token_id=join_token.id)
+
         token_role = _canonical_role(join_token.role)
-        resolved_role = requested_role if requested_role != "auto" else token_role
-        role_source = "payload" if requested_role != "auto" else "token"
-        if resolved_role == "auto":
-            resolved_role = await _choose_auto_role(session)
-            role_source = "auto"
-        assigned_roles = [resolved_role] if resolved_role in _RUNTIME_NODE_ROLES else []
+        resolved_role, role_source, assigned_roles = await _resolve_join_role(
+            session,
+            requested_role=requested_role,
+            token_role=token_role,
+        )
         op.step(
             "role.resolve",
             "Resolved node runtime role",
@@ -764,21 +1044,13 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
                 validity_days=settings.node_cert_validity_days,
             )
         except ValueError:
-            await _record_node_event(
+            await _reject_join_request(
                 session,
-                node_id=payload.node_id,
-                name="node.join.reject.invalid_csr",
-                level="WARNING",
-                fields={
-                    "resolved_role": resolved_role,
-                },
-            )
-            await session.commit()
-            _logger.warning(
-                "node.join.reject",
-                "Rejected node join due to invalid CSR",
-                node_id=payload.node_id,
+                payload,
+                event_name="node.join.reject.invalid_csr",
                 role=resolved_role,
+                fields={"resolved_role": resolved_role},
+                log_message="Rejected node join due to invalid CSR",
             )
             return None
         op.step(
@@ -791,25 +1063,17 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
         node = await session.get(Node, payload.node_id)
         now = _utcnow()
         if not await _claim_join_token_for_use(session, join_token=join_token, claimed_at=now):
-            await _record_node_event(
+            await _reject_join_request(
                 session,
-                node_id=payload.node_id,
-                name="node.join.reject.token_race",
-                level="WARNING",
-                fields={
-                    "resolved_role": resolved_role,
-                    "token_id": join_token.id,
-                },
-            )
-            await session.commit()
-            _logger.warning(
-                "node.join.reject",
-                "Rejected node join because token was already claimed",
-                node_id=payload.node_id,
+                payload,
+                event_name="node.join.reject.token_race",
                 role=resolved_role,
-                token_id=join_token.id,
+                fields={"resolved_role": resolved_role, "token_id": join_token.id},
+                log_message="Rejected node join because token was already claimed",
+                log_fields={"token_id": join_token.id},
             )
             return None
+
         lease_expires_at = now + timedelta(seconds=payload.lease_ttl_seconds)
         lease_token = create_lease_token(
             node_id=payload.node_id,
@@ -823,41 +1087,18 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
             lease_ttl_seconds=settings.cluster_lease_token_ttl_seconds,
         )
 
-        status = dict(payload.status)
-        status["enrolled_at"] = now.isoformat()
-        status["node_role"] = resolved_role
-        status["node_role_source"] = role_source
-
-        if node is None:
-            node = Node(
-                id=payload.node_id,
-                name=payload.name,
-                roles=assigned_roles,
-                labels=payload.labels,
-                mesh_ip=payload.mesh_ip,
-                status=status,
-                api_endpoint=payload.api_endpoint,
-                heartbeat_at=now,
-                lease_expires_at=lease_expires_at,
-                identity_fingerprint=identity_fingerprint,
-                identity_cert_pem=node_cert_pem,
-                identity_expires_at=identity_expires_at,
-            )
-            session.add(node)
-            event_name = "node.join"
-        else:
-            node.name = payload.name
-            node.roles = assigned_roles
-            node.labels = payload.labels
-            node.mesh_ip = payload.mesh_ip
-            node.api_endpoint = payload.api_endpoint
-            node.status = {**(node.status or {}), **status}
-            node.heartbeat_at = now
-            node.lease_expires_at = lease_expires_at
-            node.identity_fingerprint = identity_fingerprint
-            node.identity_cert_pem = node_cert_pem
-            node.identity_expires_at = identity_expires_at
-            event_name = "node.rejoin"
+        event_name = _apply_joined_node_state(
+            session,
+            node=node,
+            payload=payload,
+            assigned_roles=assigned_roles,
+            status=_joined_node_status(payload, now=now, role=resolved_role, role_source=role_source),
+            heartbeat_at=now,
+            lease_expires_at=lease_expires_at,
+            identity_fingerprint=identity_fingerprint,
+            node_cert_pem=node_cert_pem,
+            identity_expires_at=identity_expires_at,
+        )
         op.step("node.upsert", "Applied node state", cluster_event=event_name)
 
         await record_event(
@@ -877,102 +1118,23 @@ async def join_node(session: AsyncSession, payload: NodeJoinRequest) -> Optional
         op.step("event.record", "Recorded node join event", cluster_event=event_name)
         await session.commit()
         op.step("db.commit", "Committed node join transaction")
-        if _etcd_configured():
-            try:
-                await etcd_service.put_value(
-                    key=f"nodes/{payload.node_id}",
-                    value=json.dumps(
-                        {
-                            "node_id": payload.node_id,
-                            "name": payload.name,
-                            "role": resolved_role,
-                            "roles": assigned_roles,
-                            "labels": payload.labels,
-                            "mesh_ip": payload.mesh_ip,
-                            "api_endpoint": payload.api_endpoint,
-                            "identity_fingerprint": identity_fingerprint,
-                            "lease_expires_at": lease_expires_at.isoformat(),
-                            "updated_at": now.isoformat(),
-                        },
-                        separators=(",", ":"),
-                    ),
-                )
-                op.step("etcd.node_upsert", "Upserted node record to etcd")
-            except Exception as exc:  # noqa: BLE001
-                op.step_warning(
-                    "etcd.node_upsert",
-                    "Failed to upsert node record to etcd",
-                    error_type=type(exc).__name__,
-                    error=str(exc),
-                )
-        if resolved_role in _RUNTIME_NODE_ROLES and _etcd_configured():
-            peer_url = _resolve_etcd_peer_url(payload)
-            if peer_url:
-                try:
-                    members = await etcd_service.member_list()
-                    member_id = ""
-                    for member in members:
-                        if member.name == payload.node_id:
-                            member_id = member.member_id
-                            break
-                    if not member_id:
-                        added = await etcd_service.member_add(
-                            name=payload.node_id,
-                            peer_urls=[peer_url],
-                            is_learner=False,
-                        )
-                        member_id = added.member_id
-                        op.step(
-                            "etcd.member_add",
-                            "Added node as etcd member",
-                            member_id=member_id,
-                            peer_url=peer_url,
-                        )
-                    else:
-                        op.step(
-                            "etcd.member_exists",
-                            "Node already exists in etcd membership",
-                            member_id=member_id,
-                            peer_url=peer_url,
-                        )
-                    asyncio.create_task(
-                        _persist_node_etcd_member_metadata(
-                            node_id=payload.node_id,
-                            member_id=member_id,
-                            peer_url=peer_url,
-                        )
-                    )
-                    op.step(
-                        "etcd.member_metadata.queue",
-                        "Queued best-effort etcd member metadata persistence",
-                        member_id=member_id,
-                        peer_url=peer_url,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    op.step_warning(
-                        "etcd.member_add",
-                        "Failed to ensure node etcd member",
-                        error_type=type(exc).__name__,
-                        error=str(exc),
-                        peer_url=peer_url,
-                    )
-            else:
-                op.step_warning(
-                    "etcd.member_add",
-                    "Skipped etcd member add due to missing peer URL",
-                    node_id=payload.node_id,
-                )
-        if resolved_role in _RUNTIME_NODE_ROLES:
-            created_assignments, updated_assignments = await _reconcile_router_assignments(
-                session,
-                changed_node_id=payload.node_id,
-            )
-            op.step(
-                "router_assignment.reconcile",
-                "Reconciled router assignments after node join",
-                created=created_assignments,
-                updated=updated_assignments,
-            )
+
+        await _publish_joined_node_to_etcd(
+            op,
+            payload=payload,
+            resolved_role=resolved_role,
+            assigned_roles=assigned_roles,
+            identity_fingerprint=identity_fingerprint,
+            lease_expires_at=lease_expires_at,
+            updated_at=now,
+        )
+        await _ensure_joined_node_etcd_member(op, payload=payload, resolved_role=resolved_role)
+        await _reconcile_join_side_effects(
+            session,
+            op,
+            payload=payload,
+            resolved_role=resolved_role,
+        )
         return NodeJoinOut(
             node_id=payload.node_id,
             lease_token=lease_token,
@@ -1006,79 +1168,58 @@ async def apply_heartbeat(
         op.step_debug("secrets.resolve", "Resolved cluster signing key for heartbeat validation")
         lease_claims = decode_lease_token(lease_token, cluster_signing_key)
         if lease_claims is None:
-            await _record_heartbeat_reject_event(
+            await _reject_heartbeat(
                 session,
                 node_id=node_id,
                 reason="invalid_lease_token",
-            )
-            _logger.warning(
-                "heartbeat.reject",
-                "Rejected heartbeat with invalid lease token",
-                node_id=node_id,
+                message="Rejected heartbeat with invalid lease token",
             )
             return None
         if lease_claims.get("n") != node_id:
-            await _record_heartbeat_reject_event(
+            await _reject_heartbeat(
                 session,
                 node_id=node_id,
                 reason="node_id_mismatch",
                 fields={"lease_node_id": str(lease_claims.get("n") or "")},
-            )
-            _logger.warning(
-                "heartbeat.reject",
-                "Rejected heartbeat due to node ID mismatch",
-                node_id=node_id,
-                lease_node_id=lease_claims.get("n"),
+                message="Rejected heartbeat due to node ID mismatch",
+                log_fields={"lease_node_id": lease_claims.get("n")},
             )
             return None
         op.step_debug("lease.validate", "Validated signed lease token")
 
         node = await session.get(Node, node_id)
         if node is None or not node.identity_cert_pem or not node.identity_fingerprint:
-            await _record_heartbeat_reject_event(
+            await _reject_heartbeat(
                 session,
                 node_id=node_id,
                 reason="unknown_node",
-            )
-            _logger.warning(
-                "heartbeat.reject",
-                "Rejected heartbeat for unknown or unprovisioned node",
-                node_id=node_id,
+                message="Rejected heartbeat for unknown or unprovisioned node",
             )
             return None
         if lease_claims.get("fp") != node.identity_fingerprint:
-            await _record_heartbeat_reject_event(
+            await _reject_heartbeat(
                 session,
                 node_id=node_id,
                 reason="fingerprint_mismatch",
-            )
-            _logger.warning(
-                "heartbeat.reject",
-                "Rejected heartbeat due to fingerprint mismatch",
-                node_id=node_id,
+                message="Rejected heartbeat due to fingerprint mismatch",
             )
             return None
         op.step_debug("identity.match", "Validated node identity fingerprint")
 
         now_epoch = int(time.time())
         if abs(now_epoch - signed_at) > settings.heartbeat_signature_max_skew_seconds:
-            await _record_heartbeat_reject_event(
+            clock_fields = {
+                "signed_at": signed_at,
+                "now_epoch": now_epoch,
+                "max_skew_seconds": settings.heartbeat_signature_max_skew_seconds,
+            }
+            await _reject_heartbeat(
                 session,
                 node_id=node_id,
                 reason="clock_skew",
-                fields={
-                    "signed_at": signed_at,
-                    "now_epoch": now_epoch,
-                    "max_skew_seconds": settings.heartbeat_signature_max_skew_seconds,
-                },
-            )
-            _logger.warning(
-                "heartbeat.reject",
-                "Rejected heartbeat outside allowed clock skew",
-                node_id=node_id,
-                signed_at=signed_at,
-                now_epoch=now_epoch,
-                max_skew_seconds=settings.heartbeat_signature_max_skew_seconds,
+                fields=clock_fields,
+                message="Rejected heartbeat outside allowed clock skew",
+                log_fields=clock_fields,
             )
             return None
 
@@ -1086,21 +1227,17 @@ async def apply_heartbeat(
         if isinstance(node.status, dict):
             last_signed_at = int(node.status.get("last_heartbeat_signed_at", 0) or 0)
         if signed_at <= last_signed_at:
-            await _record_heartbeat_reject_event(
+            replay_fields = {
+                "signed_at": signed_at,
+                "last_signed_at": last_signed_at,
+            }
+            await _reject_heartbeat(
                 session,
                 node_id=node_id,
                 reason="signature_replay",
-                fields={
-                    "signed_at": signed_at,
-                    "last_signed_at": last_signed_at,
-                },
-            )
-            _logger.warning(
-                "heartbeat.reject",
-                "Rejected replayed or stale heartbeat signature",
-                node_id=node_id,
-                signed_at=signed_at,
-                last_signed_at=last_signed_at,
+                fields=replay_fields,
+                message="Rejected replayed or stale heartbeat signature",
+                log_fields=replay_fields,
             )
             return None
         op.step_debug("signature.sequence", "Validated heartbeat signature monotonicity")
@@ -1117,30 +1254,23 @@ async def apply_heartbeat(
             message=message,
             signature_b64=signature,
         ):
-            await _record_heartbeat_reject_event(
+            await _reject_heartbeat(
                 session,
                 node_id=node_id,
                 reason="signature_verification",
-            )
-            _logger.warning(
-                "heartbeat.reject",
-                "Rejected heartbeat due to signature verification failure",
-                node_id=node_id,
+                message="Rejected heartbeat due to signature verification failure",
             )
             return None
         op.step_debug("signature.verify", "Verified heartbeat signature")
 
         now = _utcnow()
-        lease_expires_at = now + timedelta(seconds=ttl_seconds)
-        node.heartbeat_at = now
-        node.lease_expires_at = lease_expires_at
-        if status_patch:
-            merged = dict(node.status or {})
-            merged.update(status_patch)
-            node.status = merged
-        status = dict(node.status or {})
-        status["last_heartbeat_signed_at"] = signed_at
-        node.status = status
+        lease_expires_at = _apply_heartbeat_status(
+            node,
+            status_patch=status_patch,
+            signed_at=signed_at,
+            ttl_seconds=ttl_seconds,
+            now=now,
+        )
         op.step_debug(
             "status.apply",
             "Applied heartbeat status update",
@@ -1149,29 +1279,14 @@ async def apply_heartbeat(
 
         await session.commit()
         op.step_debug("db.commit", "Committed heartbeat update")
-        if _etcd_configured():
-            try:
-                lease_payload = {
-                    "node_id": node_id,
-                    "name": node.name,
-                    "roles": node.roles,
-                    "heartbeat_at": now.isoformat(),
-                    "lease_expires_at": lease_expires_at.isoformat(),
-                    "lease_state": _lease_state(lease_expires_at, now=now),
-                }
-                await etcd_service.put_json_with_lease(
-                    key=f"leases/{node_id}",
-                    payload=lease_payload,
-                    ttl_seconds=ttl_seconds,
-                )
-                op.step_debug("etcd.lease_upsert", "Upserted node lease to etcd", ttl_seconds=ttl_seconds)
-            except Exception as exc:  # noqa: BLE001
-                op.step_warning(
-                    "etcd.lease_upsert",
-                    "Failed to upsert node lease to etcd",
-                    error_type=type(exc).__name__,
-                    error=str(exc),
-                )
+        await _publish_node_lease(
+            op,
+            node=node,
+            node_id=node_id,
+            now=now,
+            lease_expires_at=lease_expires_at,
+            ttl_seconds=ttl_seconds,
+        )
         return HeartbeatOut(
             node_id=node_id,
             heartbeat_at=now,

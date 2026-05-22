@@ -8,6 +8,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.formatting import as_utc as _as_utc
+from app.formatting import format_age as _format_age
+from app.formatting import format_timestamp as _format_timestamp
+from app.formatting import parse_datetime as _parse_iso_datetime
+from app.formatting import safe_int as _safe_int
 from app.logger import get_logger
 from app.models.replica import Replica
 from app.models.service import Service
@@ -66,62 +71,64 @@ def _extract_pinned_placement(spec: dict[str, object]) -> tuple[list[dict[str, o
     return items, strict
 
 
-def _safe_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except Exception:  # noqa: BLE001
-        return default
+def _rollout_counts(
+    service_replicas: list[Replica],
+    *,
+    generation: int,
+) -> tuple[int, int, int, int, int, int, datetime | None]:
+    total = len(service_replicas)
+    up_to_date = 0
+    outdated = 0
+    pending = 0
+    in_progress = 0
+    failed = 0
+    oldest_pending_at: datetime | None = None
+
+    for replica in service_replicas:
+        status = replica.status if isinstance(replica.status, dict) else {}
+        applied_generation = _safe_int(status.get("applied_generation", "0"), default=0)
+        update_state = str(status.get("update_state", "")).strip().lower()
+        replica_updated_at = _as_utc(getattr(replica, "updated_at", None))
+
+        if generation > 0 and applied_generation >= generation:
+            up_to_date += 1
+        else:
+            outdated += 1
+
+        if update_state in {"pending", "queued"}:
+            pending += 1
+            if replica_updated_at and (
+                oldest_pending_at is None or replica_updated_at < oldest_pending_at
+            ):
+                oldest_pending_at = replica_updated_at
+        elif update_state in {"in_progress", "updating", "restarting", "rolling"}:
+            in_progress += 1
+        elif update_state in {"failed", "error", "stalled"}:
+            failed += 1
+
+    return total, up_to_date, outdated, pending, in_progress, failed, oldest_pending_at
 
 
-def _as_utc(value: datetime | None) -> datetime | None:
-    if value is None:
-        return None
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
-
-
-def _parse_iso_datetime(value: Any) -> datetime | None:
-    if isinstance(value, datetime):
-        return _as_utc(value)
-    if not isinstance(value, str):
-        return None
-    raw = value.strip()
-    if not raw:
-        return None
-    try:
-        normalized = raw.replace("Z", "+00:00")
-        return _as_utc(datetime.fromisoformat(normalized))
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def _format_timestamp(value: datetime | None) -> str:
-    timestamp = _as_utc(value)
-    if timestamp is None:
-        return "-"
-    return timestamp.strftime("%Y-%m-%d %H:%M:%SZ")
-
-
-def _format_duration(seconds: int) -> str:
-    if seconds < 60:
-        return f"{seconds}s"
-    minutes, rem_seconds = divmod(seconds, 60)
-    if minutes < 60:
-        return f"{minutes}m {rem_seconds}s"
-    hours, rem_minutes = divmod(minutes, 60)
-    if hours < 24:
-        return f"{hours}h {rem_minutes}m"
-    days, rem_hours = divmod(hours, 24)
-    return f"{days}d {rem_hours}h"
-
-
-def _format_age(now: datetime, value: datetime | None) -> str:
-    timestamp = _as_utc(value)
-    if timestamp is None:
-        return "-"
-    seconds = max(int((now - timestamp).total_seconds()), 0)
-    return f"{_format_duration(seconds)} ago"
+def _rollout_state(
+    *,
+    total: int,
+    outdated: int,
+    failed: int,
+    stalled: bool,
+    pending: int,
+    in_progress: int,
+) -> tuple[str, str]:
+    if total == 0:
+        return "no_replicas", "No Replicas"
+    if outdated == 0:
+        return "complete", "Complete"
+    if failed > 0:
+        return "error", "Error"
+    if stalled:
+        return "stalled", "Stalled"
+    if pending > 0 or in_progress > 0:
+        return "rolling", "Rolling"
+    return "outdated", "Outdated"
 
 
 def build_rollout_rows(
@@ -143,35 +150,9 @@ def build_rollout_rows(
         rollout_requested_at = _parse_iso_datetime(service_spec.get("rollout_requested_at"))
         service_replicas = replicas_by_service.get(service_id, [])
 
-        total = len(service_replicas)
-        up_to_date = 0
-        outdated = 0
-        pending = 0
-        in_progress = 0
-        failed = 0
-        oldest_pending_at: datetime | None = None
-
-        for replica in service_replicas:
-            status = replica.status if isinstance(replica.status, dict) else {}
-            applied_generation = _safe_int(status.get("applied_generation", "0"), default=0)
-            update_state = str(status.get("update_state", "")).strip().lower()
-            replica_updated_at = _as_utc(getattr(replica, "updated_at", None))
-
-            if generation > 0 and applied_generation >= generation:
-                up_to_date += 1
-            else:
-                outdated += 1
-
-            if update_state in {"pending", "queued"}:
-                pending += 1
-                if replica_updated_at and (
-                    oldest_pending_at is None or replica_updated_at < oldest_pending_at
-                ):
-                    oldest_pending_at = replica_updated_at
-            elif update_state in {"in_progress", "updating", "restarting", "rolling"}:
-                in_progress += 1
-            elif update_state in {"failed", "error", "stalled"}:
-                failed += 1
+        total, up_to_date, outdated, pending, in_progress, failed, oldest_pending_at = (
+            _rollout_counts(service_replicas, generation=generation)
+        )
 
         progress_pct = round((up_to_date / total) * 100.0, 1) if total > 0 else 0.0
         pending_age_seconds = (
@@ -194,24 +175,14 @@ def build_rollout_rows(
             ):
                 stalled = True
 
-        if total == 0:
-            state_key = "no_replicas"
-            state_text = "No Replicas"
-        elif outdated == 0:
-            state_key = "complete"
-            state_text = "Complete"
-        elif failed > 0:
-            state_key = "error"
-            state_text = "Error"
-        elif stalled:
-            state_key = "stalled"
-            state_text = "Stalled"
-        elif pending > 0 or in_progress > 0:
-            state_key = "rolling"
-            state_text = "Rolling"
-        else:
-            state_key = "outdated"
-            state_text = "Outdated"
+        state_key, state_text = _rollout_state(
+            total=total,
+            outdated=outdated,
+            failed=failed,
+            stalled=stalled,
+            pending=pending,
+            in_progress=in_progress,
+        )
 
         rows.append(
             {

@@ -10,7 +10,9 @@ from app.models.provider import ProviderAccount, ProviderAction, ProviderResourc
 from app.schemas.providers import (
     ProviderAccountCreate,
     ProviderAccountOut,
+    ProviderActionOut,
     ProviderCapabilityOut,
+    ProviderResourceOut,
     ProviderSummaryOut,
 )
 from app.services import cluster_settings
@@ -121,8 +123,8 @@ async def get_summary(session: AsyncSession) -> ProviderSummaryOut:
     return ProviderSummaryOut(
         capabilities=capabilities,
         accounts=[account_out(account) for account in accounts],
-        resources=resources,
-        actions=actions,
+        resources=[ProviderResourceOut.model_validate(resource) for resource in resources],
+        actions=[ProviderActionOut.model_validate(action) for action in actions],
     )
 
 

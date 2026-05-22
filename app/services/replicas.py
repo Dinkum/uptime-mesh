@@ -2,14 +2,14 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import List, Literal, Optional
 from uuid import uuid4
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.logger import get_logger
+from app.logger import Operation, get_logger
 from app.models.node import Node
 from app.models.endpoint import Endpoint
 from app.models.replica import Replica
@@ -18,14 +18,19 @@ from app.schemas.replicas import ReplicaCreate, ReplicaUpdate
 from app.services.events import record_event
 from app.services import docker as docker_service
 from app.services import lxd as lxd_service
+from app.services.replica_runtime_create import mark_replica_create_failed
+from app.services.replica_runtime_create import merge_status as _merge_status
+from app.services.replica_runtime_create import provision_docker_replica
+from app.services.replica_runtime_create import provision_logical_replica
+from app.services.replica_runtime_create import provision_lxd_replica
+from app.services.replica_runtime_create import upsert_replica_endpoint as _upsert_replica_endpoint
+from app.services.replica_runtime_create import utcnow_iso as _utcnow_iso
 from app.services.runtime_drivers import runtime_kind_for_spec
 
 _logger = get_logger("services.replicas")
 _settings = get_settings()
-
-
-def _utcnow_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+RuntimeRoute = Literal["docker", "lxd", "logical"]
+_MOVE_STRATEGIES: dict[RuntimeRoute, str] = {"docker": "docker_recreate", "lxd": "staged", "logical": "logical"}
 
 
 def _container_name_for(replica: Replica, service: Service) -> str:
@@ -57,43 +62,21 @@ async def _service_and_node(
     return service, node
 
 
-def _merge_lxd_status(status: dict[str, object], **fields: object) -> dict[str, object]:
-    merged = dict(status)
-    merged.update(fields)
-    return merged
-
-
-def _merge_runtime_status(status: dict[str, object], **fields: object) -> dict[str, object]:
-    merged = dict(status)
-    merged.update(fields)
-    return merged
-
-
-async def _upsert_replica_endpoint(
+async def _service_for_replica(
     session: AsyncSession,
-    *,
-    replica_id: str,
-    address: str,
-    port: int,
-    healthy: bool,
-) -> None:
-    endpoint_id = f"{replica_id}-http"
-    endpoint = await session.get(Endpoint, endpoint_id)
-    if endpoint is None:
-        session.add(
-            Endpoint(
-                id=endpoint_id,
-                replica_id=replica_id,
-                address=address,
-                port=port,
-                healthy=healthy,
-            )
-        )
-        return
-    endpoint.address = address
-    endpoint.port = port
-    endpoint.healthy = healthy
-    endpoint.last_checked_at = datetime.now(timezone.utc)
+    replica: Replica,
+    operation: str,
+) -> Service:
+    service = await session.get(Service, replica.service_id)
+    if service is None:
+        raise lxd_service.LXDOperationError(operation, f"service not found: {replica.service_id}")
+    return service
+
+
+def _runtime_route(runtime_kind: str) -> RuntimeRoute:
+    if runtime_kind == "docker":
+        return "docker" if _settings.docker_enabled else "logical"
+    return "lxd" if _settings.lxd_enabled else "logical"
 
 
 async def list_replicas(session: AsyncSession, limit: int = 200) -> List[Replica]:
@@ -111,9 +94,7 @@ async def list_replicas_for_service(
     service_id: str,
     limit: int = 1000,
 ) -> List[Replica]:
-    result = await session.execute(
-        select(Replica).where(Replica.service_id == service_id).limit(limit)
-    )
+    result = await session.execute(select(Replica).where(Replica.service_id == service_id).limit(limit))
     return list(result.scalars().all())
 
 
@@ -163,7 +144,7 @@ async def create_replica(session: AsyncSession, payload: ReplicaCreate) -> Repli
         )
         status = dict(payload.status or {})
         runtime_kind = runtime_kind_for_spec(service.spec or {})
-        status = _merge_runtime_status(
+        status = _merge_status(
             status,
             runtime_kind=runtime_kind,
             runtime_reconcile_state="provisioning",
@@ -198,105 +179,30 @@ async def create_replica(session: AsyncSession, payload: ReplicaCreate) -> Repli
         op.step("db.claim", "Committed durable replica intent before runtime side effects")
 
         try:
-            spec: lxd_service.LXDContainerSpec | None = None
-            docker_spec: docker_service.DockerContainerSpec | None = None
             status = dict(replica.status or {})
             if runtime_kind == "docker":
-                docker_spec = docker_service.build_container_spec(
-                    service_name=service.name,
-                    service_spec=service.spec or {},
-                    replica_id=payload.id,
-                    node=node,
-                    desired_state=payload.desired_state,
-                )
-                endpoint_address, endpoint_port = docker_service.endpoint_for_container(
-                    node=node,
-                    spec=docker_spec,
-                )
-                if _settings.docker_enabled:
-                    op.step(
-                        "docker.spec",
-                        "Resolved Docker container spec",
-                        container=docker_spec.name,
-                        image=docker_spec.image,
-                        port=docker_spec.port,
-                        host_port=docker_spec.host_port,
-                    )
-                    await docker_service.ensure_container(docker_spec)
-                    runtime_state = await docker_service.container_status(
-                        name=docker_spec.name,
-                        docker_host=docker_spec.docker_host,
-                    )
-                    last_action = "create"
-                    healthy = True
-                    op.step("docker.ensure", "Ensured Docker container", state=runtime_state)
-                else:
-                    runtime_state = ""
-                    last_action = "create.skipped"
-                    healthy = False
-                    op.step("docker.skip", "Skipped Docker orchestration (disabled)")
-                status = _merge_runtime_status(
-                    status,
-                    runtime_kind="docker",
-                    runtime_reconcile_state="provisioned",
-                    docker_container_name=docker_spec.name,
-                    docker_image=docker_spec.image,
-                    docker_host=docker_spec.docker_host,
-                    docker_state=runtime_state,
-                    docker_endpoint_address=endpoint_address,
-                    docker_endpoint_port=endpoint_port,
-                    docker_last_error="",
-                    docker_last_action=last_action,
-                    docker_last_action_at=_utcnow_iso(),
-                )
-                await _upsert_replica_endpoint(
+                status = await provision_docker_replica(
                     session,
-                    replica_id=payload.id,
-                    address=endpoint_address,
-                    port=endpoint_port,
-                    healthy=healthy,
+                    op,
+                    service=service,
+                    node=node,
+                    replica=replica,
+                    status=status,
                 )
             elif _settings.lxd_enabled:
-                spec = lxd_service.build_container_spec(
-                    service_name=service.name,
-                    service_spec=service.spec or {},
-                    replica_id=payload.id,
-                    node_name=node.name,
-                    desired_state=payload.desired_state,
+                status = await provision_lxd_replica(
+                    op,
+                    service=service,
+                    node=node,
+                    replica=replica,
+                    status=status,
                 )
-                op.step(
-                    "lxd.spec",
-                    "Resolved container spec",
-                    container=spec.name,
-                    project=spec.project,
-                    target_node=spec.target_node,
-                )
-                await lxd_service.ensure_container(spec)
-                runtime_state = await lxd_service.container_status(
-                    name=spec.name,
-                    project=spec.project,
-                )
-                status = _merge_lxd_status(
-                    status,
-                    runtime_kind="lxd",
-                    runtime_reconcile_state="provisioned",
-                    lxd_container_name=spec.name,
-                    lxd_project=spec.project,
-                    lxd_state=runtime_state,
-                    lxd_last_error="",
-                    lxd_last_action="create",
-                    lxd_last_action_at=_utcnow_iso(),
-                )
-                op.step("lxd.ensure", "Ensured LXD container", state=runtime_state)
             else:
-                status = _merge_lxd_status(
-                    status,
+                status = provision_logical_replica(
+                    op,
                     runtime_kind=runtime_kind,
-                    runtime_reconcile_state="provisioned",
-                    lxd_last_action="create.skipped",
-                    lxd_last_action_at=_utcnow_iso(),
+                    status=status,
                 )
-                op.step("runtime.skip", "Skipped runtime orchestration (disabled)")
 
             replica.status = status
             await record_event(
@@ -314,18 +220,7 @@ async def create_replica(session: AsyncSession, payload: ReplicaCreate) -> Repli
             )
             await session.commit()
         except Exception as exc:
-            await session.rollback()
-            fresh = await session.get(Replica, payload.id)
-            if fresh is not None:
-                failed_status = _merge_runtime_status(
-                    dict(fresh.status or {}),
-                    runtime_reconcile_state="provision_failed",
-                    runtime_last_error=f"{type(exc).__name__}: {exc}",
-                    runtime_last_action="create.failed",
-                    runtime_last_action_at=_utcnow_iso(),
-                )
-                fresh.status = failed_status
-                await session.commit()
+            await mark_replica_create_failed(session, replica_id=payload.id, exc=exc)
             raise
         await session.refresh(replica)
         _logger.info("replicas.create", "Created replica", replica_id=replica.id)
@@ -342,14 +237,10 @@ async def update_replica(
     if payload.desired_state is not None:
         replica.desired_state = payload.desired_state
         changed = True
-        service = await session.get(Service, replica.service_id)
-        if service is None:
-            raise lxd_service.LXDOperationError(
-                "replica.update",
-                f"service not found: {replica.service_id}",
-            )
+        service = await _service_for_replica(session, replica, "replica.update")
         runtime_kind = runtime_kind_for_spec(service.spec or {})
-        if runtime_kind == "docker" and _settings.docker_enabled:
+        runtime_route = _runtime_route(runtime_kind)
+        if runtime_route == "docker":
             container_name = _container_name_for(replica, service)
             docker_host = str(status_map.get("docker_host") or "")
             desired = payload.desired_state.lower()
@@ -367,7 +258,7 @@ async def update_replica(
                     name=container_name,
                     docker_host=docker_host,
                 )
-            status_map = _merge_runtime_status(
+            status_map = _merge_status(
                 status_map,
                 runtime_kind="docker",
                 docker_container_name=container_name,
@@ -376,7 +267,7 @@ async def update_replica(
                 docker_last_action="update.state",
                 docker_last_action_at=_utcnow_iso(),
             )
-        elif runtime_kind != "docker" and _settings.lxd_enabled:
+        elif runtime_route == "lxd":
             container_name = _container_name_for(replica, service)
             project = str(status_map.get("lxd_project") or _settings.lxd_project)
             desired = payload.desired_state.lower()
@@ -391,7 +282,7 @@ async def update_replica(
                     name=container_name,
                     project=project,
                 )
-            status_map = _merge_lxd_status(
+            status_map = _merge_status(
                 status_map,
                 lxd_container_name=container_name,
                 lxd_project=project,
@@ -401,7 +292,7 @@ async def update_replica(
                 lxd_last_action_at=_utcnow_iso(),
             )
     if payload.status is not None:
-        status_map = _merge_lxd_status(status_map, **payload.status)
+        status_map = _merge_status(status_map, **payload.status)
         changed = True
 
     if changed:
@@ -421,6 +312,238 @@ async def update_replica(
     await session.commit()
     await session.refresh(replica)
     return replica
+
+
+async def _move_docker_replica(
+    session: AsyncSession,
+    op: Operation,
+    *,
+    replica: Replica,
+    service: Service,
+    target_node: Node,
+    target_node_id: str,
+    status: dict[str, object],
+) -> dict[str, object]:
+    source_name = _container_name_for(replica, service)
+    source_host = str(status.get("docker_host") or "")
+    target_spec = docker_service.build_container_spec(
+        service_name=service.name,
+        service_spec=service.spec or {},
+        replica_id=replica.id,
+        node=target_node,
+        desired_state=replica.desired_state,
+    )
+    op.step(
+        "docker.move",
+        "Recreating Docker replica on target node",
+        source_container=source_name,
+        target_container=target_spec.name,
+        target_node=target_node.id,
+    )
+    await docker_service.ensure_container(target_spec)
+    if source_host != target_spec.docker_host or source_name != target_spec.name:
+        await docker_service.delete_container(name=source_name, docker_host=source_host)
+    runtime_state = await docker_service.container_status(
+        name=target_spec.name,
+        docker_host=target_spec.docker_host,
+    )
+    endpoint_address, endpoint_port = docker_service.endpoint_for_container(
+        node=target_node,
+        spec=target_spec,
+    )
+    await _upsert_replica_endpoint(
+        session,
+        replica_id=replica.id,
+        address=endpoint_address,
+        port=endpoint_port,
+        healthy=True,
+    )
+    op.step("docker.status", "Docker replica move complete", docker_state=runtime_state)
+    return _merge_status(
+        status,
+        runtime_kind="docker",
+        docker_container_name=target_spec.name,
+        docker_image=target_spec.image,
+        docker_host=target_spec.docker_host,
+        docker_state=runtime_state,
+        docker_endpoint_address=endpoint_address,
+        docker_endpoint_port=endpoint_port,
+        docker_last_move_source_node=replica.node_id,
+        docker_last_move_target_node=target_node_id,
+        docker_last_error="",
+        docker_last_action="move.recreate",
+        docker_last_action_at=_utcnow_iso(),
+    )
+
+
+async def _recover_lxd_cutover(
+    op: Operation,
+    *,
+    container_name: str,
+    temp_name: str,
+    project: str,
+    error: lxd_service.LXDOperationError,
+) -> tuple[bool, bool]:
+    canonical_exists = await lxd_service.container_exists(name=container_name, project=project)
+    staged_exists = await lxd_service.container_exists(name=temp_name, project=project)
+    if staged_exists and not canonical_exists:
+        try:
+            await lxd_service.rename_container(
+                source_name=temp_name,
+                target_name=container_name,
+                project=project,
+            )
+        except lxd_service.LXDOperationError as recover_exc:
+            op.step_warning(
+                "lxd.cutover.recover",
+                "Failed to recover staged rename after cutover failure",
+                staged_container=temp_name,
+                target_container=container_name,
+                error_type=type(recover_exc).__name__,
+                error=recover_exc.detail,
+            )
+            return False, staged_exists
+        op.step_warning(
+            "lxd.cutover.recover",
+            "Completed staged rename after cutover failure",
+            staged_container=temp_name,
+            target_container=container_name,
+            original_error=error.detail,
+        )
+        return True, staged_exists
+    if canonical_exists:
+        op.step_warning(
+            "lxd.cutover.recover",
+            "Canonical container exists after cutover failure",
+            target_container=container_name,
+            staged_container=temp_name,
+            staged_exists=staged_exists,
+            original_error=error.detail,
+        )
+        return True, staged_exists
+    return False, staged_exists
+
+
+async def _move_lxd_replica(
+    session: AsyncSession,
+    op: Operation,
+    *,
+    replica: Replica,
+    service: Service,
+    target_node: Node,
+    target_node_id: str,
+    status: dict[str, object],
+) -> dict[str, object]:
+    container_name = _container_name_for(replica, service)
+    project = str(status.get("lxd_project") or _settings.lxd_project)
+    temp_name = f"{container_name}-mv-{uuid4().hex[:6]}"[:63].strip("-")
+    source_exists = await lxd_service.container_exists(name=container_name, project=project)
+    spec = lxd_service.build_container_spec(
+        service_name=service.name,
+        service_spec=service.spec or {},
+        replica_id=replica.id,
+        node_name=target_node.name,
+        desired_state=replica.desired_state,
+    )
+    staged_spec = replace(spec, name=temp_name, project=project, target_node=target_node.name)
+    op.step(
+        "lxd.stage.init",
+        "Creating staged target container",
+        source_container=container_name,
+        staged_container=temp_name,
+        project=project,
+        target_node=target_node.name,
+        source_exists=source_exists,
+    )
+    await lxd_service.ensure_container(staged_spec)
+    try:
+        staged_state = await lxd_service.container_status(name=temp_name, project=project)
+    except lxd_service.LXDOperationError:
+        try:
+            await lxd_service.delete_container(name=temp_name, project=project)
+            op.step(
+                "lxd.stage.cleanup",
+                "Deleted staged container after pre-cutover failure",
+                staged_container=temp_name,
+            )
+        except lxd_service.LXDOperationError as cleanup_exc:
+            op.step_warning(
+                "lxd.stage.cleanup",
+                "Failed to delete staged container after move failure",
+                staged_container=temp_name,
+                error_type=type(cleanup_exc).__name__,
+                error=cleanup_exc.detail,
+            )
+        raise
+    op.step(
+        "lxd.stage.health_gate",
+        "Staged target container passed health gate",
+        staged_container=temp_name,
+        staged_state=staged_state,
+    )
+
+    try:
+        if source_exists:
+            op.step(
+                "lxd.cutover.stop",
+                "Stopping and deleting source container before cutover",
+                source_container=container_name,
+            )
+            await lxd_service.delete_container(name=container_name, project=project)
+        else:
+            op.step("lxd.cutover.source", "Source container missing; cutover continues")
+        await lxd_service.rename_container(
+            source_name=temp_name,
+            target_name=container_name,
+            project=project,
+        )
+        op.step(
+            "lxd.cutover.rename",
+            "Renamed staged container to canonical name",
+            source_container=temp_name,
+            target_container=container_name,
+        )
+    except lxd_service.LXDOperationError as exc:
+        recovered, staged_exists = await _recover_lxd_cutover(
+            op,
+            container_name=container_name,
+            temp_name=temp_name,
+            project=project,
+            error=exc,
+        )
+        if not recovered:
+            replica.status = _merge_status(
+                status,
+                lxd_container_name=temp_name if staged_exists else container_name,
+                lxd_project=project,
+                lxd_target_node=target_node.name,
+                lxd_state="move_cutover_failed",
+                lxd_move_strategy="staged",
+                lxd_last_move_source_node=replica.node_id,
+                lxd_last_move_target_node=target_node_id,
+                lxd_last_error=exc.detail,
+                lxd_last_action="move.cutover_failed",
+                lxd_last_action_at=_utcnow_iso(),
+            )
+            await session.commit()
+            raise
+
+    runtime_state = await lxd_service.container_status(name=container_name, project=project)
+    status = _merge_status(
+        status,
+        lxd_container_name=container_name,
+        lxd_project=project,
+        lxd_target_node=target_node.name,
+        lxd_state=runtime_state,
+        lxd_move_strategy="staged",
+        lxd_last_move_source_node=replica.node_id,
+        lxd_last_move_target_node=target_node_id,
+        lxd_last_error="",
+        lxd_last_action="move.staged",
+        lxd_last_action_at=_utcnow_iso(),
+    )
+    op.step("lxd.status", "Staged move complete", lxd_state=runtime_state)
+    return status
 
 
 async def move_replica(
@@ -446,7 +569,8 @@ async def move_replica(
             node_id=target_node_id,
         )
         runtime_kind = runtime_kind_for_spec(service.spec or {})
-        status = _merge_runtime_status(
+        runtime_route = _runtime_route(runtime_kind)
+        status = _merge_status(
             status,
             runtime_reconcile_state="moving",
             runtime_last_move_source_node=replica.node_id,
@@ -459,218 +583,30 @@ async def move_replica(
         await session.refresh(replica)
         status = dict(replica.status or {})
         op.step("db.claim", "Committed durable replica move intent before runtime side effects")
-        if runtime_kind == "docker" and _settings.docker_enabled:
-            source_name = _container_name_for(replica, service)
-            source_host = str(status.get("docker_host") or "")
-            target_spec = docker_service.build_container_spec(
-                service_name=service.name,
-                service_spec=service.spec or {},
-                replica_id=replica.id,
-                node=target_node,
-                desired_state=replica.desired_state,
-            )
-            op.step(
-                "docker.move",
-                "Recreating Docker replica on target node",
-                source_container=source_name,
-                target_container=target_spec.name,
-                target_node=target_node.id,
-            )
-            await docker_service.ensure_container(target_spec)
-            if source_host != target_spec.docker_host or source_name != target_spec.name:
-                await docker_service.delete_container(name=source_name, docker_host=source_host)
-            runtime_state = await docker_service.container_status(
-                name=target_spec.name,
-                docker_host=target_spec.docker_host,
-            )
-            endpoint_address, endpoint_port = docker_service.endpoint_for_container(
-                node=target_node,
-                spec=target_spec,
-            )
-            status = _merge_runtime_status(
-                status,
-                runtime_kind="docker",
-                docker_container_name=target_spec.name,
-                docker_image=target_spec.image,
-                docker_host=target_spec.docker_host,
-                docker_state=runtime_state,
-                docker_endpoint_address=endpoint_address,
-                docker_endpoint_port=endpoint_port,
-                docker_last_move_source_node=replica.node_id,
-                docker_last_move_target_node=target_node_id,
-                docker_last_error="",
-                docker_last_action="move.recreate",
-                docker_last_action_at=_utcnow_iso(),
-            )
-            await _upsert_replica_endpoint(
+        if runtime_route == "docker":
+            status = await _move_docker_replica(
                 session,
-                replica_id=replica.id,
-                address=endpoint_address,
-                port=endpoint_port,
-                healthy=True,
+                op,
+                replica=replica,
+                service=service,
+                target_node=target_node,
+                target_node_id=target_node_id,
+                status=status,
             )
-            op.step("docker.status", "Docker replica move complete", docker_state=runtime_state)
-        elif runtime_kind != "docker" and _settings.lxd_enabled:
-            container_name = _container_name_for(replica, service)
-            project = str(status.get("lxd_project") or _settings.lxd_project)
-            temp_name = f"{container_name}-mv-{uuid4().hex[:6]}"[:63].strip("-")
-            source_exists = await lxd_service.container_exists(name=container_name, project=project)
-            temp_created = False
-            cutover_started = False
-            cutover_recovered = False
-
-            try:
-                spec = lxd_service.build_container_spec(
-                    service_name=service.name,
-                    service_spec=service.spec or {},
-                    replica_id=replica.id,
-                    node_name=target_node.name,
-                    desired_state=replica.desired_state,
-                )
-                staged_spec = replace(
-                    spec,
-                    name=temp_name,
-                    project=project,
-                    target_node=target_node.name,
-                )
-                op.step(
-                    "lxd.stage.init",
-                    "Creating staged target container",
-                    source_container=container_name,
-                    staged_container=temp_name,
-                    project=project,
-                    target_node=target_node.name,
-                    source_exists=source_exists,
-                )
-                await lxd_service.ensure_container(staged_spec)
-                temp_created = True
-                staged_state = await lxd_service.container_status(name=temp_name, project=project)
-                op.step(
-                    "lxd.stage.health_gate",
-                    "Staged target container passed health gate",
-                    staged_container=temp_name,
-                    staged_state=staged_state,
-                )
-
-                cutover_started = True
-                if source_exists:
-                    op.step(
-                        "lxd.cutover.stop",
-                        "Stopping and deleting source container before cutover",
-                        source_container=container_name,
-                    )
-                    await lxd_service.delete_container(name=container_name, project=project)
-                else:
-                    op.step("lxd.cutover.source", "Source container missing; cutover continues")
-
-                await lxd_service.rename_container(
-                    source_name=temp_name,
-                    target_name=container_name,
-                    project=project,
-                )
-                op.step(
-                    "lxd.cutover.rename",
-                    "Renamed staged container to canonical name",
-                    source_container=temp_name,
-                    target_container=container_name,
-                )
-            except lxd_service.LXDOperationError as exc:
-                if temp_created and cutover_started:
-                    canonical_exists = await lxd_service.container_exists(
-                        name=container_name,
-                        project=project,
-                    )
-                    staged_exists = await lxd_service.container_exists(
-                        name=temp_name,
-                        project=project,
-                    )
-                    if staged_exists and not canonical_exists:
-                        try:
-                            await lxd_service.rename_container(
-                                source_name=temp_name,
-                                target_name=container_name,
-                                project=project,
-                            )
-                            cutover_recovered = True
-                            op.step_warning(
-                                "lxd.cutover.recover",
-                                "Completed staged rename after cutover failure",
-                                staged_container=temp_name,
-                                target_container=container_name,
-                                original_error=exc.detail,
-                            )
-                        except lxd_service.LXDOperationError as recover_exc:
-                            op.step_warning(
-                                "lxd.cutover.recover",
-                                "Failed to recover staged rename after cutover failure",
-                                staged_container=temp_name,
-                                target_container=container_name,
-                                error_type=type(recover_exc).__name__,
-                                error=recover_exc.detail,
-                            )
-                    elif canonical_exists:
-                        cutover_recovered = True
-                        op.step_warning(
-                            "lxd.cutover.recover",
-                            "Canonical container exists after cutover failure",
-                            target_container=container_name,
-                            staged_container=temp_name,
-                            staged_exists=staged_exists,
-                            original_error=exc.detail,
-                        )
-                    if not cutover_recovered:
-                        replica.status = _merge_lxd_status(
-                            status,
-                            lxd_container_name=temp_name if staged_exists else container_name,
-                            lxd_project=project,
-                            lxd_target_node=target_node.name,
-                            lxd_state="move_cutover_failed",
-                            lxd_move_strategy="staged",
-                            lxd_last_move_source_node=replica.node_id,
-                            lxd_last_move_target_node=target_node_id,
-                            lxd_last_error=exc.detail,
-                            lxd_last_action="move.cutover_failed",
-                            lxd_last_action_at=_utcnow_iso(),
-                        )
-                        await session.commit()
-                if temp_created and not cutover_started:
-                    try:
-                        await lxd_service.delete_container(name=temp_name, project=project)
-                        op.step(
-                            "lxd.stage.cleanup",
-                            "Deleted staged container after pre-cutover failure",
-                            staged_container=temp_name,
-                        )
-                    except lxd_service.LXDOperationError as cleanup_exc:
-                        op.step_warning(
-                            "lxd.stage.cleanup",
-                            "Failed to delete staged container after move failure",
-                            staged_container=temp_name,
-                            error_type=type(cleanup_exc).__name__,
-                            error=cleanup_exc.detail,
-                        )
-                if not cutover_recovered:
-                    raise
-
-            runtime_state = await lxd_service.container_status(name=container_name, project=project)
-            status = _merge_lxd_status(
-                status,
-                lxd_container_name=container_name,
-                lxd_project=project,
-                lxd_target_node=target_node.name,
-                lxd_state=runtime_state,
-                lxd_move_strategy="staged",
-                lxd_last_move_source_node=replica.node_id,
-                lxd_last_move_target_node=target_node_id,
-                lxd_last_error="",
-                lxd_last_action="move.staged",
-                lxd_last_action_at=_utcnow_iso(),
+        elif runtime_route == "lxd":
+            status = await _move_lxd_replica(
+                session,
+                op,
+                replica=replica,
+                service=service,
+                target_node=target_node,
+                target_node_id=target_node_id,
+                status=status,
             )
-            op.step("lxd.status", "Staged move complete", lxd_state=runtime_state)
         else:
             op.step("runtime.skip", "Skipped runtime move (disabled)", runtime_kind=runtime_kind)
         replica.node_id = target_node_id
-        status = _merge_runtime_status(
+        status = _merge_status(
             status,
             runtime_reconcile_state="moved",
             runtime_last_action="move.completed",
@@ -686,11 +622,7 @@ async def move_replica(
             fields={
                 "replica_id": replica.id,
                 "target_node_id": target_node_id,
-                "strategy": (
-                    "docker_recreate"
-                    if runtime_kind == "docker" and _settings.docker_enabled
-                    else "staged" if runtime_kind != "docker" and _settings.lxd_enabled else "logical"
-                ),
+                "strategy": _MOVE_STRATEGIES[runtime_route],
             },
         )
         op.step("event.record", "Recorded replica move event")
@@ -708,14 +640,10 @@ async def restart_replica(session: AsyncSession, replica: Replica) -> Replica:
     ) as op:
         status = dict(replica.status or {})
         status["last_restart_at"] = _utcnow_iso()
-        service = await session.get(Service, replica.service_id)
-        if service is None:
-            raise lxd_service.LXDOperationError(
-                "replica.restart",
-                f"service not found: {replica.service_id}",
-            )
+        service = await _service_for_replica(session, replica, "replica.restart")
         runtime_kind = runtime_kind_for_spec(service.spec or {})
-        if runtime_kind == "docker" and _settings.docker_enabled:
+        runtime_route = _runtime_route(runtime_kind)
+        if runtime_route == "docker":
             container_name = _container_name_for(replica, service)
             docker_host = str(status.get("docker_host") or "")
             op.step("docker.restart", "Restarting Docker container", container=container_name)
@@ -724,7 +652,7 @@ async def restart_replica(session: AsyncSession, replica: Replica) -> Replica:
                 name=container_name,
                 docker_host=docker_host,
             )
-            status = _merge_runtime_status(
+            status = _merge_status(
                 status,
                 runtime_kind="docker",
                 docker_container_name=container_name,
@@ -734,13 +662,13 @@ async def restart_replica(session: AsyncSession, replica: Replica) -> Replica:
                 docker_last_action_at=_utcnow_iso(),
             )
             op.step("docker.status", "Container restart complete", docker_state=runtime_state)
-        elif runtime_kind != "docker" and _settings.lxd_enabled:
+        elif runtime_route == "lxd":
             container_name = _container_name_for(replica, service)
             project = str(status.get("lxd_project") or _settings.lxd_project)
             op.step("lxd.restart", "Restarting LXD container", container=container_name, project=project)
             await lxd_service.restart_container(name=container_name, project=project)
             runtime_state = await lxd_service.container_status(name=container_name, project=project)
-            status = _merge_lxd_status(
+            status = _merge_status(
                 status,
                 lxd_container_name=container_name,
                 lxd_project=project,
@@ -779,12 +707,7 @@ async def snapshot_replica(session: AsyncSession, replica: Replica) -> Replica:
         status["last_snapshot_at"] = _utcnow_iso()
         status["last_snapshot_id"] = snapshot_id
         if _settings.lxd_enabled:
-            service = await session.get(Service, replica.service_id)
-            if service is None:
-                raise lxd_service.LXDOperationError(
-                    "replica.snapshot",
-                    f"service not found: {replica.service_id}",
-                )
+            service = await _service_for_replica(session, replica, "replica.snapshot")
             container_name = _container_name_for(replica, service)
             project = str(status.get("lxd_project") or _settings.lxd_project)
             op.step(
@@ -799,7 +722,7 @@ async def snapshot_replica(session: AsyncSession, replica: Replica) -> Replica:
                 project=project,
                 snapshot=snapshot_id,
             )
-            status = _merge_lxd_status(
+            status = _merge_status(
                 status,
                 lxd_container_name=container_name,
                 lxd_project=project,
@@ -839,12 +762,7 @@ async def restore_replica(
         status = dict(replica.status or {})
         resolved_snapshot = snapshot_id or str(status.get("last_snapshot_id") or "")
         if _settings.lxd_enabled:
-            service = await session.get(Service, replica.service_id)
-            if service is None:
-                raise lxd_service.LXDOperationError(
-                    "replica.restore",
-                    f"service not found: {replica.service_id}",
-                )
+            service = await _service_for_replica(session, replica, "replica.restore")
             container_name = _container_name_for(replica, service)
             project = str(status.get("lxd_project") or _settings.lxd_project)
             if not resolved_snapshot:
@@ -871,7 +789,7 @@ async def restore_replica(
                 snapshot=resolved_snapshot,
             )
             runtime_state = await lxd_service.container_status(name=container_name, project=project)
-            status = _merge_lxd_status(
+            status = _merge_status(
                 status,
                 lxd_container_name=container_name,
                 lxd_project=project,
@@ -911,19 +829,15 @@ async def delete_replica(session: AsyncSession, replica: Replica) -> None:
         replica_id=replica_id,
         service_id=service_id,
     ) as op:
-        service = await session.get(Service, replica.service_id)
-        if service is None:
-            raise lxd_service.LXDOperationError(
-                "replica.delete",
-                f"service not found: {replica.service_id}",
-            )
+        service = await _service_for_replica(session, replica, "replica.delete")
         runtime_kind = runtime_kind_for_spec(service.spec or {})
-        if runtime_kind == "docker" and _settings.docker_enabled:
+        runtime_route = _runtime_route(runtime_kind)
+        if runtime_route == "docker":
             container_name = _container_name_for(replica, service)
             docker_host = str((replica.status or {}).get("docker_host") or "")
             op.step("docker.delete", "Deleting Docker container", container=container_name)
             await docker_service.delete_container(name=container_name, docker_host=docker_host)
-        elif runtime_kind != "docker" and _settings.lxd_enabled:
+        elif runtime_route == "lxd":
             container_name = _container_name_for(replica, service)
             project = str((replica.status or {}).get("lxd_project") or _settings.lxd_project)
             op.step("lxd.delete", "Deleting LXD container", container=container_name, project=project)
@@ -949,7 +863,7 @@ async def delete_replica(session: AsyncSession, replica: Replica) -> None:
             await session.rollback()
             stale_replica = await session.get(Replica, replica_id)
             if stale_replica is not None:
-                stale_replica.status = _merge_lxd_status(
+                stale_replica.status = _merge_status(
                     dict(stale_replica.status or {}),
                     lxd_state="deleted",
                     lxd_last_error=f"DB delete commit failed after LXD delete: {type(exc).__name__}: {exc}",
